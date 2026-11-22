@@ -195,43 +195,114 @@ void TextureCache<P>::RunGarbageCollector() {
         static constexpr size_t normal_iterations = 10;
         num_iterations = aggressive_mode ? 40 : (high_priority_mode ? 20 : normal_iterations);
     };
-    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode,
-                          &evict_old_costly](ImageId image_id) {
-        if (num_iterations == 0) {
-            return true;
+    constexpr bool use_deferred_download = IMPLEMENTS_ASYNC_DOWNLOADS;
+    using GcMap = decltype(runtime.DownloadStagingBuffer(size_t{}, use_deferred_download));
+    using GcCopies = decltype(FullDownloadCopies(std::declval<const ImageInfo&>()));
+    struct PendingGcDownload {
+        ImageId image_id;
+        GcMap map;
+        GcCopies copies;
+        bool scale_tick_recent{};
+    };
+    std::vector<PendingGcDownload> pending_gc_downloads;
+    u64 pending_freed_bytes{};
+    const auto FlushPendingDownloads = [&] {
+        if (pending_gc_downloads.empty()) {
+            return;
         }
-        --num_iterations;
-        auto& image = slot_images[image_id];
+        runtime.Finish();
+        for (PendingGcDownload& entry : pending_gc_downloads) {
+            Image& image = slot_images[entry.image_id];
+            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, entry.copies,
+                         entry.map.mapped_span, swizzle_data_buffer);
+            if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
+                runtime.FreeDeferredStagingBuffer(entry.map);
+            }
+            ++gc_download_deletes;
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, entry.image_id);
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            UnregisterImage(entry.image_id);
+            DeleteImage(entry.image_id, entry.scale_tick_recent);
+        }
+        pending_gc_downloads.clear();
+        pending_freed_bytes = 0;
+    };
+    const auto CanEvict = [this, &high_priority_mode, &aggressive_mode, &evict_old_costly,
+                           &pending_gc_downloads](ImageId image_id,
+                                                  bool* out_must_download = nullptr) {
+        if (out_must_download != nullptr) {
+            *out_must_download = false;
+        }
+        if (std::ranges::any_of(pending_gc_downloads, [image_id](const PendingGcDownload& entry) {
+                return entry.image_id == image_id;
+            })) {
+            return false;
+        }
+        const auto& image = slot_images[image_id];
         if (True(image.flags & ImageFlagBits::IsDecoding)) {
             return false;
         }
         const bool must_download =
             IsDownloadable(image) && False(image.flags & ImageFlagBits::BadOverlap);
+        if (out_must_download != nullptr) {
+            *out_must_download = must_download;
+        }
         if ((!aggressive_mode && !evict_old_costly &&
              True(image.flags & ImageFlagBits::CostlyLoad)) ||
             (!high_priority_mode && must_download)) {
             return false;
         }
+        return true;
+    };
+    const auto Cleanup = [this, &num_iterations, &high_priority_mode, &aggressive_mode, &CanEvict,
+                          &pending_gc_downloads, &pending_freed_bytes](ImageId image_id) {
+        if (num_iterations == 0) {
+            return true;
+        }
+        bool must_download = false;
+        if (!CanEvict(image_id, &must_download)) {
+            return false;
+        }
+        --num_iterations;
+        auto& image = slot_images[image_id];
+        if constexpr (requires(const Image& img) { img.MemoryBlock(); }) {
+            const auto block = image.MemoryBlock();
+            if (block.block != 0) {
+                const auto it = block_image_bytes.find(block.block);
+                if (it != block_image_bytes.end()) {
+                    it->second -= (std::min)(it->second, block.size);
+                }
+            }
+        }
         if (must_download) {
             ResourceTrace::Image("gc-download", image, image_id.Value());
-            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
-            const auto copies = FullDownloadCopies(image.info);
+            auto map =
+                runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, use_deferred_download);
+            auto copies = FullDownloadCopies(image.info);
             image.DownloadMemory(map, copies);
-            runtime.Finish();
-            SwizzleImage(*gpu_memory, image.gpu_addr, image.info, copies, map.mapped_span,
-                         swizzle_data_buffer);
-            ++gc_download_deletes;
+            pending_freed_bytes += ImageMemoryBytes(image);
+            pending_gc_downloads.push_back(PendingGcDownload{
+                .image_id = image_id,
+                .map = std::move(map),
+                .copies = std::move(copies),
+                .scale_tick_recent = image.scale_tick > frame_tick + 5,
+            });
+        } else {
+            if (True(image.flags & ImageFlagBits::Tracked)) {
+                UntrackImage(image, image_id);
+            }
+            ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
+            UnregisterImage(image_id);
+            DeleteImage(image_id, image.scale_tick > frame_tick + 5);
         }
-        if (True(image.flags & ImageFlagBits::Tracked)) {
-            UntrackImage(image, image_id);
-        }
-        ++(True(image.flags & ImageFlagBits::CostlyLoad) ? gc_costly_deletes : gc_deletes);
-        UnregisterImage(image_id);
-        DeleteImage(image_id, image.scale_tick > frame_tick + 5);
-        if (aggressive_mode && total_used_memory < critical_memory) {
+        const u64 effective_used =
+            total_used_memory > pending_freed_bytes ? total_used_memory - pending_freed_bytes : 0;
+        if (aggressive_mode && effective_used < critical_memory) {
             num_iterations >>= 2;
             aggressive_mode = false;
-        } else if (high_priority_mode && total_used_memory < expected_memory) {
+        } else if (high_priority_mode && effective_used < expected_memory) {
             num_iterations >>= 1;
             high_priority_mode = false;
         }
@@ -243,15 +314,19 @@ void TextureCache<P>::RunGarbageCollector() {
     // used). Among the oldest candidates (8 per image this pass may delete), those in the
     // emptiest blocks go first, so blocks drain and go back to the driver; placement already
     // prefers the fullest blocks (best fit). Images with memory of their own sit in the middle.
-    const auto Collect = [&] {
-        if (frame_tick <= ticks_to_destroy) {
+    const auto Collect = [&](u64 age_override = 0) {
+        const u64 required_age = age_override != 0 ? age_override : ticks_to_destroy;
+        if (num_iterations == 0 || frame_tick <= required_age) {
             return;
         }
+        const u64 last_tick = frame_tick - required_age;
         if constexpr (requires(const Image& image) { image.MemoryBlock(); }) {
             std::vector<ImageId> candidates;
             const size_t limit = num_iterations * 8;
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, [&](ImageId image_id) {
-                candidates.push_back(image_id);
+            lru_cache.ForEachItemBelow(last_tick, [&](ImageId image_id) {
+                if (CanEvict(image_id)) {
+                    candidates.push_back(image_id);
+                }
                 return candidates.size() >= limit;
             });
             if (candidates.empty()) {
@@ -288,7 +363,7 @@ void TextureCache<P>::RunGarbageCollector() {
                 }
             }
         } else {
-            lru_cache.ForEachItemBelow(frame_tick - ticks_to_destroy, Cleanup);
+            lru_cache.ForEachItemBelow(last_tick, Cleanup);
         }
     };
     Configure(false);
@@ -312,13 +387,16 @@ void TextureCache<P>::RunGarbageCollector() {
     }();
     if (high_priority_mode && old_age != 0 && frame_tick > old_age) {
         evict_old_costly = true;
-        lru_cache.ForEachItemBelow(frame_tick - old_age, Cleanup);
+        Collect(old_age);
         evict_old_costly = false;
+        FlushPendingDownloads();
     }
     Collect();
+    FlushPendingDownloads();
     if (total_used_memory >= critical_memory) {
         Configure(true);
         Collect();
+        FlushPendingDownloads();
     }
 }
 
@@ -712,6 +790,19 @@ bool TextureCache<P>::PublishComputeCollisionImage(u32 index) {
         return false;
     }
     const auto copies = FullDownloadCopies(info);
+    if constexpr (IMPLEMENTS_ASYNC_DOWNLOADS) {
+        if (image.unswizzled_size_bytes == static_cast<size_t>(info.pitch) * info.size.height) {
+            const BufferDownload new_buffer_download{image.gpu_addr, image.unswizzled_size_bytes};
+            const auto slot = slot_buffer_downloads.insert(new_buffer_download);
+            const PendingDownload new_download{false, uncommitted_async_buffers.size(), slot};
+            uncommitted_downloads.emplace_back(new_download);
+            auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes, true);
+            uncommitted_async_buffers.emplace_back(map);
+            image.DownloadMemory(map, copies);
+            image.flags &= ~ImageFlagBits::GpuModified;
+            return true;
+        }
+    }
     auto map = runtime.DownloadStagingBuffer(image.unswizzled_size_bytes);
     image.DownloadMemory(map, copies);
     runtime.Finish();
@@ -761,27 +852,43 @@ void TextureCache<P>::ReplaceColorFeedbackViews(std::span<ImageViewInOut> views)
     // A draw that samples its own colour target reads it while the host writes it, a feedback
     // loop: RADV reads compressed tiles back as garbage (DK Bananza's video panel came out in
     // tiles). Maxwell reads the texel before the draw's write lands, so sample a copy instead.
-    std::vector<ImageId> used_shadows;
     const auto& regs = maxwell3d->regs;
+    if (views.empty() || regs.rt_control.count == 0) {
+        return;
+    }
+    std::array<GPUVAddr, NUM_RT> rt_addrs{};
+    u32 rt_count = 0;
+    for (u32 index = 0; index < regs.rt_control.count; ++index) {
+        const auto& rt = regs.rt[regs.rt_control.Map(index)];
+        if (rt.format != Tegra::RenderTargetFormat::NONE) {
+            rt_addrs[rt_count++] = rt.Address();
+        }
+    }
+    if (rt_count == 0) {
+        return;
+    }
+    boost::container::small_vector<ImageId, 4> used_shadows;
+    ImageViewId last_non_target_view{};
     for (ImageViewInOut& view : views) {
-        if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist) {
+        if (view.id == NULL_IMAGE_VIEW_ID || view.blacklist || view.id == last_non_target_view) {
             continue;
         }
         const ImageViewBase& image_view = slot_image_views[view.id];
         if (image_view.IsBuffer()) {
+            last_non_target_view = view.id;
             continue;
         }
         const ImageId image_id = image_view.image_id;
         const GPUVAddr gpu_addr = slot_images[image_id].gpu_addr;
         bool is_target = false;
-        for (u32 index = 0; index < regs.rt_control.count; ++index) {
-            const auto& rt = regs.rt[regs.rt_control.Map(index)];
-            is_target |= rt.format != Tegra::RenderTargetFormat::NONE && rt.Address() == gpu_addr;
+        for (u32 index = 0; index < rt_count; ++index) {
+            is_target |= rt_addrs[index] == gpu_addr;
         }
         // ponytail: rescaled and multisampled targets keep the loop; copy them when a game needs
         // it.
         if (!is_target || True(slot_images[image_id].flags & ImageFlagBits::Rescaled) ||
             slot_images[image_id].info.num_samples != 1) {
+            last_non_target_view = view.id;
             continue;
         }
         const auto same_shape = [&](const FeedbackShadow& entry) {

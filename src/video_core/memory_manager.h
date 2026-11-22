@@ -146,6 +146,13 @@ public:
     [[nodiscard]] bool IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const;
 
     /**
+     * Checks if a gpu region is mapped continuously starting at the exact device address
+     * without rebuilding or consulting the MappingSnapshot cache.
+     */
+    [[nodiscard]] bool IsMappedContinuouslyTo(GPUVAddr gpu_addr, DAddr dev_addr,
+                                              std::size_t size) const;
+
+    /**
      * Checks if a gpu region is mapped entirely.
      */
     [[nodiscard]] bool IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) const;
@@ -182,6 +189,10 @@ public:
 
     /// MaxContinuousRange by walking the page tables (the answer with Nx2Perf off).
     size_t MaxContinuousRangeUncached(GPUVAddr gpu_addr, size_t size) const;
+
+    /// GetSubmappedRange by walking the page tables.
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> GetSubmappedRangeUncached(
+        GPUVAddr gpu_addr, std::size_t size) const;
 
     bool IsWithinGPUAddressRange(GPUVAddr gpu_addr) const {
         return gpu_addr < address_space_size;
@@ -228,6 +239,15 @@ private:
         std::vector<Run> runs;
         std::vector<std::pair<s64, PTEKind>> kinds;
     };
+
+    /// The segments GetSubmappedRangeImpl walks to, from the snapshot's runs: each run is one
+    /// segment, clipped to the range. Returns false if Bounds opt is off or out of range.
+    template <bool is_gpu_address>
+    bool SubmappedRangeFromRuns(
+        GPUVAddr gpu_addr, std::size_t size,
+        boost::container::small_vector<
+            std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>&
+            result) const;
 
     /// Rebuilds the runs through the big pages a page table operation touched.
     void UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size);

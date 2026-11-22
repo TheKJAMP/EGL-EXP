@@ -35,6 +35,7 @@
 #include "video_core/renderer_vulkan/vk_staging_buffer_pool.h"
 #include "video_core/renderer_vulkan/vk_texture_cache.h"
 #include "video_core/renderer_vulkan/vk_update_descriptor.h"
+#include "video_core/vertex_input_cache.h"
 #include "video_core/vulkan_common/vulkan_memory_allocator.h"
 #include "video_core/vulkan_common/vulkan_wrapper.h"
 
@@ -262,6 +263,18 @@ private:
     void UpdateColorWriteEnable(Tegra::Engines::Maxwell3D::Regs& regs);
 
     void UpdateVertexInput(Tegra::Engines::Maxwell3D::Regs& regs);
+
+    /// A dynamic vertex input state: what vkCmdSetVertexInputEXT is given.
+    struct VertexInputState {
+        boost::container::static_vector<VkVertexInputBindingDescription2EXT, 32> bindings;
+        boost::container::static_vector<VkVertexInputAttributeDescription2EXT, 32> attributes;
+    };
+    /// Builds the state from the attribute formats, vertex streams and repacked bindings (the
+    /// registers VideoCommon::VertexInputKey holds).
+    void BuildVertexInput(const Tegra::Engines::Maxwell3D::Regs& regs, u32 max_attributes,
+                          u32 max_bindings, VertexInputState& state);
+    /// Dynamic vertex input states built before, by the registers they were built from.
+    VideoCommon::VertexInputCache<VertexInputState> vertex_input_cache;
 
     Tegra::GPU& gpu;
     Tegra::MaxwellDeviceMemoryManager& device_memory;

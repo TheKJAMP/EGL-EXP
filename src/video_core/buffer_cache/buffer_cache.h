@@ -23,6 +23,7 @@
 
 #include "common/range_sets.inc"
 #include "video_core/buffer_cache/buffer_cache_base.h"
+#include "video_core/buffer_cache/download_coalesce.h"
 #include "video_core/buffer_cache/storage_buffer_size.h"
 #include "video_core/buffer_cache/buffer_bytes_equal.h"
 #include "video_core/buffer_cache/uniform_stream_reuse.h"
@@ -394,9 +395,21 @@ void BufferCache<P>::DownloadMemory(DAddr device_addr, u64 size) {
         }
     }
     ForEachBufferInRange(device_addr, size, [&](BufferId, Buffer& buffer) {
+        const DAddr buffer_end = buffer.CpuAddr() + buffer.SizeBytes();
         const DAddr start = (std::max)(device_addr, buffer.CpuAddr());
-        const DAddr end = (std::min)(device_addr + size, buffer.CpuAddr() + buffer.SizeBytes());
+        DAddr end = (std::min)(device_addr + size, buffer_end);
         if (start < end) {
+            if constexpr (USE_MEMORY_MAPS) {
+                constexpr u64 SMALL_DOWNLOAD_COALESCE_TRIGGER = 64_KiB;
+                constexpr u64 MAX_COALESCED_DOWNLOAD_BYTES = 256_KiB;
+                if (size <= SMALL_DOWNLOAD_COALESCE_TRIGGER &&
+                    memory_tracker.IsRegionGpuModified(start, end - start)) {
+                    end = CoalesceContiguousDownloadEnd(start, end, buffer_end,
+                                                        Core::DEVICE_PAGESIZE,
+                                                        MAX_COALESCED_DOWNLOAD_BYTES,
+                                                        gpu_modified_ranges);
+                }
+            }
             DownloadBufferMemory(buffer, start, end - start);
         }
     });
@@ -2782,7 +2795,18 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             if (begin >= end) {
                 continue;
             }
-            Nx2Staging staging = runtime.DownloadStagingBuffer(page_size, true);
+            // A copy recorded earlier in the open tick is read only once the tick is done, after
+            // this one: copy into its buffer again.
+            std::optional<Nx2Staging> open_copy;
+            if (!nx2_writer_trace) {
+                std::scoped_lock lock{nx2_list_mutex};
+                const auto it = nx2_list_pages.find(page);
+                if (it != nx2_list_pages.end() && it->second.copy && it->second.copy_tick == tick) {
+                    open_copy = it->second.copy;
+                }
+            }
+            const Nx2Staging staging =
+                open_copy ? *open_copy : runtime.DownloadStagingBuffer(page_size, true);
             const BufferCopy copy{
                 .src_offset = buffer.Offset(begin),
                 .dst_offset = staging.offset + (begin - page),
@@ -2796,9 +2820,9 @@ bool BufferCache<P>::Nx2CopyListPages(u64 tick) {
             if (nx2_list_copy_log) {
                 ++nx2_list_copy_stats.copies;
                 nx2_list_copy_stats.bytes += copy.size;
-                nx2_list_copy_stats.replaced_unread += entry.copy && !entry.copy_read;
+                nx2_list_copy_stats.replaced_unread += entry.copy && !open_copy && !entry.copy_read;
             }
-            if (entry.copy) {
+            if (entry.copy && !open_copy) {
                 if (nx2_writer_trace) {
                     nx2_writer_trace->FreezeCopy(
                         reinterpret_cast<uintptr_t>(entry.copy->mapped_span.data()), entry.copy_writes);
@@ -2888,8 +2912,8 @@ auto BufferCache<P>::Nx2ReadListCopy(DAddr device_addr, std::span<u8> out, bool 
                 if (!past_sync) {
                     return Nx2ListRead::NeedsSync;
                 }
-                return entry.synced_writes == entry.writes ? Nx2ListRead::Synced
-                                                           : Nx2ListRead::Unknown;
+                // Past the sync the back noted every write the list can see: fall through to
+                // synced_writes / current(entry) without forcing a flush and Scheduler::Finish.
             }
             // Pages the CPU writes the lists of (GPU-written once, long before) stay synced.
             if (entry.synced_writes == entry.writes) {

@@ -372,8 +372,8 @@ std::optional<std::pair<VkBuffer, VkDeviceSize>> VertexRepackPass::Assemble(VkBu
             .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, read_barrier);
         const auto set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
@@ -416,8 +416,8 @@ void PlainUnswizzlePass::Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer
             .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT | VK_PIPELINE_STAGE_HOST_BIT,
-                              VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
+        cmdbuf.PipelineBarrier(vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER,
+                               VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, before);
         const auto set = descriptor_allocator.Commit();
         device.GetLogical().UpdateDescriptorSet(set, *descriptor_template, data);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
@@ -432,6 +432,7 @@ void PlainUnswizzlePass::Dispatch(VkBuffer source, VkDeviceSize offset, VkBuffer
         cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
                               VK_PIPELINE_STAGE_TRANSFER_BIT, 0, after);
     });
+    scheduler.InvalidateDescriptorBuffer();
 }
 
 Uint8Pass::Uint8Pass(const Device& device_, Scheduler& scheduler_, DescriptorPool& descriptor_pool,
@@ -729,8 +730,9 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
     const VkImageAspectFlags aspect_mask = target.aspect_mask;
     const VkImage vk_image = target.image;
     const bool is_initialized = target.initialized;
-    scheduler.Record([vk_pipeline, vk_image, aspect_mask,
-                      is_initialized](vk::CommandBuffer cmdbuf) {
+    const bool compute_only = target.compute_only_barrier;
+    scheduler.Record([vk_pipeline, vk_image, aspect_mask, is_initialized,
+                      compute_only](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier image_barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
@@ -750,9 +752,11 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
-        cmdbuf.PipelineBarrier(is_initialized ? vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER
-                              : VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT),
-                       VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
+        const VkPipelineStageFlags src_stage =
+            !is_initialized ? VkPipelineStageFlags(VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT)
+            : compute_only  ? VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                            : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER;
+        cmdbuf.PipelineBarrier(src_stage, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, image_barrier);
         cmdbuf.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, vk_pipeline);
     });
     // With trimmed host levels the input holds each layer's mip chain from host_level_offset on
@@ -835,12 +839,14 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
             cmdbuf.Dispatch(num_dispatches_x, num_dispatches_y, num_dispatches_z);
         });
     }
-    scheduler.Record([vk_image, aspect_mask](vk::CommandBuffer cmdbuf) {
+    scheduler.Record([vk_image, aspect_mask, compute_only](vk::CommandBuffer cmdbuf) {
         const VkImageMemoryBarrier image_barrier{
             .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
             .pNext = nullptr,
             .srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+            .dstAccessMask = static_cast<VkAccessFlags>(
+                compute_only ? VK_ACCESS_SHADER_READ_BIT
+                             : (VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT)),
             .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
             .newLayout = VK_IMAGE_LAYOUT_GENERAL,
             .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
@@ -854,8 +860,10 @@ void ASTCDecoderPass::AssembleInto(const VideoCommon::ImageInfo& info, u32 skip,
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         };
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                       vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, image_barrier);
+        const VkPipelineStageFlags dst_stage =
+            compute_only ? VkPipelineStageFlags(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT)
+                         : vk::PIPELINE_STAGE_GRAPHICS_COMPUTE;
+        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, dst_stage, 0, image_barrier);
     });
     scheduler.InvalidateDescriptorBuffer();
     // Each decode ends with a submit to the host GPU. Measured here

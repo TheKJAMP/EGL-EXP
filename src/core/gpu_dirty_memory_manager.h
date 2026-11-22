@@ -9,6 +9,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <bit>
 #include <functional>
@@ -31,27 +32,14 @@ public:
     ~GPUDirtyMemoryManager() = default;
 
     void Collect(PAddr address, size_t size) {
-        TransformAddress t = BuildTransform(address, size);
-        TransformAddress tmp, original;
-        do {
-            tmp = current.load(std::memory_order_acquire);
-            original = tmp;
-            if (tmp.address != t.address) {
-                if (IsValid(tmp.address)) {
-                    std::scoped_lock lk(guard);
-                    back_buffer.emplace_back(tmp);
-                    current.exchange(t, std::memory_order_relaxed);
-                    return;
-                }
-                tmp.address = t.address;
-                tmp.mask = 0;
-            }
-            if ((tmp.mask | t.mask) == tmp.mask) {
-                return;
-            }
-            tmp.mask |= t.mask;
-        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
-                                                std::memory_order_relaxed));
+        // A transform covers one 2 KiB page: split cross-page writes per page so BuildTransform
+        // never shifts u32 by >= 32 (UB that could drop bits).
+        while (size != 0) {
+            const size_t in_page = (std::min)(size, page_size - (address & page_mask));
+            CollectInPage(address, in_page);
+            address += in_page;
+            size -= in_page;
+        }
     }
 
     /// Calls `callback` for each write collected and not yet gathered, without consuming them.
@@ -68,6 +56,13 @@ public:
         for (const auto& transform : pending) {
             ForEachRun(transform, callback);
         }
+    }
+
+    /// False when Gather would find nothing. Every Collect that adds a write leaves its transform
+    /// in `current`, and only Gather (which drains back_buffer too) resets `current` to an empty
+    /// transform whose mask is 0. Without the locks: a Collect missed here is ordered after this call.
+    [[nodiscard]] bool MayHavePending() const {
+        return current.load(std::memory_order_acquire).mask != 0;
     }
 
     void Gather(std::function<void(PAddr, size_t)>& callback) {
@@ -100,6 +95,31 @@ private:
         u32 address;
         u32 mask;
     };
+
+    /// [address, address + size) lies within one 2 KiB page and size > 0, so its mask is non-zero.
+    void CollectInPage(PAddr address, size_t size) {
+        TransformAddress t = BuildTransform(address, size);
+        TransformAddress tmp, original;
+        do {
+            tmp = current.load(std::memory_order_acquire);
+            original = tmp;
+            if (tmp.address != t.address) {
+                if (IsValid(tmp.address)) {
+                    std::scoped_lock lk(guard);
+                    back_buffer.emplace_back(tmp);
+                    current.exchange(t, std::memory_order_relaxed);
+                    return;
+                }
+                tmp.address = t.address;
+                tmp.mask = 0;
+            }
+            if ((tmp.mask | t.mask) == tmp.mask) {
+                return;
+            }
+            tmp.mask |= t.mask;
+        } while (!current.compare_exchange_weak(original, tmp, std::memory_order_release,
+                                                std::memory_order_relaxed));
+    }
 
     template <typename Func>
     static void ForEachRun(const TransformAddress& transform, Func&& callback) {

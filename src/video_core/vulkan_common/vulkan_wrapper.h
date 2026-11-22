@@ -1249,10 +1249,17 @@ private:
 
 class CommandBuffer {
 public:
+    struct ComputeBinding {
+        VkPipeline pipeline{};
+        u64 requests{};
+        u64 reused{};
+    };
+
     CommandBuffer() noexcept = default;
 
-    explicit CommandBuffer(VkCommandBuffer handle_, const DeviceDispatch& dld_) noexcept
-        : handle{handle_}, dld{&dld_} {}
+    explicit CommandBuffer(VkCommandBuffer handle_, const DeviceDispatch& dld_,
+                           ComputeBinding* compute_binding_ = nullptr) noexcept
+        : handle{handle_}, dld{&dld_}, compute_binding{compute_binding_} {}
 
     const VkCommandBuffer* address() const noexcept {
         return &handle;
@@ -1263,6 +1270,9 @@ public:
     }
     void Begin(const VkCommandBufferBeginInfo& begin_info) const {
         Check(dld->vkBeginCommandBuffer(handle, &begin_info));
+        if (compute_binding) {
+            compute_binding->pipeline = VK_NULL_HANDLE;
+        }
     }
 
     void End() const {
@@ -1309,6 +1319,14 @@ public:
     }
 
     void BindPipeline(VkPipelineBindPoint bind_point, VkPipeline pipeline) const noexcept {
+        if (bind_point == VK_PIPELINE_BIND_POINT_COMPUTE && compute_binding) {
+            ++compute_binding->requests;
+            if (pipeline != VK_NULL_HANDLE && pipeline == compute_binding->pipeline) {
+                ++compute_binding->reused;
+                return;
+            }
+            compute_binding->pipeline = pipeline;
+        }
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
     }
 
@@ -1806,8 +1824,9 @@ public:
     }
 
 private:
-    VkCommandBuffer handle;
-    const DeviceDispatch* dld;
+    VkCommandBuffer handle{};
+    const DeviceDispatch* dld{};
+    ComputeBinding* compute_binding{};
 };
 
 u32 AvailableVersion(const InstanceDispatch& dld) noexcept;

@@ -26,6 +26,11 @@ void InnerFence::Queue() {
     if (is_stubbed) {
         return;
     }
+    if (!scheduler.HasPendingCommands()) {
+        // All prior commands were already submitted on an earlier tick; no empty submission needed.
+        wait_tick = scheduler.CurrentTick() - 1;
+        return;
+    }
     // Get the current tick so we can wait for it
     wait_tick = scheduler.CurrentTick();
     if (!scheduler.DeferFlush()) {

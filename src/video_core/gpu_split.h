@@ -481,6 +481,8 @@ private:
 
     /// One step of a front wait for the back to consume `target`.
     void Backoff(u32 spins, u64 target);
+    /// Parks the front until the back consumes `target` (or goes quiet when `wait_for_idle`).
+    void SleepForBack(u64 target, bool wait_for_idle = false);
     /// The idle hook (deferred submits), timed as its own profiler zone.
     void RunIdleHook();
     /// After the back stored `consumed`: wakes a front sleeping in Backoff.

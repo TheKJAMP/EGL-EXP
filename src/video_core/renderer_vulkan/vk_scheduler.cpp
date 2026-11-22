@@ -25,6 +25,7 @@
 #include "video_core/gpu_logging/gpu_logging.h"
 #include "video_core/nx2_perf.h"
 #include "video_core/nx2_profile.h"
+#include "video_core/renderer_vulkan/end_renderpass_barriers.h"
 #include "video_core/renderer_vulkan/upload_batch.h"
 #include "video_core/renderer_vulkan/vk_command_pool.h"
 #include "video_core/renderer_vulkan/vk_graphics_pipeline.h"
@@ -37,12 +38,11 @@
 
 namespace Vulkan {
 
-void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf,
-                                         vk::CommandBuffer upload_cmdbuf) {
+void Scheduler::CommandChunk::ExecuteAll(vk::CommandBuffer cmdbuf, Scheduler& scheduler) {
     auto command = first;
     while (command != nullptr) {
         auto next = command->GetNext();
-        command->Execute(cmdbuf, upload_cmdbuf);
+        command->Execute(cmdbuf, scheduler);
         command->~Command();
         command = next;
     }
@@ -416,6 +416,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
         return true;
     }};
 
+    u64 last_compute_bind_report{};
     while (!stop_token.stop_requested()) {
         std::unique_ptr<CommandChunk> work;
 
@@ -431,7 +432,7 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
 
             // If we've been asked to stop, we're done.
             if (stop_token.stop_requested()) {
-                return;
+                break;
             }
 
             // Exchange lock ownership so that we take the execution lock before
@@ -442,12 +443,19 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             // Perform the work, tracking whether the chunk was a submission
             // before executing.
             const bool has_submit = work->HasSubmit();
-            work->ExecuteAll(current_cmdbuf, current_upload_cmdbuf);
+            work->ExecuteAll(current_cmdbuf, *this);
 
             // If the chunk was a submission, reallocate the command buffer.
             if (has_submit) {
                 AllocateWorkerCommandBuffer();
             }
+        }
+
+        if (worker_compute_binding.requests - last_compute_bind_report >= 16'384 &&
+            VideoCommon::Nx2Profile::Enabled()) {
+            last_compute_bind_report = worker_compute_binding.requests;
+            LOG_INFO(Render_Vulkan, "Compute pipeline binds reused: {} of {}",
+                     worker_compute_binding.reused, worker_compute_binding.requests);
         }
 
         {
@@ -457,23 +465,50 @@ void Scheduler::WorkerThread(std::stop_token stop_token) {
             chunk_reserve.emplace_back(std::move(work));
         }
     }
+    if (VideoCommon::Nx2Profile::Enabled()) {
+        LOG_INFO(Render_Vulkan, "Compute pipeline binds reused: {} of {}",
+                 worker_compute_binding.reused, worker_compute_binding.requests);
+    }
 }
 
 void Scheduler::AllocateWorkerCommandBuffer() {
-    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+    static const bool reuse_compute_bindings = [] {
+        const char* value = std::getenv("EDEN_VK_COMPUTE_BIND_CACHE");
+        return value == nullptr || value[0] != '0';
+    }();
+    // Recorded commands copy the wrapper but share the primary command buffer's binding state.
+    current_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader(),
+                                       reuse_compute_bindings ? &worker_compute_binding : nullptr);
     current_cmdbuf.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
         .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
         .pInheritanceInfo = nullptr,
     });
-    current_upload_cmdbuf = vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
-    current_upload_cmdbuf.Begin({
-        .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
-        .pNext = nullptr,
-        .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
-        .pInheritanceInfo = nullptr,
-    });
+    current_upload_cmdbuf = {};
+}
+
+vk::CommandBuffer Scheduler::EnsureUploadCommandBuffer() {
+    if (*current_upload_cmdbuf == VK_NULL_HANDLE) {
+        static constexpr VkMemoryBarrier READ_BARRIER{
+            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+            .pNext = nullptr,
+            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
+        };
+        current_upload_cmdbuf =
+            vk::CommandBuffer(command_pool->Commit(), device.GetDispatchLoader());
+        current_upload_cmdbuf.Begin({
+            .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+            .pNext = nullptr,
+            .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
+            .pInheritanceInfo = nullptr,
+        });
+        // Order reordered uploads after all commands from earlier submissions on this queue.
+        current_upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+                                              VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+    }
+    return current_upload_cmdbuf;
 }
 
 u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore) {
@@ -489,23 +524,19 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
     draws_since_submit = 0;
 
     const u64 signal_value = master_semaphore->NextTick();
-    RecordWithUploadBuffer([signal_semaphore, wait_semaphore, signal_value,
-                            this](vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) {
-        static constexpr VkMemoryBarrier WRITE_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-        };
-        static constexpr VkMemoryBarrier READ_BARRIER{
-            .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-            .pNext = nullptr,
-            .srcAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
-            .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT,
-        };
-        upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WRITE_BARRIER);
-        upload_cmdbuf.End();
-        cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, READ_BARRIER);
+    Record([signal_semaphore, wait_semaphore, signal_value, this](vk::CommandBuffer cmdbuf) {
+        if (*current_upload_cmdbuf != VK_NULL_HANDLE) {
+            static constexpr VkMemoryBarrier WRITE_BARRIER{
+                .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                .pNext = nullptr,
+                .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+                .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
+            };
+            current_upload_cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                                  VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0,
+                                                  WRITE_BARRIER);
+            current_upload_cmdbuf.End();
+        }
         cmdbuf.End();
 
         if (on_submit) {
@@ -514,7 +545,7 @@ u64 Scheduler::SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_se
 
         std::scoped_lock lock{submit_mutex};
         switch (const VkResult result = master_semaphore->SubmitQueue(
-                    cmdbuf, upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
+                    cmdbuf, current_upload_cmdbuf, signal_semaphore, wait_semaphore, signal_value)) {
         case VK_SUCCESS:
             // Log successful queue submission
             if (GPU::Logging::IsActive() &&
@@ -568,6 +599,12 @@ void Scheduler::EndRenderPass()
         fragment_barrier.Reset();
         render_pass_has_stores = false;
         render_pass_depth_written = false;
+        const bool emit_xfb_barrier =
+            device.IsExtTransformFeedbackSupported() && std::exchange(render_pass_used_xfb, false);
+        const VkPipelineStageFlags wfi_stages = std::exchange(deferred_wfi_stages, 0);
+        if (wfi_stages != 0) {
+            storage_writes_unordered = false;
+        }
 
         query_cache->CounterClose(VideoCommon::QueryType::StreamingByteCount);
 
@@ -581,50 +618,17 @@ void Scheduler::EndRenderPass()
         query_cache->NotifySegment(false);
 
         Record([num_images = num_renderpass_images,
-                       images = renderpass_images,
-                       ranges = renderpass_image_ranges,
-                       has_transform_feedback = device.IsExtTransformFeedbackSupported()](
-                          vk::CommandBuffer cmdbuf) {
-            std::array<VkImageMemoryBarrier, 9> barriers;
-            for (size_t i = 0; i < num_images; ++i) {
-                const VkImageSubresourceRange& range = ranges[i];
-                const bool is_color = (range.aspectMask & VK_IMAGE_ASPECT_COLOR_BIT) != 0;
-                const bool is_depth_stencil = (range.aspectMask
-                                              & (VK_IMAGE_ASPECT_DEPTH_BIT
-                                                 | VK_IMAGE_ASPECT_STENCIL_BIT)) !=0;
-
-                VkAccessFlags src_access = 0;
-
-                if (is_color)
-                    src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT;
-                else if (is_depth_stencil)
-                    src_access |= VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-                else
-                    src_access |= VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                                  | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT;
-
-                barriers[i] = VkImageMemoryBarrier{
-                        .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
-                        .pNext = nullptr,
-                        .srcAccessMask = src_access,
-                        .dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT
-                                         | VK_ACCESS_COLOR_ATTACHMENT_READ_BIT
-                                         | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT
-                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_READ_BIT
-                                         | VK_ACCESS_DEPTH_STENCIL_ATTACHMENT_WRITE_BIT,
-                        .oldLayout = VK_IMAGE_LAYOUT_GENERAL,
-                        .newLayout = VK_IMAGE_LAYOUT_GENERAL,
-                        .srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED,
-                        .image = images[i],
-                        .subresourceRange = range,
-                };
-            }
+                images = renderpass_images,
+                ranges = renderpass_image_ranges,
+                emit_xfb_barrier,
+                wfi_stages](vk::CommandBuffer cmdbuf) {
+            const EndRenderPassBarriers built = BuildEndRenderPassBarriers(num_images, images, ranges);
             cmdbuf.EndRenderPass();
-            cmdbuf.PipelineBarrier(VK_PIPELINE_STAGE_EARLY_FRAGMENT_TESTS_BIT | VK_PIPELINE_STAGE_LATE_FRAGMENT_TESTS_BIT |
-                                   VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE,
-                                   0, nullptr, nullptr, vk::Span(barriers.data(), num_images));
-            if (has_transform_feedback) {
+            if (built.count != 0) {
+                cmdbuf.PipelineBarrier(built.src_stages, vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0,
+                                       nullptr, nullptr, vk::Span(built.barriers.data(), built.count));
+            }
+            if (emit_xfb_barrier) {
                 static constexpr VkMemoryBarrier XFB_OUTPUT_BARRIER{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,
@@ -635,21 +639,18 @@ void Scheduler::EndRenderPass()
                                        VK_PIPELINE_STAGE_VERTEX_INPUT_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
                                        0, XFB_OUTPUT_BARRIER);
             }
-        });
-
-        if (const VkPipelineStageFlags stages = std::exchange(deferred_wfi_stages, 0)) {
-            // The guest's wait-for-idle (RasterizerVulkan::WaitForIdle) from inside the pass.
-            Record([stages](vk::CommandBuffer cmdbuf) {
+            if (wfi_stages != 0) {
+                // The guest's wait-for-idle (RasterizerVulkan::WaitForIdle) from inside the pass.
                 static constexpr VkMemoryBarrier WFI_BARRIER{
                     .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                     .pNext = nullptr,
                     .srcAccessMask = VK_ACCESS_MEMORY_WRITE_BIT,
                     .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
                 };
-                cmdbuf.PipelineBarrier(stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
-            });
-            storage_writes_unordered = false;
-        }
+                cmdbuf.PipelineBarrier(wfi_stages, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, WFI_BARRIER);
+            }
+        });
+
         state.renderpass = VkRenderPass{};
         num_renderpass_images = 0;
         ++pass_epoch;
@@ -723,8 +724,7 @@ void Scheduler::ReleasePass() {
                                       VkPipelineStageFlags src_stages,
                                       VkPipelineStageFlags dst_stages) {
         std::unique_ptr<CommandChunk> barrier = TakeReserveChunk();
-        auto command = [src_access, dst_access, src_stages, dst_stages](vk::CommandBuffer cmdbuf,
-                                                                        vk::CommandBuffer) {
+        auto command = [src_access, dst_access, src_stages, dst_stages](vk::CommandBuffer cmdbuf) {
             const VkMemoryBarrier memory_barrier{
                 .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
                 .pNext = nullptr,
@@ -733,7 +733,7 @@ void Scheduler::ReleasePass() {
             };
             cmdbuf.PipelineBarrier(src_stages, dst_stages, 0, memory_barrier);
         };
-        (void)barrier->Record(command);
+        (void)barrier->Record<true>(command);
         return barrier;
     };
     std::vector<std::unique_ptr<CommandChunk>> pre_pass;

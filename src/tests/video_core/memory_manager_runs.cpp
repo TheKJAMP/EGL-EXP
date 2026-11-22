@@ -7,6 +7,7 @@
 #include <exception>
 #include <limits>
 #include <random>
+#include <tuple>
 #include <catch2/catch_test_macros.hpp>
 #include <catch2/generators/catch_generators.hpp>
 
@@ -92,6 +93,8 @@ TEST_CASE("MaxContinuousRange from the mapping runs matches the page walk", "[me
         REQUIRE(memory.MaxContinuousRange(address, size) ==
                 memory.MaxContinuousRangeUncached(address, size));
         REQUIRE(memory.GetMemoryLayoutSize(address) == memory.GetMemoryLayoutSizeUncached(address));
+        REQUIRE(memory.GetSubmappedRange(address, size) ==
+                memory.GetSubmappedRangeUncached(address, size));
     };
 
     // Known answers first, so the comparison isn't between two zeros.
@@ -221,4 +224,78 @@ TEST_CASE("ReadU32 with a page cache reads what Read<u32> reads", "[memory_manag
         CAPTURE(offset);
         CHECK(memory.ReadU32(window + offset, cache) == memory.Read<u32>(window + offset));
     }
+}
+
+TEST_CASE("MemoryManager: IsMappedContinuouslyTo matches direct check across big and small pages",
+          "[memory_manager]") {
+    ScopedSystemTestContext context;
+    Core::System system;
+    Core::DeviceMemory physical;
+    Tegra::MaxwellDeviceMemoryManager device_memory{physical};
+    NullRasterizer rasterizer;
+    Tegra::MemoryManager memory{system, device_memory, 32, 1ULL << 34, 16};
+    memory.BindRasterizer(&rasterizer);
+
+    constexpr u64 small_page = 0x1000;
+    constexpr u64 big_page = 0x10000;
+    constexpr GPUVAddr base = 0x4000'0000;
+    constexpr DAddr dev_a = 0x1000'0000;
+    constexpr DAddr dev_b = 0x2000'0000;
+    constexpr DAddr dev_c = 0x2000'0000 + big_page;
+
+    const auto expected = [&](GPUVAddr gpu, DAddr dev, size_t size) {
+        return memory.IsContinuousRange(gpu, size) && memory.GpuToCpuAddress(gpu) == dev;
+    };
+
+    // Unmapped initially
+    CHECK_FALSE(memory.IsMappedContinuouslyTo(base, dev_a, small_page));
+    CHECK(memory.IsMappedContinuouslyTo(base, dev_a, small_page) ==
+          expected(base, dev_a, small_page));
+
+    // Multi-big-page contiguous region
+    memory.Map(base, dev_a, 3 * big_page, Tegra::PTEKind::PITCH, true);
+    for (const auto& [gpu, dev, size] : {
+             std::tuple<GPUVAddr, DAddr, size_t>{base, dev_a, big_page},
+             std::tuple<GPUVAddr, DAddr, size_t>{base, dev_a, 3 * big_page},
+             std::tuple<GPUVAddr, DAddr, size_t>{base + 0x1234, dev_a + 0x1234, 2 * big_page},
+             std::tuple<GPUVAddr, DAddr, size_t>{base, dev_b, big_page},
+             std::tuple<GPUVAddr, DAddr, size_t>{base, dev_a, 4 * big_page},
+             std::tuple<GPUVAddr, DAddr, size_t>{base, dev_a, 0},
+             std::tuple<GPUVAddr, DAddr, size_t>{base + 0x200, dev_a + 0x200, 0},
+         }) {
+        CAPTURE(gpu, dev, size);
+        CHECK(memory.IsMappedContinuouslyTo(gpu, dev, size) == expected(gpu, dev, size));
+    }
+
+    // Small-page contiguous, non-contiguous, and mixed big+small contiguous mappings
+    constexpr GPUVAddr small_base = base + 5 * big_page;
+    memory.Map(small_base, dev_b, 4 * small_page, Tegra::PTEKind::PITCH, false);
+    // Disjoint next small page
+    memory.Map(small_base + 4 * small_page, dev_a, small_page, Tegra::PTEKind::PITCH, false);
+    CHECK(memory.IsMappedContinuouslyTo(small_base, dev_b, 4 * small_page) ==
+          expected(small_base, dev_b, 4 * small_page));
+    CHECK(memory.IsMappedContinuouslyTo(small_base, dev_b, 4 * small_page));
+    CHECK_FALSE(memory.IsMappedContinuouslyTo(small_base, dev_b, 5 * small_page));
+    CHECK(memory.IsMappedContinuouslyTo(small_base, dev_b, 5 * small_page) ==
+          expected(small_base, dev_b, 5 * small_page));
+
+    // Gap at small_base + 5*small_page, then contiguous big page at +big_page? No, small_base is
+    // big-page aligned: map small_base + 16*small_page (= +1 big_page) as big page at dev_c, and fill
+    // [small_base + 4*small_page, small_base + big_page) contiguously from dev_b + 4*small_page.
+    memory.Map(small_base + 4 * small_page, dev_b + 4 * small_page, 12 * small_page,
+               Tegra::PTEKind::PITCH, false);
+    memory.Map(small_base + big_page, dev_c, big_page, Tegra::PTEKind::PITCH, true);
+    CHECK(memory.IsMappedContinuouslyTo(small_base, dev_b, 2 * big_page));
+    CHECK(memory.IsMappedContinuouslyTo(small_base, dev_b, 2 * big_page) ==
+          expected(small_base, dev_b, 2 * big_page));
+
+    // Sparse reserved gap inside range
+    constexpr GPUVAddr sparse_base = base + 8 * big_page;
+    memory.MapSparse(sparse_base, big_page, true);
+    CHECK_FALSE(memory.IsMappedContinuouslyTo(sparse_base, 0, big_page));
+    CHECK_FALSE(memory.IsMappedContinuouslyTo(sparse_base, 0, 0));
+
+    // Device address outside MaxwellDeviceMemoryManager::AS_BITS
+    constexpr DAddr invalid_dev = DAddr{1} << Tegra::MaxwellDeviceMemoryManager::AS_BITS;
+    CHECK_FALSE(memory.IsMappedContinuouslyTo(base, invalid_dev, small_page));
 }

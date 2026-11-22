@@ -112,7 +112,12 @@ struct GPU::Impl {
 
     /// Synchronizes CPU writes with Host GPU memory.
     void InvalidateGPUCache() {
-        // Runs at every fence (~17k/s), on more than one thread: keep each thread's buffer.
+        // Runs at every fence (~17k/s), on more than one thread: avoid creating std::function and
+        // taking each manager's locks when no manager has pending writes.
+        if (std::ranges::none_of(system.GetGPUDirtyMemoryManager(),
+                                 &Core::GPUDirtyMemoryManager::MayHavePending)) {
+            return;
+        }
         thread_local std::vector<std::pair<DAddr, u64>> thread_writes;
         auto& writes = thread_writes;
         writes.clear();

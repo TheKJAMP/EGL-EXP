@@ -10,6 +10,8 @@
 add_executable(tests
     core/nx2_frame_interval.cpp
     video_core/upload_batch.cpp
+    video_core/end_renderpass_barriers.cpp
+    video_core/download_coalesce.cpp
     video_core/texture_swizzle.cpp
     core/nx2_oot_time.cpp
     core/address_space.cpp
@@ -114,6 +116,9 @@ add_executable(tests
     video_core/plain_unswizzle.cpp
     video_core/uniform_stream_reuse.cpp
     video_core/shader_invalidation.cpp
+    video_core/vertex_input_cache.cpp
+    video_core/pipeline_layout_cache.cpp
+    video_core/nx2_backx.cpp
     video_core/descriptor_table.cpp
     video_core/global_address_tracking.cpp
     video_core/global_atomic_routing.cpp

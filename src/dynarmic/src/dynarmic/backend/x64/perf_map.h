@@ -18,12 +18,14 @@ namespace Dynarmic::Backend::X64 {
 namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name);
 }  // namespace detail
+bool PerfMapEnabled() noexcept;
 template<typename T>
 void PerfMapRegister(T start, const void* end, std::string_view friendly_name) noexcept {
     detail::PerfMapRegister(std::bit_cast<const void*>(start), end, friendly_name);
 }
 void PerfMapClear();
 #else
+constexpr bool PerfMapEnabled() noexcept { return false; }
 // Resolve to no-op (compiler thinks fmt has side effects)
 template<typename T> inline void PerfMapRegister(T, const void*, std::string_view) noexcept {}
 inline void PerfMapClear() noexcept {}

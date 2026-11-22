@@ -293,26 +293,24 @@ public:
     void TranscodeAstcToBcnFused(Image& image, const StagingBufferRef& map,
                                  std::span<const VideoCommon::SwizzleParameters> swizzles);
 
-    /// Temporary decode images, reusable once the GPU is past `tick`.
-    struct PendingTranscode {
-        u64 tick;
+    /// Temporary RGBA8 decode images reused immediately across transcodes of the same shape
+    /// within the same command buffer (synchronized by COMPUTE -> COMPUTE barriers).
+    struct TranscodeScratch {
+        u64 tick{};
         vk::Image image;
         std::vector<vk::ImageView> views;
         /// Per level and layer (level * layers + layer), for layer-chunked decodes.
         std::vector<vk::ImageView> layer_views;
-        u32 width;
-        u32 height;
-        u32 levels;
-        u32 layers;
-        u32 unused_frames;
+        u32 width{};
+        u32 height{};
+        u32 levels{};
+        u32 layers{};
+        u32 unused_frames{};
+        bool initialized{};
     };
-    std::deque<PendingTranscode> pending_transcodes;
-    /// Decode images the GPU is done with, for the next texture of the same shape.
-    std::vector<PendingTranscode> free_transcodes;
+    std::vector<TranscodeScratch> transcode_scratch;
     /// RGBA8 bytes of a decode image.
-    static u64 TranscodeDecodeBytes(const PendingTranscode& t);
-    /// Moves finished decode images to free_transcodes (within its limit) or destroys them.
-    void RecycleTranscodes();
+    static u64 TranscodeDecodeBytes(const TranscodeScratch& t);
 
     std::optional<BlockLinearUnswizzle3DPass> bl3d_unswizzle_pass;
     std::optional<PlainUnswizzlePass> plain_unswizzle_pass;

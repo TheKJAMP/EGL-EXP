@@ -44,6 +44,11 @@ void OpenFile() {
 }
 }  // anonymous namespace
 
+bool PerfMapEnabled() noexcept {
+    static const bool enabled = std::getenv("PERF_BUILDID_DIR") != nullptr;
+    return enabled;
+}
+
 namespace detail {
 void PerfMapRegister(const void* start, const void* end, std::string_view friendly_name) {
     if (start == end) {

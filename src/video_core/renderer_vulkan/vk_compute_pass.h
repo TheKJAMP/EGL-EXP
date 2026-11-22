@@ -179,6 +179,7 @@ public:
         bool initialized;
         std::function<VkImageView(s32 host_level)> level_view;
         bool wait; ///< Wait for the GPU afterwards (the decoded image itself is sampled).
+        bool compute_only_barrier{}; ///< Image is only accessed by compute shaders (e.g. transcode scratch).
         /// When set, the input holds only these layers (in order), each decoded into
         /// layer_view(host level, layer).
         std::span<const u32> layers{};

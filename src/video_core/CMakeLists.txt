@@ -35,6 +35,7 @@ add_library(video_core STATIC
     buffer_cache/buffer_cache_base.h
     buffer_cache/buffer_cache.cpp
     buffer_cache/buffer_cache.h
+    buffer_cache/download_coalesce.h
     buffer_cache/memory_tracker_base.h
     buffer_cache/usage_tracker.h
     buffer_cache/virtual_range_cache.h
@@ -400,6 +401,7 @@ add_library(video_core STATIC
     renderer_vulkan/vk_resource_pool.h
     renderer_vulkan/vk_scheduler.cpp
     renderer_vulkan/vk_scheduler.h
+    renderer_vulkan/end_renderpass_barriers.h
     renderer_vulkan/fragment_barrier_state.h
     renderer_vulkan/vk_shader_util.cpp
     renderer_vulkan/vk_shader_util.h
@@ -494,6 +496,7 @@ add_library(video_core STATIC
     textures/workers.h
     transform_feedback.cpp
     transform_feedback.h
+    vertex_input_cache.h
     video_core.cpp
     video_core.h
 )

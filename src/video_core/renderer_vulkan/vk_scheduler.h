@@ -80,6 +80,11 @@ public:
         return tick < master_semaphore->CurrentTick();
     }
 
+    /// Whether any command, batched upload, or deferred clear is recorded for the current tick.
+    [[nodiscard]] bool HasPendingCommands() const noexcept {
+        return commands_pending || uploads_pending || deferred_clear.framebuffer != nullptr;
+    }
+
     /// Nx2Perf submit_while_waited: FlushWork counts its draws; only a submission (Flush,
     /// Finish) resets the count, not a deferred FlushCommands.
     void NoteDraw() noexcept {
@@ -133,6 +138,11 @@ public:
     void NoteRenderPassStores() {
         render_pass_has_stores = true;
         storage_writes_unordered = true;
+    }
+
+    /// A draw in the active render pass used transform feedback (EndRenderPass needs XFB barrier).
+    void NoteTransformFeedback() noexcept {
+        render_pass_used_xfb = true;
     }
 
     /// A draw wrote storage since the last memory barrier after all graphics stages: a host
@@ -225,6 +235,12 @@ public:
         state.rescaling_defined = false;
     }
 
+    /// Marks push-constant rescaling state as disturbed (e.g. after compute push constants)
+    /// without disturbing bound descriptor buffers.
+    void InvalidateRescaling() noexcept {
+        state.rescaling_defined = false;
+    }
+
     /// Invalidates current command buffer state except for render passes
     void InvalidateState();
 
@@ -303,13 +319,10 @@ public:
     template <typename T>
         requires std::is_invocable_v<T, vk::CommandBuffer>
     void RecordBeforeRenderPass(PrePassStage stage, T&& c) {
-        auto command = [command = std::move(c)](vk::CommandBuffer cmdbuf, vk::CommandBuffer) {
-            command(cmdbuf);
-        };
         auto& chunks = pre_pass_chunks[static_cast<size_t>(stage)];
-        if (chunks.empty() || !chunks.back()->Record(command)) {
+        if (chunks.empty() || !chunks.back()->Record<true>(c)) {
             chunks.push_back(TakeReserveChunk());
-            (void)chunks.back()->Record(command);
+            (void)chunks.back()->Record<true>(c);
         }
     }
 
@@ -326,6 +339,10 @@ public:
                 FlushUploads();
             }
             if (chunk->Record<true>(c)) {
+                return;
+            }
+            if (pass_held && HoldFullPassChunk()) {
+                (void)chunk->Record<true>(c);
                 return;
             }
             DispatchWork();
@@ -351,6 +368,10 @@ public:
             VideoCommon::GpuSplit::CheckOwner("Scheduler::RecordState");
         }
         if (!chunk->Record<true>(command)) {
+            if (pass_held && HoldFullPassChunk()) {
+                (void)chunk->Record<true>(command);
+                return;
+            }
             DispatchWork();
             (void)chunk->Record<true>(command);
         }
@@ -441,7 +462,7 @@ private:
     public:
         virtual ~Command() = default;
 
-        virtual void Execute(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) const = 0;
+        virtual void Execute(vk::CommandBuffer cmdbuf, Scheduler& scheduler) const = 0;
 
         Command* GetNext() const {
             return next;
@@ -464,12 +485,11 @@ private:
         TypedCommand(TypedCommand&&) = delete;
         TypedCommand& operator=(TypedCommand&&) = delete;
 
-        void Execute(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf) const override {
-
+        void Execute(vk::CommandBuffer cmdbuf, Scheduler& scheduler) const override {
             if constexpr (SingleBuffer) {
                 command(cmdbuf);
             } else {
-                command(cmdbuf, upload_cmdbuf);
+                command(cmdbuf, scheduler.EnsureUploadCommandBuffer());
             }
         }
 
@@ -479,7 +499,7 @@ private:
 
     class CommandChunk final {
     public:
-        void ExecuteAll(vk::CommandBuffer cmdbuf, vk::CommandBuffer upload_cmdbuf);
+        void ExecuteAll(vk::CommandBuffer cmdbuf, Scheduler& scheduler);
 
         template <bool SingleBuffer = false, typename T>
         bool Record(T& command) {
@@ -556,6 +576,10 @@ private:
 
     void AllocateWorkerCommandBuffer();
 
+    /// Worker thread only: lazily allocates and begins current_upload_cmdbuf with its leading
+    /// ALL_COMMANDS -> TRANSFER dependency on first reordered buffer upload in a submission.
+    vk::CommandBuffer EnsureUploadCommandBuffer();
+
     u64 SubmitExecution(VkSemaphore signal_semaphore, VkSemaphore wait_semaphore);
 
     void AllocateNewContext();
@@ -596,6 +620,7 @@ private:
 private:
     FragmentBarrierState fragment_barrier;
     bool render_pass_has_stores{};
+    bool render_pass_used_xfb{};
     bool storage_writes_unordered{};
     bool render_pass_depth_written{};
     VkPipelineStageFlags deferred_wfi_stages{}; ///< DeferWaitForIdle: barrier due at the pass end
@@ -608,8 +633,9 @@ private:
 
     VideoCommon::QueryCacheBase<QueryCacheParams>* query_cache = nullptr;
 
-    vk::CommandBuffer current_cmdbuf;
-    vk::CommandBuffer current_upload_cmdbuf;
+    vk::CommandBuffer::ComputeBinding worker_compute_binding;
+    vk::CommandBuffer current_cmdbuf{};
+    vk::CommandBuffer current_upload_cmdbuf{};
 
     DeferredClear deferred_clear;
 

@@ -262,7 +262,7 @@ void MemoryManager::PreserveMapping(GPUVAddr gpu_addr, std::size_t size) {
 GPUVAddr MemoryManager::Map(GPUVAddr gpu_addr, DAddr dev_addr, std::size_t size, PTEKind kind,
                             bool is_big_pages) {
     if (UsesNativeTiling() && rasterizer != nullptr && size != 0 &&
-        (!IsContinuousRange(gpu_addr, size) || GpuToCpuAddress(gpu_addr) != dev_addr)) {
+        !IsMappedContinuouslyTo(gpu_addr, dev_addr, size)) {
         PreserveMapping(gpu_addr, size);
         // Another virtual view can own the newest image contents at this device address.
         // Publish it while its translation is valid, then make sampled aliases reload it.
@@ -919,7 +919,7 @@ void MemoryManager::UpdateContinuousRuns(GPUVAddr gpu_addr, size_t size) {
         add(tail->first, tail->second.end - tail->first, tail->second.device_addr);
     }
     for (const auto& run : rebuilt) {
-        continuous_runs.insert(continuous_runs.end(), run);
+        continuous_runs.insert(it, run);
     }
     map_serial.fetch_add(1, std::memory_order_release);
 }
@@ -1141,6 +1141,61 @@ bool MemoryManager::IsContinuousRange(GPUVAddr gpu_addr, std::size_t size) const
     return result;
 }
 
+bool MemoryManager::IsMappedContinuouslyTo(GPUVAddr gpu_addr, DAddr dev_addr,
+                                           std::size_t size) const {
+    if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr ||
+        (dev_addr >> MaxwellDeviceMemoryManager::AS_BITS) != 0) {
+        return false;
+    }
+    if (size == 0) {
+        if (GetEntry(gpu_addr, true) == EntryType::Mapped) {
+            const DAddr base = DAddr(big_page_table_dev[PageEntryIndex(gpu_addr, true)])
+                               << cpu_page_bits;
+            return base + (gpu_addr & big_page_mask) == dev_addr;
+        }
+        if (GetEntry(gpu_addr, false) == EntryType::Mapped) {
+            const DAddr base = DAddr(page_table[PageEntryIndex(gpu_addr, false)]) << cpu_page_bits;
+            return base + (gpu_addr & page_mask) == dev_addr;
+        }
+        return false;
+    }
+    DAddr expected_dev_addr = dev_addr;
+    bool result{true};
+    auto fail = [&]([[maybe_unused]] std::size_t page_index, [[maybe_unused]] std::size_t offset,
+                    [[maybe_unused]] std::size_t copy_amount) {
+        result = false;
+        return true;
+    };
+    auto short_check = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        const DAddr dev_addr_base =
+            (static_cast<DAddr>(page_table[page_index]) << cpu_page_bits) + offset;
+        if (dev_addr_base != expected_dev_addr) {
+            result = false;
+            return true;
+        }
+        expected_dev_addr += copy_amount;
+        return false;
+    };
+    auto big_check = [&](std::size_t page_index, std::size_t offset, std::size_t copy_amount) {
+        const DAddr dev_addr_base =
+            (static_cast<DAddr>(big_page_table_dev[page_index]) << cpu_page_bits) + offset;
+        if (dev_addr_base != expected_dev_addr) {
+            result = false;
+            return true;
+        }
+        expected_dev_addr += copy_amount;
+        return false;
+    };
+    auto check_short_pages = [&](std::size_t page_index, std::size_t offset,
+                                 std::size_t copy_amount) {
+        const GPUVAddr base = (page_index << big_page_bits) + offset;
+        MemoryOperation(base, copy_amount, false, short_check, fail, fail);
+        return !result;
+    };
+    MemoryOperation(gpu_addr, size, true, big_check, fail, check_short_pages);
+    return result;
+}
+
 bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) const {
     if (!IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
         return false;
@@ -1163,8 +1218,67 @@ bool MemoryManager::IsFullyMappedRange(GPUVAddr gpu_addr, std::size_t size) cons
     return result;
 }
 
+template <bool is_gpu_address>
+bool MemoryManager::SubmappedRangeFromRuns(
+    GPUVAddr gpu_addr, std::size_t size,
+    boost::container::small_vector<
+        std::pair<std::conditional_t<is_gpu_address, GPUVAddr, DAddr>, std::size_t>, 32>& result)
+    const {
+    if (!VideoCommon::Nx2Perf::On(VideoCommon::Nx2Perf::Opt::Bounds) ||
+        !IsWithinGPUAddressRange(gpu_addr) || size > address_space_size - gpu_addr) {
+        return false;
+    }
+    if (size == 0) {
+        return true;
+    }
+    // A run is a maximal GPU range mapped to one device range, so the page walk ends a segment
+    // exactly where a run ends: at an unmapped page or where the device address jumps.
+    const GPUVAddr end = gpu_addr + size;
+    const auto& runs = CurrentSnapshot().runs;
+    auto it = std::upper_bound(
+        runs.begin(), runs.end(), gpu_addr,
+        [](GPUVAddr address, const MappingSnapshot::Run& run) { return address < run.begin; });
+    if (it != runs.begin() && std::prev(it)->end > gpu_addr) {
+        --it;
+    }
+    for (; it != runs.end() && it->begin < end; ++it) {
+        const GPUVAddr begin = (std::max)(it->begin, gpu_addr);
+        const GPUVAddr run_end = (std::min)(it->end, end);
+        if (begin >= run_end) {
+            continue;
+        }
+        if constexpr (is_gpu_address) {
+            result.emplace_back(begin, static_cast<std::size_t>(run_end - begin));
+        } else {
+            result.emplace_back(it->device_addr + (begin - it->begin),
+                                static_cast<std::size_t>(run_end - begin));
+        }
+    }
+    return true;
+}
+
 boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
 MemoryManager::GetSubmappedRange(GPUVAddr gpu_addr, std::size_t size) const {
+    boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
+    if (!SubmappedRangeFromRuns<true>(gpu_addr, size, result)) {
+        GetSubmappedRangeImpl<true>(gpu_addr, size, result);
+        return result;
+    }
+    if (VideoCommon::Nx2Perf::Verify()) {
+        auto expected = GetSubmappedRangeUncached(gpu_addr, size);
+        static std::atomic<u32> logged{};
+        if (expected != result && logged.fetch_add(1, std::memory_order_relaxed) < 64) {
+            LOG_ERROR(HW_GPU,
+                      "Nx2Perf mapping runs: GetSubmappedRange({:#x}, {:#x}) mismatch", gpu_addr,
+                      size);
+        }
+        return expected;
+    }
+    return result;
+}
+
+boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32>
+MemoryManager::GetSubmappedRangeUncached(GPUVAddr gpu_addr, std::size_t size) const {
     boost::container::small_vector<std::pair<GPUVAddr, std::size_t>, 32> result{};
     GetSubmappedRangeImpl<true>(gpu_addr, size, result);
     return result;
@@ -1249,7 +1363,9 @@ void MemoryManager::FlushCaching() {
                     return;
                 }
             }
-            GetSubmappedRangeImpl<false>(addr, size, page_stash2);
+            if (!SubmappedRangeFromRuns<false>(addr, size, page_stash2)) {
+                GetSubmappedRangeImpl<false>(addr, size, page_stash2);
+            }
         })) {
         static constexpr bool coalesce = true;
         if (coalesce && page_stash2.size() > 1) {

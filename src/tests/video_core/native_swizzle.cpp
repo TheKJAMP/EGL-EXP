@@ -56,6 +56,7 @@ TEST_CASE("Full texture swizzles match a scalar byte-address oracle",
         Shape{31, 8, 3, 0, 1, 4}, Shape{32, 15, 3, 1, 1, 0},
         Shape{63, 19, 3, 2, 1, 6}, Shape{64, 33, 1, 2, 0, 6},
         Shape{65, 31, 5, 1, 2, 0}, Shape{129, 9, 2, 3, 1, 4},
+        Shape{256, 33, 2, 4, 1, 0}, Shape{128, 7, 1, 2, 0, 5},
     };
     std::mt19937 random{0x5a1221e};
     for (const auto shape : shapes) {
