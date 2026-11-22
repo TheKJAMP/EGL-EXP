@@ -35,7 +35,8 @@ public:
         // A transform covers one 2 KiB page: split cross-page writes per page so BuildTransform
         // never shifts u32 by >= 32 (UB that could drop bits).
         while (size != 0) {
-            const size_t in_page = (std::min)(size, page_size - (address & page_mask));
+            const size_t in_page =
+                (std::min)(size, static_cast<size_t>(page_size - (address & page_mask)));
             CollectInPage(address, in_page);
             address += in_page;
             size -= in_page;
