@@ -97,10 +97,12 @@ TEST_CASE("NVN pool mirror pages: Set marks pages and TakeInvalidWithin takes on
 
     // The working set is a few ranges of a big pool (one crosses a 64-page word): the first copy
     // is those pages, not the pool.
-    wanted.Set(5 * PAGE + 17, 100);         // page 5
-    wanted.Set(62 * PAGE, 4 * PAGE);        // pages 62..65
-    wanted.Set(200 * PAGE, 2 * PAGE);       // pages 200..201
-    wanted.Set(255 * PAGE + 4000, 5000);    // page 255, clamped at the pool end
+    CHECK(wanted.Set(5 * PAGE + 17, 100));      // page 5
+    CHECK(wanted.Set(62 * PAGE, 4 * PAGE));     // pages 62..65
+    CHECK(wanted.Set(200 * PAGE, 2 * PAGE));    // pages 200..201
+    CHECK(wanted.Set(255 * PAGE + 4000, 5000)); // page 255, clamped at the pool end
+    CHECK_FALSE(wanted.Set(62 * PAGE, 4 * PAGE)); // already set: no bit changed
+    CHECK_FALSE(wanted.Set(0, 0));
     pages.TakeInvalidWithin(wanted, runs);
     const std::vector<std::pair<u64, u64>> first{
         {5 * PAGE, 6 * PAGE}, {62 * PAGE, 66 * PAGE}, {200 * PAGE, 202 * PAGE},
@@ -164,4 +166,27 @@ TEST_CASE("NVN vertex coverage: the vtxcov line is per present, vertex/index, re
           "inpass,shaderwrites,bound,bigpool");
     CHECK(Vulkan::Nvn::VtxCovServed(VtxCov::Device));
     CHECK_FALSE(Vulkan::Nvn::VtxCovServed(VtxCov::StageOff));
+}
+
+TEST_CASE("NVN pool mirror: MarkWanted tracks wanted_dirty cleanly", "[nvn][pool_mirror]") {
+    Vulkan::Nvn::PoolMirror mirror;
+    mirror.pages = MirrorPages{16 * PAGE};
+    mirror.wanted_dirty = false;
+    mirror.MarkWanted(16 * PAGE, 2 * PAGE, PAGE);
+    CHECK(mirror.prefetch);
+    REQUIRE(mirror.wanted != nullptr);
+    CHECK(mirror.wanted_dirty);
+
+    // Repeating an already-wanted & valid range leaves wanted_dirty clear.
+    Runs runs;
+    mirror.pages.TakeInvalidWithin(*mirror.wanted, runs);
+    REQUIRE(runs == Runs{{2 * PAGE, 3 * PAGE}});
+    mirror.wanted_dirty = false;
+    mirror.MarkWanted(16 * PAGE, 2 * PAGE, PAGE);
+    CHECK_FALSE(mirror.wanted_dirty);
+
+    // If a valid page is invalidated again, MarkWanted marks wanted_dirty even though `wanted` bit is unchanged.
+    mirror.pages.Invalidate(2 * PAGE, PAGE);
+    mirror.MarkWanted(16 * PAGE, 2 * PAGE, PAGE);
+    CHECK(mirror.wanted_dirty);
 }

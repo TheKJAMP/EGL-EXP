@@ -242,11 +242,11 @@ struct Config {
     /// the layout transitions a draw needs before its pass share one barrier with the attachments'
     /// (DESIGN.md "Barrier merging").
     u32 try_barrier_merge{0};
-    /// EDEN_NX2_TRY_STAGE_SPAN=1 (candidate, off by default): vertex staging scans past render target
-    /// changes, so the small passes of one window (a game that switches targets every few draws)
+    /// EDEN_NX2_TRY_STAGE_SPAN=1 (on by default; =0 opts out): vertex staging scans past render
+    /// target changes, so the small passes of one window (a game that switches targets every few draws)
     /// share one gather when together they hold the minimum number of draws, and a mesh indirect
     /// argument conversion does not drop the staged copies (it writes only its own arena).
-    bool try_stage_span{false};
+    bool try_stage_span{true};
     /// EDEN_NX2_TRY_UBO_MIRROR=1 (candidate, off by default): read-only uniform buffer ranges of
     /// imported pools are served from device-local pool mirrors (made at the pool's first uniform
     /// binding, at most TRY_STORAGE_VRAM_MAX_MIB each), kept current by a copy-in of the pages the

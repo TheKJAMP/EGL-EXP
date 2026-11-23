@@ -963,8 +963,8 @@ TEST_CASE("NVN storage shadow: a render pass writing a storage range reaches the
     CHECK(WordAt(data, 0x1008) == 0xCDCDCDCDu);
     CHECK(WordAt(data, 0x4000) == 0x1337);
     CHECK(WordAt(data, 0x4004) == 0xCDCDCDCDu);
-    CHECK(stats.driver_bank_uploads == (mkw ? 2u : 4u));
-    CHECK(stats.pipeline_state_reuses == (mkw ? 1u : 0u));
+    CHECK(stats.driver_bank_uploads == 2u);
+    CHECK(stats.pipeline_state_reuses == 1u);
     if (stats.pools_imported != 0) {
         CHECK(stats.shadow_creates == 1);
         CHECK(stats.shadow_redirects == 2);

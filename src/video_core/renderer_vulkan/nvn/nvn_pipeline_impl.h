@@ -319,7 +319,7 @@ struct PipelineCache::Impl {
                                                   const std::function<void(u64)>& look_ahead = {},
                                                   std::optional<u64> prefetch_skip = {});
     std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready);
-    VkRenderPass GetRenderPass(const RenderPassKey& key);
+    VkRenderPass GetRenderPass(const RenderPassKey& key, bool read_only_depth = false);
     void Flush();
     void ClearShaders();
     PipelineCacheStats Stats() const;
@@ -369,18 +369,10 @@ struct PipelineCache::Impl {
                                         const TranslationState* translation, bool has_geometry);
 
     // --- Vulkan objects -----------------------------------------------------------------------
-    struct LayoutObjects {
-        vk::DescriptorSetLayout set_layout;
-        /// Set BINDLESS_SET when a stage samples through the table (nvn_bindless.h).
-        vk::DescriptorSetLayout bindless_layout;
-        vk::PipelineLayout layout;
-        bool push_descriptors{};
-        u32 push_constant_size{};
-    };
     bool CanUsePush(u32 descriptor_count) const;
     /// `push_stages`: the stages of the push-constant range (PipelineBase::push_constant_stages).
-    LayoutObjects CreateLayoutObjects(const VC::DescriptorLayout& descriptors, bool is_compute,
-                                      VkShaderStageFlags push_stages);
+    std::shared_ptr<const SharedPipelineLayout> CreateLayoutObjects(
+        const VC::DescriptorLayout& descriptors, bool is_compute, VkShaderStageFlags push_stages);
     VC::DescriptorLayout MergeLayouts(std::span<const StageArtifact* const> stages);
     struct ShaderSet;
     /// Without `gpl_set` the pipeline is compiled whole from modules made for the call. With it
@@ -406,7 +398,7 @@ struct PipelineCache::Impl {
         TranslateOutput translated;
         std::once_flag created; ///< `modules` and `layout` exist once it is set
         std::array<vk::ShaderModule, GRAPHICS_STAGE_COUNT> modules; ///< by NVNshaderStage
-        LayoutObjects layout; ///< the layout the shader parts are compiled with
+        std::shared_ptr<const SharedPipelineLayout> layout; ///< layout the shader parts are compiled with
         /// True when `oracle` still answers every texture query of the stages as it did.
         [[nodiscard]] bool QueriesMatch(const TextureOracle& oracle) const;
     };
@@ -644,6 +636,10 @@ struct PipelineCache::Impl {
 
     std::mutex render_pass_mutex;
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> render_passes;
+    std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> read_only_depth_passes;
+
+    std::mutex layout_cache_mutex;
+    std::map<std::vector<u32>, std::shared_ptr<const SharedPipelineLayout>> layout_cache;
 
     mutable std::mutex pipeline_mutex;
     std::unordered_map<GraphicsKey, std::vector<std::shared_ptr<GraphicsPipeline>>, GraphicsKeyHash,

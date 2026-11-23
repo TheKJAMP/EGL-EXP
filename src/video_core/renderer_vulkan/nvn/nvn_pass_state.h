@@ -22,6 +22,7 @@
 #include <cstddef>
 #include <cstring>
 #include <memory>
+#include <span>
 #include <type_traits>
 #include <vector>
 
@@ -133,6 +134,8 @@ public:
         constants_ = false;
         area_ = false;
         descriptors_ = false;
+        template_descriptors_ = false;
+        bindless_set_ = VK_NULL_HANDLE;
         streams_valid_ = 0;
         index_valid_ = false;
     }
@@ -145,6 +148,8 @@ public:
         }
         layout_ = layout;
         descriptors_ = false;
+        template_descriptors_ = false;
+        bindless_set_ = VK_NULL_HANDLE;
         if (!uses_push_constants) {
             constants_ = false;
             area_ = false;
@@ -178,11 +183,40 @@ public:
         buffers_ = buffers;
         images_ = images;
         descriptors_ = layout == layout_;
+        template_descriptors_ = false;
+        return false;
+    }
+    /// Fast path when `layout` uses a fixed DescriptorUpdateTemplate shape: skips building
+    /// WriteSig / ImageSig vectors and compares only the bound buffer and image infos.
+    [[nodiscard]] bool TakeTemplateDescriptors(VkPipelineLayout layout,
+                                               std::span<const VkDescriptorBufferInfo> buffers,
+                                               std::span<const VkDescriptorImageInfo> images) {
+        if (template_descriptors_ && layout == layout_ && SameBuffers(buffers) &&
+            SameImages(images)) {
+            return true;
+        }
+        buffers_.assign(buffers.begin(), buffers.end());
+        raw_images_.assign(images.begin(), images.end());
+        template_descriptors_ = layout == layout_;
+        descriptors_ = false;
         return false;
     }
     /// The next descriptor push is not comparable (a write carries texel buffer views).
     void ForgetDescriptors() noexcept {
         descriptors_ = false;
+        template_descriptors_ = false;
+    }
+
+    /// True when the bindless descriptor set for `layout` is already bound in this pass.
+    [[nodiscard]] bool TakeBindlessSet(VkPipelineLayout layout, VkDescriptorSet set) noexcept {
+        if (layout == layout_ && set != VK_NULL_HANDLE && bindless_set_ == set) {
+            return true;
+        }
+        bindless_set_ = layout == layout_ ? set : VK_NULL_HANDLE;
+        return false;
+    }
+    void ForgetBindlessSet() noexcept {
+        bindless_set_ = VK_NULL_HANDLE;
     }
 
     /// True when vertex stream `stream` already has this buffer and offset bound; otherwise
@@ -220,10 +254,23 @@ public:
     }
 
 private:
-    [[nodiscard]] bool SameBuffers(const std::vector<VkDescriptorBufferInfo>& other) const {
+    [[nodiscard]] bool SameBuffers(std::span<const VkDescriptorBufferInfo> other) const {
         return other.size() == buffers_.size() &&
                (other.empty() || std::memcmp(other.data(), buffers_.data(),
                                              other.size() * sizeof(VkDescriptorBufferInfo)) == 0);
+    }
+    [[nodiscard]] bool SameImages(std::span<const VkDescriptorImageInfo> other) const {
+        if (other.size() != raw_images_.size()) {
+            return false;
+        }
+        for (size_t i = 0; i < other.size(); ++i) {
+            if (other[i].sampler != raw_images_[i].sampler ||
+                other[i].imageView != raw_images_[i].imageView ||
+                other[i].imageLayout != raw_images_[i].imageLayout) {
+                return false;
+            }
+        }
+        return true;
     }
 
     VkPipelineLayout layout_{VK_NULL_HANDLE};
@@ -231,9 +278,12 @@ private:
     bool area_{false};
     PushWords words_{};
     bool descriptors_{false};
+    bool template_descriptors_{false};
+    VkDescriptorSet bindless_set_{VK_NULL_HANDLE};
     std::vector<WriteSig> writes_;
     std::vector<VkDescriptorBufferInfo> buffers_;
     std::vector<ImageSig> images_;
+    std::vector<VkDescriptorImageInfo> raw_images_;
     u32 streams_valid_{0};
     std::array<VkBuffer, MAX_STREAMS> stream_buffers_{};
     std::array<VkDeviceSize, MAX_STREAMS> stream_offsets_{};

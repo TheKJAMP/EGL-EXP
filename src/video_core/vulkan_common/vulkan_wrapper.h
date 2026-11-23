@@ -318,6 +318,7 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkDestroyBufferView vkDestroyBufferView{};
     PFN_vkDestroyCommandPool vkDestroyCommandPool{};
     PFN_vkDestroyDescriptorPool vkDestroyDescriptorPool{};
+    PFN_vkResetDescriptorPool vkResetDescriptorPool{};
     PFN_vkDestroyDescriptorSetLayout vkDestroyDescriptorSetLayout{};
     PFN_vkDestroyDescriptorUpdateTemplate vkDestroyDescriptorUpdateTemplate{};
     PFN_vkDestroyEvent vkDestroyEvent{};
@@ -970,6 +971,8 @@ class DescriptorPool : public Handle<VkDescriptorPool, VkDevice, DeviceDispatch>
 public:
     DescriptorSets Allocate(const VkDescriptorSetAllocateInfo& ai) const;
 
+    void Reset(VkDescriptorPoolResetFlags flags = 0) const;
+
     /// Set object name.
     void SetObjectNameEXT(const char* name) const;
 };
@@ -1328,6 +1331,12 @@ public:
             compute_binding->pipeline = pipeline;
         }
         dld->vkCmdBindPipeline(handle, bind_point, pipeline);
+    }
+
+    void ForgetComputePipeline() const noexcept {
+        if (compute_binding) {
+            compute_binding->pipeline = VK_NULL_HANDLE;
+        }
     }
 
     void BindIndexBuffer(VkBuffer buffer, VkDeviceSize offset,

@@ -25,7 +25,7 @@ using namespace Shader;
 
 struct ShuffleModule {
     std::vector<u32> code;
-    std::array<u32, 3> results;
+    std::array<u32, 4> results;
 };
 
 ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallback,
@@ -44,10 +44,11 @@ ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallbac
     IR::IREmitter ir{block};
     const auto lane = ir.LaneId();
     const auto value = ir.IAdd(lane, ir.Imm32(100));
-    const std::array<IR::U32, 3> results{
+    const std::array<IR::U32, 4> results{
         ir.ShuffleIndex(value, ir.BitwiseXor(lane, ir.Imm32(1)), ir.Imm32(31), ir.Imm32(0)),
         ir.ShuffleUp(value, ir.Imm32(1), ir.Imm32(0), ir.Imm32(0)),
         ir.ShuffleDown(value, ir.Imm32(1), ir.Imm32(31), ir.Imm32(0)),
+        ir.ShuffleButterfly(value, ir.Imm32(1), ir.Imm32(29), ir.Imm32(0)),
     };
     Profile profile;
     profile.supported_spirv = 0x00010500;
@@ -71,7 +72,8 @@ ShuffleModule EmitShuffles(Stage stage, u32 subgroup_size, bool fragment_fallbac
     }
     return {std::move(code), {results[0].Inst()->Definition<u32>(),
                               results[1].Inst()->Definition<u32>(),
-                              results[2].Inst()->Definition<u32>()}};
+                              results[2].Inst()->Definition<u32>(),
+                              results[3].Inst()->Definition<u32>()}};
 }
 }
 
@@ -91,6 +93,7 @@ TEST_CASE("Fragment shuffle fallback preserves host subgroup partitions",
             CHECK(op != spv::Op::OpGroupNonUniformShuffle);
             CHECK(op != spv::Op::OpGroupNonUniformShuffleUp);
             CHECK(op != spv::Op::OpGroupNonUniformShuffleDown);
+            CHECK(op != spv::Op::OpGroupNonUniformShuffleXor);
             bool has_result{}, has_type{};
             spv::HasResultAndType(op, &has_result, &has_type);
             if (has_result && has_type) {
@@ -106,7 +109,7 @@ TEST_CASE("Fragment shuffle fallback preserves host subgroup partitions",
             }
             offset += size;
         }
-        REQUIRE(broadcast_lanes.size() == 3 * subgroup_size);
+        REQUIRE(broadcast_lanes.size() == module.results.size() * subgroup_size);
         REQUIRE(invocation_variable != 0);
         for (u32 index = 0; index < broadcast_lanes.size(); ++index) {
             CHECK(definitions.at(broadcast_lanes[index])[3] == index % subgroup_size);
@@ -148,6 +151,9 @@ TEST_CASE("Fragment shuffle fallback preserves host subgroup partitions",
                   100 + (guest_lane == 0 ? 0 : guest_lane - 1));
             CHECK(evaluate(evaluate, module.results[2], lane) ==
                   100 + (guest_lane == 31 ? 31 : guest_lane + 1));
+            const u32 butterfly_source = guest_lane ^ 1;
+            CHECK(evaluate(evaluate, module.results[3], lane) ==
+                  100 + (butterfly_source <= 29 ? butterfly_source : guest_lane));
         }
     }
 }
@@ -166,13 +172,14 @@ TEST_CASE("Fragment workaround leaves other stages on native shuffles",
                     broadcasts += op == spv::Op::OpGroupNonUniformBroadcast;
                     shuffles += op == spv::Op::OpGroupNonUniformShuffle ||
                                 op == spv::Op::OpGroupNonUniformShuffleUp ||
-                                op == spv::Op::OpGroupNonUniformShuffleDown;
+                                op == spv::Op::OpGroupNonUniformShuffleDown ||
+                                op == spv::Op::OpGroupNonUniformShuffleXor;
                     offset += size;
                 }
                 const bool fallback = general_fallback ||
                                       (fragment_fallback && stage == Stage::Fragment);
-                CHECK(broadcasts == (fallback ? 192u : 0u));
-                CHECK(shuffles == (fallback ? 0u : 3u));
+                CHECK(broadcasts == (fallback ? module.results.size() * 64 : 0u));
+                CHECK(shuffles == (fallback ? 0u : module.results.size()));
             }
         }
     }

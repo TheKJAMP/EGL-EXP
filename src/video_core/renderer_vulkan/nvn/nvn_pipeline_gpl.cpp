@@ -167,7 +167,7 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
                         .state = &state,
                         .targets = &targets,
                         .render_pass = pipeline->render_pass,
-                        .layout = *pipeline->layout,
+                        .layout = pipeline->layout,
                         .stages = stage_infos,
                         .viewport_count = pipeline->viewport_count,
                         .attributes_read = pipeline->attributes_read,

@@ -831,9 +831,20 @@ void Context::Impl::Dispatch(Command& command) {
                 LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: early submit at most twice per "
                                         "submission; live passes and shadows use the pass budget");
             }
-            if (!impl.options.barrier_merge &&
-                std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
-                impl.barrier_merge = BarrierMergeMask(impl.mario_kart_world ? 1 : 0);
+            if (c.title_id != 0) {
+                if (!impl.options.barrier_merge &&
+                    std::getenv("EDEN_NX2_TRY_BARRIER_MERGE") == nullptr) {
+                    impl.barrier_merge = BarrierMergeMask(1);
+                }
+                if (!impl.options.dispatch_order_by_barriers &&
+                    std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
+                    impl.dispatch_order_by_barriers = true;
+                }
+                if (!impl.options.ubo_mirror &&
+                    std::getenv("EDEN_NX2_TRY_UBO_MIRROR") == nullptr &&
+                    impl.pool_mirror_mode != 0) {
+                    impl.ubo_mirror = true;
+                }
             }
             if (!impl.options.dispatch_order_by_barriers.has_value() &&
                 std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
@@ -1450,6 +1461,14 @@ void Context::Impl::CompleteMain() {
         }
         if (!flight->shadow.empty()) {
             draw_resources->ReleaseShadows(flight->shadow);
+        }
+        if (!flight->descriptor_pools.empty()) {
+            if ((gpu_complete || flight->semaphore == VK_NULL_HANDLE) &&
+                !device_lost.load(std::memory_order_acquire)) {
+                draw_resources->ReleaseDescriptorPools(flight->descriptor_pools);
+            } else {
+                flight->descriptor_pools.clear();
+            }
         }
         flight->download.reset();
         flight->keepalive.clear();

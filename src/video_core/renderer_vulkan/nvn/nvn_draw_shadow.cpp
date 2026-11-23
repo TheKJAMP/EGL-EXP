@@ -391,6 +391,38 @@ void DrawContext::ApplyMirrors(DrawPlan& plan, bool allow_create) {
             continue;
         }
         if (use.creates_mirror) {
+            if (!mirror->storage) {
+                if (mirror->ubo_dynamic) {
+                    continue;
+                }
+                if (mirror->write_epoch) {
+                    const u64 present = impl.stats.presents.load(std::memory_order_relaxed);
+                    if (present != mirror->ubo_thrash_present) {
+                        const u64 ep = mirror->write_epoch->load(std::memory_order_acquire);
+                        if (mirror->ubo_thrash_present != ~u64{0} &&
+                            ep - mirror->ubo_thrash_epoch > 64) {
+                            if (++mirror->ubo_thrash_streak >= 4) {
+                                mirror->ubo_dynamic = true;
+                                if (mirror->wanted) {
+                                    mirror->wanted->InvalidateAll();
+                                }
+                                mirror->wanted_dirty = false;
+                                mirror->ubo_thrash_present = present;
+                                mirror->ubo_thrash_epoch = ep;
+                                LOG_INFO(
+                                    Render_Vulkan,
+                                    "[nvn] pool {:#x}: dynamic UBO writes detected, keeping in host memory",
+                                    use.pool->address);
+                                continue;
+                            }
+                        } else {
+                            mirror->ubo_thrash_streak = 0;
+                        }
+                        mirror->ubo_thrash_present = present;
+                        mirror->ubo_thrash_epoch = ep;
+                    }
+                }
+            }
             // The pages uniform bindings use: PrefetchMirrors keeps them current from now on.
             impl.MirrorMarkPrefetch(*use.pool, use.offset, use.size);
         }

@@ -119,9 +119,14 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         return;
     }
     const VC::ProgramDesc& program = *program_it->second;
-    std::string error;
-    const std::optional<VC::NvnControl> control =
-        VC::ParseControl(program.control[STAGE_COMPUTE], error);
+    auto ctrl_it = resources.compute_controls.find(bound.program_serial);
+    if (ctrl_it == resources.compute_controls.end()) {
+        DrawResources::ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(program.control[STAGE_COMPUTE], parsed.error);
+        ctrl_it = resources.compute_controls.emplace(bound.program_serial, std::move(parsed)).first;
+    }
+    const std::optional<VC::NvnControl>& control = ctrl_it->second.control;
+    const std::string& error = ctrl_it->second.error;
     if (!control || !control->has_compute_counts) {
         skipped();
         host->HostUnsupported("Dispatch", fmt::format("compute control section: {}",
@@ -279,6 +284,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                         words[6], words[7], input->desc.width, input->desc.height);
                 });
             } else if (UpscaleNetwork(input_rect, output_rect, output_id)) {
+                host->HostCmd().ForgetComputePipeline();
                 if (VideoCommon::ShaderLog::Enabled()) {
                     // The game's own program is never translated or run: log its bytes and the
                     // inputs it would have read.
@@ -304,33 +310,57 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     }
 
     const ComputeOracle oracle{*this, control->compute.HandleTables()};
-    ComputeRequest request;
-    request.program = {hash_it->second[STAGE_COMPUTE], &program.control[STAGE_COMPUTE],
-                       &program.code[STAGE_COMPUTE]};
-    request.oracle = &oracle;
-    request.inputs = &oracle;
-    // Only the first lookup of a program is timed (it is the one that translates and compiles).
-    const bool first_dispatch = !resources.compute_programs.contains(request.program.hash);
-    const auto compile_start =
-        first_dispatch ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    // A dispatch is never skipped while its pipeline compiles (use_asynchronous_shaders): the
-    // lookup waits for a compile in flight, as the emulated path's ComputePipeline::Configure
-    // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
-    // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
-    const std::shared_ptr<ComputePipeline> compute = resources.Cache().GetCompute(request);
-    if (first_dispatch) {
-        const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-                                    std::chrono::steady_clock::now() - compile_start)
-                                    .count();
-        resources.compute_programs.insert(request.program.hash);
-        // Once per distinct program: what DK dispatches and what its first lookup cost (a
-        // translation and pipeline compile unless the disk cache had it).
-        LOG_INFO(Render_Vulkan,
-                 "[nvn] compute program {:016x}: group {}x{}x{}, {} push words, {} B shared, first "
-                 "dispatch {} ms ({})",
-                 request.program.hash, control->thread_group[0], control->thread_group[1],
-                 control->thread_group[2], control->compute.push_constant_words,
-                 control->shared_memory_bytes, compile_ms, compute ? "ok" : "rejected");
+    const u64 generation = resources.Cache().ShaderGeneration();
+    if (shader_generation != generation) {
+        pipeline.reset();
+        pipeline_memo = {};
+        pipeline_dirty = true;
+        bound_pipeline = VK_NULL_HANDLE;
+        bound_state.Reset();
+        last_kept = nullptr;
+        compute_memo = {};
+        last_compute_kept = nullptr;
+        shader_generation = generation;
+    }
+    ComputeMemo& memo = compute_memo[static_cast<size_t>(bound.program_serial) &
+                                     (compute_memo.size() - 1)];
+    std::shared_ptr<ComputePipeline> compute;
+    if (memo.pipeline && memo.serial == bound.program_serial &&
+        memo.program_hash == program_hash && memo.pipeline->QueriesMatch(oracle)) {
+        compute = memo.pipeline;
+    } else {
+        ComputeRequest request;
+        request.program = {program_hash, &program.control[STAGE_COMPUTE],
+                           &program.code[STAGE_COMPUTE]};
+        request.oracle = &oracle;
+        request.inputs = &oracle;
+        // Only the first lookup of a program is timed (it is the one that translates and compiles).
+        const bool first_dispatch = !resources.compute_programs.contains(request.program.hash);
+        const auto compile_start =
+            first_dispatch ? std::chrono::steady_clock::now()
+                           : std::chrono::steady_clock::time_point{};
+        // A dispatch is never skipped while its pipeline compiles (use_asynchronous_shaders): the
+        // lookup waits for a compile in flight, as the emulated path's ComputePipeline::Configure
+        // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
+        // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
+        compute = resources.Cache().GetCompute(request);
+        if (first_dispatch) {
+            const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+                                        std::chrono::steady_clock::now() - compile_start)
+                                        .count();
+            resources.compute_programs.insert(request.program.hash);
+            // Once per distinct program: what DK dispatches and what its first lookup cost (a
+            // translation and pipeline compile unless the disk cache had it).
+            LOG_INFO(Render_Vulkan,
+                     "[nvn] compute program {:016x}: group {}x{}x{}, {} push words, {} B shared, "
+                     "first dispatch {} ms ({})",
+                     request.program.hash, control->thread_group[0], control->thread_group[1],
+                     control->thread_group[2], control->compute.push_constant_words,
+                     control->shared_memory_bytes, compile_ms, compute ? "ok" : "rejected");
+        }
+        if (compute) {
+            memo = {bound.program_serial, program_hash, compute};
+        }
     }
     if (!compute) {
         // The cache counted and logged why (unsupported rows, `shader:`).

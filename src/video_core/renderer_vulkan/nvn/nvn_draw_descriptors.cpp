@@ -18,6 +18,7 @@
 #include "video_core/nvn/shader/nvn_handle_program.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw_plan.h"
+#include "video_core/renderer_vulkan/nvn/nvn_pipeline_state.h"
 #include "video_core/renderer_vulkan/nvn/nvn_sampler_aniso.h"
 
 namespace Vulkan::Nvn {
@@ -914,10 +915,29 @@ std::shared_ptr<Texture> DrawContext::ScaledTextureFor(Texture& texture, bool gr
 bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics) {
     plan.graphics = graphics;
     const VC::DescriptorLayout& layout = pipe.descriptors;
+    static const bool read_only_depth_probe = [] {
+        const char* value = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
+        return value != nullptr && value[0] == '1';
+    }();
+    const Storage* depth_attachment =
+        depth_target.texture ? depth_target.texture->storage.get() : nullptr;
+    const bool allow_read_only_depth =
+        graphics && read_only_depth_probe && impl.device.ApiVersion() >= VK_API_VERSION_1_3 &&
+        impl.device.GetDriverID() == VK_DRIVER_ID_MESA_RADV && !targets_scaled &&
+        !depth_target.alias && depth_attachment != nullptr &&
+        depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
+        depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
+        depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT && depth_attachment->levels == 1 &&
+        depth_attachment->layers == 1 && !layout.uses_bindless_table &&
+        !layout.stores_raw_global_memory && !MakeDynamicFixedState(fixed).depth_write_enable &&
+        std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
+            return binding.is_written;
+        });
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
     scratch_views.clear();
+    scratch_template_ok = pipe.update_template != VK_NULL_HANDLE;
     size_t total = 0;
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         total += binding.count;
@@ -1258,6 +1278,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     for (const VC::DescriptorBinding& binding : layout.bindings) {
         const u32 stage = static_cast<u32>(binding.stage);
         const u32 count = binding.count;
+        scratch_template_ok &= count >= 1;
         VkWriteDescriptorSet write{
             .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
             .pNext = nullptr,
@@ -1278,23 +1299,47 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                 case VC::DescriptorRole::DriverTable: {
                     BufferRef& ref = driver_bank[stage];
                     if (!ref.buffer) {
+                        const u64 seq = host->HostFlight().seq;
+                        const u64 raw_generation = raw_table ? raw_table->generation + 1 : 0;
+                        const void* raw_device = raw_table ? raw_table->device.get() : nullptr;
                         if (binding.stage == VC::ShaderStage::Compute) {
-                            u8* pointer = nullptr;
-                            ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
-                            FillComputeBank(pipe.compute_layout, pointer);
-                            if (raw_table != nullptr) {
-                                WriteRawGlobalTable(raw_table->device.get(), coverage_ring,
-                                                    std::span<u8>{pointer, DRIVER_BANK_SIZE},
-                                                    alias_header);
+                            ComputeBankCache& cache = compute_driver_bank;
+                            if (cache.seq != seq || cache.uniform_gen != compute_uniform_gen ||
+                                cache.storage_gen != storage_gen[STAGE_COMPUTE] ||
+                                cache.handle_gen != handle_gen[STAGE_COMPUTE] ||
+                                cache.push_gen != push_gen[1] || cache.raw_gen != raw_generation ||
+                                cache.raw_device != raw_device ||
+                                cache.coverage_ring != coverage_ring ||
+                                cache.alias_gen != alias_generation ||
+                                cache.groups != compute_groups ||
+                                cache.layout != pipe.compute_layout) {
+                                u8* pointer = nullptr;
+                                cache.ref = AllocArena(DRIVER_BANK_SIZE, 256, &pointer);
+                                ++counters.driver_bank_uploads;
+                                FillComputeBank(pipe.compute_layout, pointer);
+                                if (raw_table != nullptr) {
+                                    WriteRawGlobalTable(raw_table->device.get(), coverage_ring,
+                                                        std::span<u8>{pointer, DRIVER_BANK_SIZE},
+                                                        alias_header);
+                                }
+                                cache.seq = seq;
+                                cache.uniform_gen = compute_uniform_gen;
+                                cache.storage_gen = storage_gen[STAGE_COMPUTE];
+                                cache.handle_gen = handle_gen[STAGE_COMPUTE];
+                                cache.push_gen = push_gen[1];
+                                cache.raw_gen = raw_generation;
+                                cache.raw_device = raw_device;
+                                cache.coverage_ring = coverage_ring;
+                                cache.alias_gen = alias_generation;
+                                cache.groups = compute_groups;
+                                cache.layout = pipe.compute_layout;
                             }
+                            ref = cache.ref;
                         } else {
                             // The arena copy of the last build serves every draw of the
                             // submission until what the bank is made of changes.
                             BankCache& cache = driver_banks[stage];
-                            const u64 seq = host->HostFlight().seq;
-                            const u64 raw_generation = raw_table ? raw_table->generation + 1 : 0;
                             const u64 pool_bases = u64{texture_pool_base} << 32 | sampler_pool_base;
-                            const void* raw_device = raw_table ? raw_table->device.get() : nullptr;
                             if (cache.seq != seq || cache.a != storage_gen[stage] ||
                                 cache.b != push_gen[0] || cache.c != raw_generation ||
                                 cache.d != raw_device || cache.e != mesh_dims_gen ||
@@ -1473,7 +1518,12 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                         Texture* view_texture = texture.get();
                         bool scratch = false;
                         bound = true;
-                        if (graphics && IsBoundTarget(&s)) {
+                        if (allow_read_only_depth && &s == depth_attachment && !is_image &&
+                            !twin && key.format == VK_FORMAT_D32_SFLOAT &&
+                            wanted == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
+                            plan.read_only_depth = true;
+                            plan.UseImage(texture->storage, wanted, true);
+                        } else if (graphics && IsBoundTarget(&s)) {
                             // A render target of this very draw: the pass writes it, so sample a
                             // copy of it made before the pass (copy-on-read).
                             bound = false;
@@ -1778,6 +1828,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             if (!usable) {
                 ++counters.descriptors_unsupported;
                 host->HostFailed("Draw", "no arena space for a texture buffer");
+                scratch_template_ok = false;
                 continue;
             }
             write.pTexelBufferView = &scratch_views[first];
@@ -1788,6 +1839,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             ++counters.descriptors_unsupported;
             note(DescReason::TexelBuffer);
             host->HostUnsupported("Draw", "storage texel buffer descriptors are not supported");
+            scratch_template_ok = false;
             continue;
         }
         scratch_writes.push_back(write);
@@ -2247,10 +2299,10 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     if (cs_mode == CostSplit::Mode::NoBind && bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS &&
         pipe.layout) [[unlikely]] {
         // The pass's first class draw pushed for this layout: its descriptors and constants stay.
-        if (cs_draw_index > 0 && *pipe.layout == cs_pushed_layout) {
+        if (cs_draw_index > 0 && pipe.layout == cs_pushed_layout) {
             return true;
         }
-        cs_pushed_layout = *pipe.layout;
+        cs_pushed_layout = pipe.layout;
     }
     // Inside an open pass a draw skips what the pass has recorded already (nvn_pass_state.h).
     const bool track = bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS && pass_open &&
@@ -2270,21 +2322,34 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     } else if (pipe.descriptors.UsesPushConstants() && pipe.layout) {
         using namespace Shader::Backend::SPIRV;
         const VkShaderStageFlags stage_flags = pipe.push_constant_stages;
-        cmd.PushConstants(*pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
-                          sizeof(pushed.words), pushed.words.data());
-        cmd.PushConstants(*pipe.layout, stage_flags, RESCALING_LAYOUT_DOWN_FACTOR_OFFSET,
-                          sizeof(pushed.down_factor), &pushed.down_factor);
+        if (bind_point == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+            struct ScalingConstants {
+                std::array<u32, Rescale::PUSH_WORDS> words;
+                f32 down_factor;
+            };
+            static_assert(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET ==
+                          RESCALING_LAYOUT_WORDS_OFFSET + offsetof(ScalingConstants, down_factor));
+            const ScalingConstants constants{pushed.words, pushed.down_factor};
+            cmd.PushConstants(pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
+                              sizeof(constants), &constants);
+        } else {
+            cmd.PushConstants(pipe.layout, stage_flags, RESCALING_LAYOUT_WORDS_OFFSET,
+                              sizeof(pushed.words), pushed.words.data());
+        }
         if (pipe.descriptors.uses_render_area) {
             const std::array<f32, 4> area{static_cast<f32>(framebuffer_extent.width),
                                           static_cast<f32>(framebuffer_extent.height), 0.0f, 0.0f};
-            cmd.PushConstants(*pipe.layout, stage_flags, RENDERAREA_LAYOUT_OFFSET, sizeof(area),
+            cmd.PushConstants(pipe.layout, stage_flags, RENDERAREA_LAYOUT_OFFSET, sizeof(area),
                               area.data());
         }
     }
     if (scratch_writes.empty() || !pipe.set_layout) {
         return true;
     }
-    const bool need_sigs = track || !pipe.push_descriptors;
+    const bool use_template = scratch_template_ok && pipe.update_template != VK_NULL_HANDLE &&
+                              scratch_writes.size() == pipe.descriptors.bindings.size();
+    const bool need_sigs =
+        (track && (!use_template || !scratch_views.empty())) || !pipe.push_descriptors;
     bool comparable = false;
     if (need_sigs) {
         comparable = true;
@@ -2298,18 +2363,55 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         for (const VkDescriptorImageInfo& info : scratch_images) {
             scratch_image_sigs.push_back({info.sampler, info.imageView, info.imageLayout});
         }
-        if (track) {
-            if (!comparable) {
-                bound_state.ForgetDescriptors();
-            } else if (bound_state.TakeDescriptors(*pipe.layout, scratch_write_sigs,
-                                                   scratch_buffers, scratch_image_sigs)) {
+    }
+    if (track) {
+        if (use_template && scratch_views.empty()) {
+            if (bound_state.TakeTemplateDescriptors(pipe.layout, scratch_buffers, scratch_images)) {
                 ++counters.elided_descriptors;
                 return true;
             }
+        } else if (!comparable) {
+            bound_state.ForgetDescriptors();
+        } else if (bound_state.TakeDescriptors(pipe.layout, scratch_write_sigs, scratch_buffers,
+                                               scratch_image_sigs)) {
+            ++counters.elided_descriptors;
+            return true;
+        }
+    }
+    bool template_ready = false;
+    if (use_template) {
+        scratch_template_entries.clear();
+        scratch_template_entries.reserve(pipe.template_entry_count);
+        for (const VkWriteDescriptorSet& write : scratch_writes) {
+            if (write.pBufferInfo != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.buffer = write.pBufferInfo[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            } else if (write.pImageInfo != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.image = write.pImageInfo[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            } else if (write.pTexelBufferView != nullptr) {
+                for (u32 i = 0; i < write.descriptorCount; ++i) {
+                    DescriptorTemplateEntry entry{};
+                    entry.texel_view = write.pTexelBufferView[i];
+                    scratch_template_entries.push_back(entry);
+                }
+            }
+        }
+        template_ready = scratch_template_entries.size() == pipe.template_entry_count;
+        if (template_ready && pipe.push_descriptors) {
+            cmd.PushDescriptorSetWithTemplateKHR(pipe.update_template, pipe.layout, 0,
+                                                 scratch_template_entries.data());
+            return true;
         }
     }
     if (pipe.push_descriptors) {
-        cmd.PushDescriptorSetKHR(bind_point, *pipe.layout, 0, scratch_writes);
+        cmd.PushDescriptorSetKHR(bind_point, pipe.layout, 0, scratch_writes);
         return true;
     }
     // An allocated set, kept alive by the submission. Reuse an identical set allocated earlier in
@@ -2325,7 +2427,7 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
             h ^= v + 0x9e3779b97f4a7c15ULL + (h << 6) + (h >> 2);
             return h;
         };
-        cache_hash = mix(0, std::bit_cast<u64>(*pipe.set_layout));
+        cache_hash = mix(0, std::bit_cast<u64>(pipe.set_layout));
         for (const PassBoundState::WriteSig& w : scratch_write_sigs) {
             cache_hash = mix(cache_hash, (static_cast<u64>(w.binding) << 32) |
                                              (static_cast<u64>(w.type) << 16) | w.count);
@@ -2342,18 +2444,18 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         }
         cache_slot = &desc_set_cache[static_cast<size_t>(cache_hash) & (desc_set_cache.size() - 1)];
         if (cache_slot->seq == flight_seq && cache_slot->hash == cache_hash &&
-            cache_slot->set_layout == *pipe.set_layout && cache_slot->set != VK_NULL_HANDLE &&
+            cache_slot->set_layout == pipe.set_layout && cache_slot->set != VK_NULL_HANDLE &&
             cache_slot->writes == scratch_write_sigs &&
             cache_slot->buffers.size() == scratch_buffers.size() &&
             (scratch_buffers.empty() ||
              std::memcmp(cache_slot->buffers.data(), scratch_buffers.data(),
                          scratch_buffers.size() * sizeof(VkDescriptorBufferInfo)) == 0) &&
             cache_slot->images == scratch_image_sigs) {
-            cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&cache_slot->set, 1}, {});
+            cmd.BindDescriptorSets(bind_point, pipe.layout, 0, std::span{&cache_slot->set, 1}, {});
             return true;
         }
     }
-    const VkDescriptorSet set = AllocateSet(*pipe.set_layout);
+    const VkDescriptorSet set = AllocateSet(pipe.set_layout);
     if (!set) {
         bound_state.ForgetDescriptors();
         host->HostFailed("Draw", "descriptor set allocation failed");
@@ -2367,46 +2469,28 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
     if (cache_slot != nullptr) {
         cache_slot->seq = flight_seq;
         cache_slot->hash = cache_hash;
-        cache_slot->set_layout = *pipe.set_layout;
+        cache_slot->set_layout = pipe.set_layout;
         cache_slot->set = set;
         cache_slot->writes = scratch_write_sigs;
         cache_slot->buffers = scratch_buffers;
         cache_slot->images = scratch_image_sigs;
     }
-    cmd.BindDescriptorSets(bind_point, *pipe.layout, 0, std::span{&set, 1}, {});
+    cmd.BindDescriptorSets(bind_point, pipe.layout, 0, std::span{&set, 1}, {});
     return true;
 }
 
 VkDescriptorSet DrawContext::AllocateSet(VkDescriptorSetLayout layout) {
     constexpr u32 SETS_PER_POOL = 256;
     // A pool can run out of one descriptor type before SETS_PER_POOL sets: start a new one and
-    // retry once (the old pool stays alive in its flight's keepalive).
+    // retry once (the old pool stays in the flight until completion, then resets for reuse).
     for (u32 attempt = 0; attempt < 2; ++attempt) {
         const bool fresh = !set_pool || set_pool_used >= SETS_PER_POOL;
         if (fresh) {
-            const std::array<VkDescriptorPoolSize, 6> sizes{{
-                {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, SETS_PER_POOL * 24},
-                {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, SETS_PER_POOL * 16},
-                {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, SETS_PER_POOL * 48},
-                {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, SETS_PER_POOL * 8},
-                {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, SETS_PER_POOL * 4},
-                {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, SETS_PER_POOL * 4},
-            }};
-            try {
-                set_pool = std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
-                    .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
-                    .pNext = nullptr,
-                    .flags = 0,
-                    .maxSets = SETS_PER_POOL,
-                    .poolSizeCount = static_cast<u32>(sizes.size()),
-                    .pPoolSizes = sizes.data(),
-                }));
-            } catch (const vk::Exception& exception) {
-                LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
-                set_pool.reset();
+            set_pool = resources.AcquireDescriptorPool(SETS_PER_POOL);
+            if (!set_pool) {
                 return VK_NULL_HANDLE;
             }
-            host->HostFlight().keepalive.push_back(set_pool);
+            host->HostFlight().descriptor_pools.push_back(set_pool);
             set_pool_used = 0;
         }
         const VkDescriptorSetAllocateInfo info{

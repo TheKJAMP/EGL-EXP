@@ -57,8 +57,9 @@ public:
     /// Marks the pages [offset, offset + length) touches invalid (clamped to the pool).
     void Invalidate(u64 offset, u64 length);
     void InvalidateAll();
-    /// Marks the pages [offset, offset + length) touches valid (clamped to the pool).
-    void Set(u64 offset, u64 length);
+    /// Marks the pages [offset, offset + length) touches valid (clamped to the pool); true when
+    /// any page changed from 0 to 1.
+    bool Set(u64 offset, u64 length);
     /// As TakeInvalid over the whole pool, for the pages `wanted` has set (a Set-only bitmap of
     /// the same pool size) that are invalid here.
     void TakeInvalidWithin(const MirrorPages& wanted, std::vector<std::pair<u64, u64>>& out);
@@ -124,6 +125,20 @@ struct PoolMirror {
     /// first use).
     std::unique_ptr<MirrorPages> wanted;
     bool wanted_dirty{true};
+    bool ubo_dynamic{false};
+    u64 ubo_thrash_present{~u64{0}};
+    u64 ubo_thrash_epoch{0};
+    u32 ubo_thrash_streak{0};
+
+    void MarkWanted(u64 pool_size, u64 offset, u64 size) {
+        prefetch = true;
+        if (!wanted) {
+            wanted = std::make_unique<MirrorPages>(pool_size);
+        }
+        if (wanted->Set(offset, size) || !pages.AllValid(offset, size)) {
+            wanted_dirty = true;
+        }
+    }
     /// The tracker's write counter of the pool's registration (GuestMemory::WriteEpoch) and its
     /// value from before the last whole-pool collect of CPU writes: while they are equal no page
     /// of the pool is dirty, and the currency checks skip the tracker.

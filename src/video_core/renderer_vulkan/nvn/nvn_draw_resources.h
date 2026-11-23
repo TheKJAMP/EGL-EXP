@@ -398,6 +398,11 @@ struct DrawResources {
     // --- programs ---
     /// Content hash per stage of every program (0 = stage absent), by program serial.
     std::unordered_map<u64, std::array<u64, STAGE_COUNT>> program_hashes;
+    struct ParsedComputeControl {
+        std::optional<VC::NvnControl> control;
+        std::string error;
+    };
+    std::unordered_map<u64, ParsedComputeControl> compute_controls;
     /// Records the stage hashes of a program the game created; on the GPL path the cache also
     /// lowers its stages now (PipelineCache::PrepareProgram), ahead of its first draw.
     void OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc>& program);
@@ -477,6 +482,12 @@ struct DrawResources {
     /// A chunk of at least `min_size` bytes (null when device memory ran out).
     std::shared_ptr<ShadowChunk> AcquireShadow(u64 min_size);
     void ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& chunks);
+
+    // --- descriptor pools ---
+    std::mutex descriptor_pool_mutex;
+    std::vector<std::shared_ptr<vk::DescriptorPool>> free_descriptor_pools;
+    std::shared_ptr<vk::DescriptorPool> AcquireDescriptorPool(u32 max_sets);
+    void ReleaseDescriptorPools(std::vector<std::shared_ptr<vk::DescriptorPool>>& pools);
 
 
     // --- dummies for unbound descriptors ---

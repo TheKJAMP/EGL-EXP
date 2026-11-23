@@ -116,6 +116,85 @@ TEST_CASE("NVN pass state: descriptors are skipped only when identical on the sa
     }
 }
 
+TEST_CASE("NVN pass state: template descriptors elide identical buffer and image bindings",
+          "[nvn][pass_state]") {
+    PassBoundState state;
+    const auto layout = Handle<VkPipelineLayout>(0x100);
+    std::vector<VkDescriptorBufferInfo> buffers{{Handle<VkBuffer>(0x10), 0, 256}};
+    std::vector<VkDescriptorImageInfo> images{
+        {Handle<VkSampler>(0x20), Handle<VkImageView>(0x30),
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL},
+        {Handle<VkSampler>(0x21), Handle<VkImageView>(0x31),
+         VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL}};
+    state.OnPipelineBind(layout, true);
+    REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+    REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+
+    SECTION("a changed buffer offset or range records again") {
+        buffers[0].offset = 128;
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+        buffers[0].range = 512;
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+    }
+    SECTION("a changed image view, sampler or layout records again") {
+        auto next_images = images;
+        next_images[1].imageView = Handle<VkImageView>(0x99);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        next_images[1].sampler = Handle<VkSampler>(0x98);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        next_images[1].imageLayout = VK_IMAGE_LAYOUT_GENERAL;
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, next_images));
+    }
+    SECTION("a different pipeline layout invalidates template descriptors") {
+        const auto other = Handle<VkPipelineLayout>(0x200);
+        state.OnPipelineBind(other, true);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(other, buffers, images));
+        state.OnPipelineBind(layout, true);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+    }
+    SECTION("ForgetDescriptors and Reset clear template descriptor tracking") {
+        state.ForgetDescriptors();
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+        REQUIRE(state.TakeTemplateDescriptors(layout, buffers, images));
+        state.Reset();
+        state.OnPipelineBind(layout, true);
+        REQUIRE_FALSE(state.TakeTemplateDescriptors(layout, buffers, images));
+    }
+}
+
+TEST_CASE("NVN pass state: bindless descriptor set elides identical same-layout binds",
+          "[nvn][pass_state]") {
+    PassBoundState state;
+    const auto layout = Handle<VkPipelineLayout>(0x100);
+    const auto other = Handle<VkPipelineLayout>(0x200);
+    const auto set_a = Handle<VkDescriptorSet>(0x500);
+    const auto set_b = Handle<VkDescriptorSet>(0x501);
+    state.OnPipelineBind(layout, true);
+    REQUIRE_FALSE(state.TakeBindlessSet(layout, set_a));
+    REQUIRE(state.TakeBindlessSet(layout, set_a));
+
+    SECTION("a changed bindless set records again") {
+        REQUIRE_FALSE(state.TakeBindlessSet(layout, set_b));
+        REQUIRE(state.TakeBindlessSet(layout, set_b));
+    }
+    SECTION("a different pipeline layout disturbs the bindless set") {
+        state.OnPipelineBind(other, true);
+        REQUIRE_FALSE(state.TakeBindlessSet(other, set_a));
+        state.OnPipelineBind(layout, true);
+        REQUIRE_FALSE(state.TakeBindlessSet(layout, set_a));
+    }
+    SECTION("ForgetBindlessSet and Reset clear bindless tracking") {
+        state.ForgetBindlessSet();
+        REQUIRE_FALSE(state.TakeBindlessSet(layout, set_a));
+        REQUIRE(state.TakeBindlessSet(layout, set_a));
+        state.Reset();
+        state.OnPipelineBind(layout, true);
+        REQUIRE_FALSE(state.TakeBindlessSet(layout, set_a));
+    }
+}
+
 TEST_CASE("NVN pass state: a full flip target list replaces the entry used longest ago",
           "[nvn][pass_state]") {
     using List = Vulkan::Nvn::FlipTargetList<int>;

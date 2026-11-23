@@ -225,10 +225,9 @@ bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offse
         }
         ++mkw_resolve_misses;
     }
+    ++mkw_resolve_misses;
     const auto remember = [&] {
-        if (exact) {
-            *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
-        }
+        *exact = {generation, mkw_mapping_generation, address, size, pool, offset};
     };
     for (const ResolveSlot& slot : resolve_cache) {
         if (slot.generation == generation && address >= slot.begin && address < slot.end) {
@@ -743,6 +742,11 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
             const auto wait_begin = Clock::now();
             staging.Flush();
             ImmediateSubmit([&](vk::CommandBuffer cmd) {
+                const VkPipelineStageFlags user_stages =
+                    vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER |
+                    (device.IsExtConditionalRendering()
+                         ? VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT
+                         : VkPipelineStageFlags{0});
                 // A pool the replay already uses: earlier submissions may still read or write the
                 // range, later ones read the new bytes.
                 const VkMemoryBarrier before{
@@ -752,8 +756,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                     .dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 };
                 if (in_use) {
-                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                        VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
+                    cmd.PipelineBarrier(user_stages, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, before);
                 }
                 for (const Copy& copy : copies) {
                     if (copy.zero) {
@@ -773,8 +776,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                     .dstAccessMask = VK_ACCESS_MEMORY_WRITE_BIT | VK_ACCESS_MEMORY_READ_BIT,
                 };
                 if (in_use) {
-                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
-                                        VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, after);
+                    cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, user_stages, 0, after);
                 }
             });
             wait_ns += static_cast<u64>(
@@ -1672,7 +1674,7 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
         auto table = std::make_shared<RawTableBuffer>();
         const VkDeviceSize bytes = entries.size() * sizeof(RawGlobalRange);
         table->count = static_cast<u32>(entries.size());
-        if (mario_kart_world) {
+        {
             const VkPhysicalDeviceMemoryProperties* properties{};
             vmaGetMemoryProperties(vma, &properties);
             constexpr VkMemoryPropertyFlags mapped_local =
@@ -1720,8 +1722,8 @@ std::shared_ptr<RawTableBuffer> Context::Impl::UploadRawTable(
                 .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
                 .dstAccessMask = VK_ACCESS_SHADER_READ_BIT,
             };
-            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                                0, barrier, {}, {});
+            cmd.PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                                vk::PIPELINE_STAGE_GRAPHICS_COMPUTE, 0, barrier, {}, {});
         });
         return table;
     } catch (const vk::Exception& exception) {

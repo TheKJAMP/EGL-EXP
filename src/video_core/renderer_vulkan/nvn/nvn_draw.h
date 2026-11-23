@@ -671,7 +671,7 @@ private:
     void FillComputeBank(const VC::ComputeDriverLayout& layout, u8* out) const;
 
     // ---- passes (nvn_draw.cpp) ----
-    bool BeginPass();
+    bool BeginPass(bool read_only_depth = false);
     /// Where a render target attaches: the view, its extent, layer count.
     struct AttachmentShape {
         ViewKey key;
@@ -918,7 +918,10 @@ private:
         u32 layers{};
         std::array<VkImageView, MAX_COLOR_TARGETS + 1> views{};
     } last_framebuffer;
+    mutable bool pass_key_valid{false};
+    mutable RenderPassKey cached_pass_key{};
     bool pass_open{false};
+    bool pass_read_only_depth{};
     void NoteFlipTarget(const std::shared_ptr<Storage>& storage, VkImageLayout sampled_layout);
     /// Storages that flip between attachment and sampled use, with the layout they are sampled in:
     /// a pass that begins moves them to it before its first draw, so a draw that samples one
@@ -1067,6 +1070,7 @@ private:
     /// the pass formats): a draw whose state words are the ones of an earlier draw finds its
     /// pipeline without canonicalizing and hashing the key again.
     struct PipelineMemo {
+        u64 hash{};
         std::array<u64, GRAPHICS_STAGE_COUNT> programs{};
         GraphicsFixedState state{};
         RenderPassKey targets{};
@@ -1085,11 +1089,18 @@ private:
                                        const std::array<u64, BIND_STAGES>& cached_gen,
                                        u64 cached_sub_seq, u64 cached_tex_epoch) const noexcept;
     u64 shader_generation{};
+    struct ComputeMemo {
+        u64 serial{};
+        u64 program_hash{};
+        std::shared_ptr<ComputePipeline> pipeline;
+    };
+    std::array<ComputeMemo, 16> compute_memo;
     /// The driver (c0) and handle (c2) banks of the graphics stages are rebuilt only when what
     /// they are made of changed (storage buffer table, push constants, handle tables, raw global
     /// table): the arena copy of the last build is reused by every draw of the submission until
     /// then. The generations come from `bank_clock`, bumped by the bind ops.
     u64 bank_clock{0};
+    u64 compute_uniform_gen{0};
     std::array<u64, BIND_STAGES> storage_gen{};
     std::array<u64, BIND_STAGES> handle_gen{};
     std::array<u64, 2> push_gen{};
@@ -1114,6 +1125,21 @@ private:
     /// The push-constant block as the bank shaders read it from (VC::PushConstantBank), graphics
     /// and compute.
     std::array<BankCache, 2> push_banks;
+    struct ComputeBankCache {
+        u64 seq{~u64{0}};
+        u64 uniform_gen{};
+        u64 storage_gen{};
+        u64 handle_gen{};
+        u64 push_gen{};
+        u64 raw_gen{};
+        const void* raw_device{};
+        u64 coverage_ring{};
+        u64 alias_gen{};
+        std::array<u32, 3> groups{};
+        VC::ComputeDriverLayout layout{};
+        BufferRef ref;
+    };
+    ComputeBankCache compute_driver_bank;
     /// The open pass's framebuffer in the game's pixels (viewports, scissors and the render area
     /// are the game's numbers).
     VkExtent2D framebuffer_extent{};
@@ -1167,6 +1193,8 @@ private:
     std::vector<VkDescriptorBufferInfo> scratch_buffers;
     std::vector<VkDescriptorImageInfo> scratch_images;
     std::vector<VkBufferView> scratch_views;
+    std::vector<DescriptorTemplateEntry> scratch_template_entries;
+    bool scratch_template_ok{false};
     /// Texture buffers bound in the current submission: a view over an arena copy of the guest
     /// bytes each, made once per submission (TexelBufferView).
     struct TexelView {

@@ -2407,7 +2407,7 @@ TEST_CASE("MKW buffer lookup cache follows pool replacement and virtual remaps",
     };
     resolve(0x10120, 64, 1, 0x120);
     resolve(0x10120, 64, 1, 0x120);
-    CHECK(impl->mkw_resolve_hits == (impl->mario_kart_world ? 1u : 0u));
+    CHECK(impl->mkw_resolve_hits == 1u);
     impl->CreatePoolNow({.serial = 4, .guest_address = 0x10100, .size = 0x100});
     resolve(0x10120, 64, 4, 0x20);
     impl->DestroyNow(4);

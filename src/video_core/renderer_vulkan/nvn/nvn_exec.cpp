@@ -241,7 +241,7 @@ public:
         dispatch_writes_pending = true;
     }
     void HostFlushBarrierBeforeDispatch() override {
-        if (barrier_pending || !buffer_ops.Empty()) {
+        if (barrier_pending || tracked_buffer_writes_pending || !buffer_ops.Empty()) {
             MemoryBarrier(true);
             return;
         }
@@ -267,7 +267,23 @@ public:
             MemoryBarrier(true);
             impl.stats.barrier_merge_ops_unknown_writes.fetch_add(1, std::memory_order_relaxed);
         } else if (buffer_ops.Conflicts(accesses)) {
-            MemoryBarrier(true);
+            if (deferred_barrier.pending) {
+                MemoryBarrier(true);
+            } else {
+                const VkMemoryBarrier barrier{
+                    .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+                    .pNext = nullptr,
+                    .srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                    .dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT |
+                                     VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                };
+                segments.back().cmd.PipelineBarrier(
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
+                    barrier);
+                buffer_ops.Clear();
+                tracked_buffer_writes_pending = true;
+            }
             impl.stats.barrier_merge_ops_hazard.fetch_add(1, std::memory_order_relaxed);
         } else if (buffer_ops.Empty()) {
             impl.stats.barrier_merge_ops_clean.fetch_add(1, std::memory_order_relaxed);
@@ -573,6 +589,7 @@ public:
 private:
     struct Segment {
         VkCommandBuffer raw{};
+        std::unique_ptr<vk::CommandBuffer::ComputeBinding> compute_binding;
         vk::CommandBuffer cmd;
         bool ended{};
         std::vector<VkSemaphore> wait_semaphores;
@@ -614,7 +631,8 @@ private:
     /// finds one waiting joins it whether it defers or not (no command came between them).
     void MemoryBarrier(bool defer = false);
     void FlushPending(bool defer = false) {
-        if (barrier_pending || dispatch_writes_pending || !buffer_ops.Empty()) {
+        if (barrier_pending || dispatch_writes_pending || tracked_buffer_writes_pending ||
+            !buffer_ops.Empty()) {
             MemoryBarrier(defer);
         }
     }
@@ -842,6 +860,7 @@ private:
     /// Game dispatches wrote since the last memory barrier (HostMarkDispatchWritten): every flush
     /// but the one before a dispatch (HostFlushBarrierBeforeDispatch) emits the barrier for them.
     bool dispatch_writes_pending{false};
+    bool tracked_buffer_writes_pending{false};
     /// EDEN_NX2_TRY_BARRIER_MERGE: the buffer ranges of the replay's own commands since the last
     /// barrier (HostBeginBufferOp); empty with the switch off. Any flush emits the barrier for
     /// them.
@@ -915,7 +934,8 @@ void Recorder::BeginSegment(bool keep_shadows) {
     Segment segment;
     segment.raw = impl.AcquireCommandBuffer();
     flight.command_buffers.push_back(segment.raw);
-    segment.cmd = vk::CommandBuffer{segment.raw, impl.dld};
+    segment.compute_binding = std::make_unique<vk::CommandBuffer::ComputeBinding>();
+    segment.cmd = vk::CommandBuffer{segment.raw, impl.dld, segment.compute_binding.get()};
     segment.cmd.Begin({
         .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
         .pNext = nullptr,
@@ -935,6 +955,7 @@ void Recorder::BeginSegment(bool keep_shadows) {
     // The first op of a segment must be ordered after whatever earlier submissions on this
     // queue left running (same VkQueue, but no implicit dependency between submissions).
     barrier_pending = true;
+    tracked_buffer_writes_pending = false;
     buffer_ops.Clear();
     condition_prefetch.Clear();
     segment_signaled = false;
@@ -1075,6 +1096,7 @@ void Recorder::MemoryBarrier(bool defer) {
     barrier_pending = false;
     impl.stats.memory_barriers.fetch_add(1, std::memory_order_relaxed);
     dispatch_writes_pending = false;
+    tracked_buffer_writes_pending = false;
     buffer_ops.Clear();
 }
 
@@ -1181,6 +1203,7 @@ void Recorder::PrepareImagesSpan(std::span<const std::pair<Storage*, VkImageLayo
     barrier_pending = false;
     impl.stats.memory_barriers.fetch_add(1, std::memory_order_relaxed);
     dispatch_writes_pending = false;
+    tracked_buffer_writes_pending = false;
     buffer_ops.Clear();
 }
 
@@ -2880,8 +2903,10 @@ bool Recorder::RecordBcUpload(Storage& s, std::span<const BcChunk> chunks, bool 
             .image = *scratch->image,
             .subresourceRange{VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, VK_REMAINING_ARRAY_LAYERS},
         };
-        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-                              VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, reuse, {}, to_general);
+        Cmd().PipelineBarrier(
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, 0, reuse, {},
+            to_general);
         fill(chunk, *scratch);
         const VkMemoryBarrier texels_written{
             .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
@@ -5927,10 +5952,11 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
             .srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
             .dstAccessMask = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT,
         };
-        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT, ALL_STAGES, 0,
-                              passes_done);
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_COLOR_ATTACHMENT_OUTPUT_BIT,
+                              vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, passes_done);
     } else {
-        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, ALL_STAGES, 0, frame_out);
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, frame_out);
     }
     const auto requested_upscaler = VideoCore::Upscaler::Effective();
     static Settings::Upscaler last_upscaler = static_cast<Settings::Upscaler>(~0u);
@@ -5953,6 +5979,7 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
         const Common::Rectangle<f32> crop{0.0f, 0.0f, 1.0f, 1.0f};
         impl.final_fsr->Record(impl.device, Cmd(), 0, *frame.image, *frame.image_view, extent,
                                crop);
+        segments.back().cmd.ForgetComputePipeline();
         const std::array fsr_barriers{
             VkImageMemoryBarrier{
                 .sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
@@ -6003,7 +6030,8 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
             .image = *frame.image,
             .subresourceRange = frame_out.subresourceRange,
         };
-        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT, ALL_STAGES, 0, fsr_done);
+        Cmd().PipelineBarrier(VK_PIPELINE_STAGE_TRANSFER_BIT,
+                              vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER, 0, fsr_done);
         static Common::BootCounter final_fsr_evaluations;
         if (final_fsr_evaluations.Next() % 600 == 0) {
             LOG_INFO(Render_Vulkan, "[upscaler] final FSR evaluated {}x{}", extent.width,
@@ -6032,6 +6060,7 @@ bool Recorder::RecordPresent(Texture& texture, Frame& frame, std::vector<Frame*>
             VkExtent2D{guest.extent.width, guest.extent.height},
             impl.present_target->UsesPresentThread(), recording,
             impl.present_target->MaxExtraFrames());
+        segments.back().cmd.ForgetComputePipeline();
         GenerateFrames(generated_count, frame, generated);
     }
 

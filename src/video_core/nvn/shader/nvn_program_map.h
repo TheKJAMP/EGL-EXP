@@ -91,6 +91,7 @@ struct ComputeDriverLayout {
     [[nodiscard]] ComputeHandleTables HandleTables() const noexcept {
         return {texture_offset, texture_count, image_offset, image_count};
     }
+    [[nodiscard]] bool operator==(const ComputeDriverLayout&) const noexcept = default;
 };
 
 /// The setup of a task (stage 6) or mesh (stage 7) program, from its control section. NVN2's

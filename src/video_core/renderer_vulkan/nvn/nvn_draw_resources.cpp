@@ -95,6 +95,7 @@ constexpr u64 SHADOW_CHUNK_SIZE = u64{8} << 20;
 /// created and destroyed a chunk every third frame (F:/eg/results/vertex-stage2, L-new1-b).
 constexpr u32 MAX_FREE_SHADOWS = 32;
 constexpr u64 SHADOW_KEEP_MAX = u64{32} << 20;
+constexpr u32 MAX_FREE_DESCRIPTOR_POOLS = 32;
 constexpr u64 MAX_FREE_SHADOW_BYTES = u64{256} << 20;
 
 /// What a shadow of a storage range is bound as, and copied from and to the pool buffer; staged
@@ -406,6 +407,11 @@ void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc
         }
     }
     program_hashes[desc.serial] = hashes;
+    if (!desc.control[STAGE_COMPUTE].empty()) {
+        ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(desc.control[STAGE_COMPUTE], parsed.error);
+        compute_controls[desc.serial] = std::move(parsed);
+    }
     PipelineCache* cache{};
     {
         std::scoped_lock lock{cache_mutex};
@@ -881,6 +887,58 @@ void DrawResources::ReleaseShadows(std::vector<std::shared_ptr<ShadowChunk>>& ch
         }
     }
     chunks.clear();
+}
+
+std::shared_ptr<vk::DescriptorPool> DrawResources::AcquireDescriptorPool(u32 max_sets) {
+    {
+        std::scoped_lock lock{descriptor_pool_mutex};
+        while (!free_descriptor_pools.empty()) {
+            std::shared_ptr<vk::DescriptorPool> pool = std::move(free_descriptor_pools.back());
+            free_descriptor_pools.pop_back();
+            if (!pool) {
+                continue;
+            }
+            try {
+                pool->Reset();
+                return pool;
+            } catch (const vk::Exception& exception) {
+                LOG_WARNING(Render_Vulkan, "[nvn] descriptor pool reset failed: {}",
+                            exception.what());
+            }
+        }
+    }
+    const std::array<VkDescriptorPoolSize, 6> sizes{{
+        {VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER, max_sets * 24},
+        {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, max_sets * 16},
+        {VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, max_sets * 48},
+        {VK_DESCRIPTOR_TYPE_STORAGE_IMAGE, max_sets * 8},
+        {VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER, max_sets * 4},
+        {VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER, max_sets * 4},
+    }};
+    try {
+        return std::make_shared<vk::DescriptorPool>(impl.device.GetLogical().CreateDescriptorPool({
+            .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+            .pNext = nullptr,
+            .flags = 0,
+            .maxSets = max_sets,
+            .poolSizeCount = static_cast<u32>(sizes.size()),
+            .pPoolSizes = sizes.data(),
+        }));
+    } catch (const vk::Exception& exception) {
+        LOG_ERROR(Render_Vulkan, "[nvn] descriptor pool creation failed: {}", exception.what());
+        return nullptr;
+    }
+}
+
+void DrawResources::ReleaseDescriptorPools(
+    std::vector<std::shared_ptr<vk::DescriptorPool>>& pools) {
+    std::scoped_lock lock{descriptor_pool_mutex};
+    for (auto& pool : pools) {
+        if (pool && free_descriptor_pools.size() < MAX_FREE_DESCRIPTOR_POOLS) {
+            free_descriptor_pools.push_back(std::move(pool));
+        }
+    }
+    pools.clear();
 }
 
 VkBuffer DrawResources::DummyBuffer() {

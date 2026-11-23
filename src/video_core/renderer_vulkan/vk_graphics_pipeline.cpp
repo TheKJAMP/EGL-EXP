@@ -1097,13 +1097,19 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                                            vk::CommandBuffer cmdbuf, VkDescriptorSet set) {
                 constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
                                                          VK_SHADER_STAGE_COMPUTE_BIT};
-                cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
-                                     sizeof(rescaling_data), rescaling_data.data());
+                struct ScalingConstants {
+                    std::array<u32, 6> words;
+                    f32 down_factor;
+                };
+                static_assert(sizeof(rescaling_data) == sizeof(ScalingConstants::words));
+                static_assert(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET ==
+                              RESCALING_LAYOUT_WORDS_OFFSET +
+                                  offsetof(ScalingConstants, down_factor));
                 const f32 config_down_factor{Settings::values.resolution_info.down_factor};
-                const f32 down_factor{is_rescaling ? config_down_factor : 1.0f};
-                cmdbuf.PushConstants(pipeline_layout, push_stages,
-                                     RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor),
-                                     &down_factor);
+                const ScalingConstants constants{
+                    rescaling_data, is_rescaling ? config_down_factor : 1.0f};
+                cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                     sizeof(constants), &constants);
                 if (uses_render_area) {
                     cmdbuf.PushConstants(pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                          sizeof(render_area_data), &render_area_data);
@@ -1229,13 +1235,19 @@ bool GraphicsPipeline::ConfigureDraw(const RescalingPushConstant& rescaling,
                 const auto bind_program_state = [&] {
                     constexpr VkShaderStageFlags push_stages{VK_SHADER_STAGE_ALL_GRAPHICS |
                                                              VK_SHADER_STAGE_COMPUTE_BIT};
-                    cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
-                                         sizeof(rescaling_data), rescaling_data.data());
+                    struct ScalingConstants {
+                        std::array<u32, 6> words;
+                        f32 down_factor;
+                    };
+                    static_assert(sizeof(rescaling_data) == sizeof(ScalingConstants::words));
+                    static_assert(RESCALING_LAYOUT_DOWN_FACTOR_OFFSET ==
+                                  RESCALING_LAYOUT_WORDS_OFFSET +
+                                      offsetof(ScalingConstants, down_factor));
                     const f32 config_down_factor{Settings::values.resolution_info.down_factor};
-                    const f32 down_factor{is_rescaling ? config_down_factor : 1.0f};
-                    cmdbuf.PushConstants(pipeline_layout, push_stages,
-                                         RESCALING_LAYOUT_DOWN_FACTOR_OFFSET, sizeof(down_factor),
-                                         &down_factor);
+                    const ScalingConstants constants{
+                        rescaling_data, is_rescaling ? config_down_factor : 1.0f};
+                    cmdbuf.PushConstants(pipeline_layout, push_stages, RESCALING_LAYOUT_WORDS_OFFSET,
+                                         sizeof(constants), &constants);
                     if (uses_render_area) {
                         cmdbuf.PushConstants(pipeline_layout, push_stages, RENDERAREA_LAYOUT_OFFSET,
                                              sizeof(render_area_data), &render_area_data);

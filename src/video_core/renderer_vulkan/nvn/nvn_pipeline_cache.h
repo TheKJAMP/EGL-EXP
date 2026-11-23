@@ -301,16 +301,42 @@ struct PipelineLogInfo {
 };
 
 
+/// Flat descriptor entry passed to vkCmdPushDescriptorSetWithTemplateKHR /
+/// vkUpdateDescriptorSetWithTemplate in binding declaration order.
+union DescriptorTemplateEntry {
+    VkDescriptorBufferInfo buffer;
+    VkDescriptorImageInfo image;
+    VkBufferView texel_view;
+};
+static_assert(sizeof(DescriptorTemplateEntry) == sizeof(VkDescriptorBufferInfo));
+
+/// Descriptor set layout, pipeline layout and descriptor update template shared across
+/// pipelines with an identical descriptor signature.
+struct SharedPipelineLayout {
+    vk::DescriptorSetLayout set_layout;
+    /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
+    vk::DescriptorSetLayout bindless_layout;
+    vk::PipelineLayout layout;
+    vk::DescriptorUpdateTemplate update_template;
+    bool push_descriptors{};
+    u32 push_constant_size{};
+    u32 template_entry_count{};
+};
+
 /// A created pipeline. Immutable after creation (but for a GPL pipeline's `optimized` handle,
 /// see GraphicsPipeline); shared_ptr so in-flight submissions keep it alive.
 struct PipelineBase {
     vk::Pipeline pipeline;
-    vk::PipelineLayout layout;
-    vk::DescriptorSetLayout set_layout; ///< null when the pipeline has no descriptors
+    std::shared_ptr<const SharedPipelineLayout> shared_layout;
+    VkPipelineLayout layout{VK_NULL_HANDLE};
+    VkDescriptorSetLayout set_layout{VK_NULL_HANDLE}; ///< null when the pipeline has no descriptors
     /// Set BINDLESS_SET of the layout when a stage samples through the bindless table.
-    vk::DescriptorSetLayout bindless_layout;
-    /// The descriptor set is pushed with vkCmdPushDescriptorSetKHR; otherwise it is allocated.
+    VkDescriptorSetLayout bindless_layout{VK_NULL_HANDLE};
+    VkDescriptorUpdateTemplate update_template{VK_NULL_HANDLE};
+    /// The descriptor set is pushed with vkCmdPushDescriptorSetWithTemplateKHR / KHR; otherwise
+    /// it is allocated.
     bool push_descriptors{};
+    u32 template_entry_count{};
     /// Descriptor bindings of every stage in pipeline order, numbered as in the SPIR-V.
     VC::DescriptorLayout descriptors;
     /// Push-constant range size in bytes (rescaling / render-area words), 0 if none.
@@ -510,7 +536,8 @@ public:
     /// The render pass pipelines of this key are created for and that the replay begins with
     /// (attachments LOAD/STORE, color attachments in COLOR_ATTACHMENT_OPTIMAL, depth/stencil in
     /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL for the whole pass). Owned by the cache.
-    [[nodiscard]] VkRenderPass GetRenderPass(const RenderPassKey& key);
+    [[nodiscard]] VkRenderPass GetRenderPass(const RenderPassKey& key,
+                                             bool read_only_depth = false);
 
     /// The Shader::Profile / HostTranslateInfo built from the device (as vk_pipeline_cache.cpp).
     [[nodiscard]] const Shader::Profile& Profile() const noexcept;

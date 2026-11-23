@@ -97,6 +97,7 @@ struct DrawPlan {
     VkDescriptorSet set{VK_NULL_HANDLE};
     /// The plan is for a graphics draw (false: a dispatch); only the fallback counters read it.
     bool graphics{true};
+    bool read_only_depth{};
     /// The pipeline's shaders reach any pool through raw global memory: no storage range of the draw
     /// is shadowed and every live shadow is copied back before it.
     bool raw_global{false};
@@ -125,6 +126,7 @@ struct DrawPlan {
         feedback.clear();
         uniform_copies.clear();
         set = VK_NULL_HANDLE;
+        read_only_depth = false;
         raw_global_writes = false;
         raw_stores_written_through = false;
         raw_global = false;

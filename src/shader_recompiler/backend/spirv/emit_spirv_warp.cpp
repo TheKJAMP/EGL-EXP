@@ -315,7 +315,10 @@ Id EmitShuffleButterfly(EmitContext& ctx, IR::Inst* inst, Id value, Id index, Id
     const Id in_range{ctx.OpSLessThanEqual(ctx.U1, src_thread_id, max_thread_id)};
 
     SetInBoundsFlag(inst, in_range);
-    const Id shuffled{ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value, mask)};
+    const Id shuffled{UseShuffleFallback(ctx)
+                          ? ShuffleAbsolute(ctx, value, HostThreadId(ctx, src_thread_id))
+                          : ctx.OpGroupNonUniformShuffleXor(ctx.U32[1], SubgroupScope(ctx), value,
+                                                            mask)};
     return ctx.OpSelect(ctx.U32[1], in_range, shuffled, value);
 }
 

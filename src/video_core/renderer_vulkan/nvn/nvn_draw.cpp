@@ -10,6 +10,7 @@
 #include <fmt/format.h>
 
 #include "common/boot_counter.h"
+#include "common/cityhash.h"
 #include "common/diag_request.h"
 #include "common/logging.h"
 #include "common/scope_exit.h"
@@ -141,6 +142,7 @@ void DrawContext::BeginSubmission(DrawHost& host_, const VC::Submission& submiss
     last_kept = nullptr;
     last_compute_kept = nullptr;
     last_framebuffer.handle = VK_NULL_HANDLE;
+    pass_key_valid = false;
     resources.RefreshSamplerSetting();
 }
 
@@ -426,14 +428,15 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetDepthClamp:
         if (fits(sizeof(VC::EnablePayload))) {
             const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
-            pipeline_dirty |= ReplaceState(fixed.depth_clamp, value, impl.mario_kart_world);
+            pipeline_dirty |= ReplaceState(fixed.depth_clamp, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetAlphaRef:
         if (fits(sizeof(VC::SetAlphaRefPayload))) {
             const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::SetAlphaRefPayload>(header)->reference);
-            pipeline_dirty |= ReplaceState(fixed.alpha_ref_bits, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.alpha_ref_bits, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::PushConstants:
@@ -451,8 +454,10 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
             const auto* p = VC::RecordPayload<VC::SetPrimitiveRestartPayload>(header);
             const u32 enabled = p->enable ? 1u : 0u;
             const u32 index = p->enable ? p->index : 0u;
-            pipeline_dirty |= ReplaceState(fixed.primitive_restart, enabled, impl.mario_kart_world);
-            pipeline_dirty |= ReplaceState(fixed.restart_index, index, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.primitive_restart, enabled, !Debug::Get().no_state_elide);
+            pipeline_dirty |=
+                ReplaceState(fixed.restart_index, index, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetViewportSwizzles:
@@ -466,27 +471,30 @@ bool DrawContext::Handle(const VC::RecordHeader* header) {
     case Op::SetRasterizerDiscard:
         if (fits(sizeof(VC::EnablePayload))) {
             const u32 value = VC::RecordPayload<VC::EnablePayload>(header)->enable ? 1u : 0u;
-            pipeline_dirty |= ReplaceState(fixed.rasterizer_discard, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.rasterizer_discard, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetSampleMask:
         if (fits(sizeof(VC::U32Payload))) {
             const u32 value = VC::RecordPayload<VC::U32Payload>(header)->value;
-            pipeline_dirty |= ReplaceState(fixed.sample_mask, value, impl.mario_kart_world);
+            pipeline_dirty |= ReplaceState(fixed.sample_mask, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetProvokingVertex:
         if (fits(sizeof(VC::U32Payload))) {
             const u32 last = VC::RecordPayload<VC::U32Payload>(header)->value & 1;
             const u32 value = last != 0 ? 0u : 1u;
-            pipeline_dirty |= ReplaceState(fixed.provoking_first, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.provoking_first, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetPointSize:
         if (fits(sizeof(VC::F32Payload))) {
             const u32 value =
                 std::bit_cast<u32>(VC::RecordPayload<VC::F32Payload>(header)->value);
-            pipeline_dirty |= ReplaceState(fixed.point_size_bits, value, impl.mario_kart_world);
+            pipeline_dirty |=
+                ReplaceState(fixed.point_size_bits, value, !Debug::Get().no_state_elide);
         }
         return true;
     case Op::SetLineWidth:
@@ -517,7 +525,7 @@ void DrawContext::SetProgram(const VC::BindProgramPayload& p) {
             stages[stage].program_serial = p.program_serial;
         }
     }
-    pipeline_dirty |= !impl.mario_kart_world || changed;
+    pipeline_dirty |= Debug::Get().no_state_elide || changed;
 }
 
 void DrawContext::BindState(const VC::RecordHeader* header) {
@@ -529,8 +537,9 @@ void DrawContext::BindState(const VC::RecordHeader* header) {
                          fmt::format("bad state object (kind {}, size {})", p->kind, p->size));
         return;
     }
+    const bool elide = !Debug::Get().no_state_elide;
     const auto assign = [&](auto& destination, const auto& value) {
-        return ReplaceState(destination, value, impl.mario_kart_world);
+        return ReplaceState(destination, value, elide);
     };
     bool changed = false;
     switch (static_cast<VC::StateKind>(p->kind)) {
@@ -582,7 +591,7 @@ void DrawContext::BindVertexAttribs(const VC::RecordHeader* header) {
     for (u32 i = 0; i < words.size() && i < MAX_VERTEX_ATTRIBUTES; ++i) {
         attributes[i] = words[i];
     }
-    if (impl.mario_kart_world && fixed.attributes == attributes) {
+    if (!Debug::Get().no_state_elide && fixed.attributes == attributes) {
         return;
     }
     fixed.attributes = attributes;
@@ -600,7 +609,7 @@ void DrawContext::BindVertexStreams(const VC::RecordHeader* header) {
         strides[i] = values[i].stride;
         divisors[i] = values[i].divisor;
     }
-    if (impl.mario_kart_world && fixed.stream_stride == strides &&
+    if (!Debug::Get().no_state_elide && fixed.stream_stride == strides &&
         fixed.stream_divisor == divisors) {
         return;
     }
@@ -633,7 +642,11 @@ void DrawContext::BindBuffers(const VC::RecordHeader* header, bool uniform) {
                    table[p->first + i].size != ranges[i].size;
         table[p->first + i] = {ranges[i].address, ranges[i].size};
     }
-    if (!uniform && (!impl.mario_kart_world || changed)) {
+    if (uniform) {
+        if (p->stage == STAGE_COMPUTE && (Debug::Get().no_state_elide || changed)) {
+            compute_uniform_gen = ++bank_clock;
+        }
+    } else if (Debug::Get().no_state_elide || changed) {
         storage_gen[p->stage] = ++bank_clock;
     }
 }
@@ -676,7 +689,7 @@ void DrawContext::BindHandles(const VC::RecordHeader* header, VC::Op op) {
             break;
         }
     }
-    if (!impl.mario_kart_world || changed) {
+    if (Debug::Get().no_state_elide || changed) {
         handle_gen[p->stage] = ++bank_clock;
     }
 }
@@ -717,7 +730,7 @@ void DrawContext::PushConstantsOp(const VC::RecordHeader* header) {
                                           size, PUSH_CONSTANT_BLOCK_SIZE));
         return;
     }
-    if (impl.mario_kart_world &&
+    if (!Debug::Get().no_state_elide &&
         std::memcmp(block.data() + p->offset, reinterpret_cast<const u8*>(p + 1), size) == 0) {
         return;
     }
@@ -809,6 +822,7 @@ void DrawContext::SetRenderTargets(const VC::RecordHeader* header) {
 }
 
 void DrawContext::DecideTargetScale() {
+    pass_key_valid = false;
     targets_scaled = false;
     const Rescale::Factor factor = impl.RescaleFactor();
     if (!factor.Active()) {
@@ -1068,9 +1082,13 @@ void DrawContext::RevertTargetScale() {
         depth_target.texture = std::move(depth_target.native);
     }
     targets_scaled = false;
+    pass_key_valid = false;
 }
 
-bool DrawContext::BeginPass() {
+bool DrawContext::BeginPass(bool read_only_depth) {
+    if (pass_open && pass_read_only_depth != read_only_depth) {
+        EndPass(BreakCause::LayoutChange);
+    }
     if (pass_open) {
         return true;
     }
@@ -1174,8 +1192,11 @@ bool DrawContext::BeginPass() {
                                                              attachment.texture->serial));
             return false;
         }
+        const VkImageLayout depth_layout = read_only_depth
+            ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL
+            : VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL;
         transition_scratch.emplace_back(attachment.storage,
-                                        is_depth ? VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL
+                                        is_depth ? depth_layout
                                                  : VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
     }
     // Storages that flip between attachment and sampled use go to their sampled layout now, in
@@ -1229,7 +1250,7 @@ bool DrawContext::BeginPass() {
         }
     }
 
-    const VkRenderPass render_pass = resources.Cache().GetRenderPass(key);
+    const VkRenderPass render_pass = resources.Cache().GetRenderPass(key, read_only_depth);
     if (!render_pass) {
         host->HostFailed("SetRenderTargets", "render pass creation failed");
         return false;
@@ -1277,6 +1298,7 @@ bool DrawContext::BeginPass() {
         return false;
     }
     pass_open = true;
+    pass_read_only_depth = read_only_depth;
     ++counters.pass_begins;
     if (VideoCommon::Nvn::TimestampTraceEnabled()) {
         resources.TracePass(extent.width, extent.height);
@@ -2004,6 +2026,9 @@ private:
 } // namespace
 
 RenderPassKey DrawContext::MakePassKey() const {
+    if (pass_key_valid) {
+        return cached_pass_key;
+    }
     RenderPassKey key{};
     const Device& device = impl.device;
     for (u32 slot = 0; slot < color_target_count; ++slot) {
@@ -2017,6 +2042,8 @@ RenderPassKey DrawContext::MakePassKey() const {
         key.depth = static_cast<s32>(FormatOf(device, *depth_target.texture, depth_target.ref).format);
         key.samples = static_cast<u32>(depth_target.texture->storage->samples);
     }
+    cached_pass_key = key;
+    pass_key_valid = true;
     return key;
 }
 
@@ -2095,6 +2122,8 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         bound_pipeline = VK_NULL_HANDLE;
         bound_state.Reset();
         last_kept = nullptr;
+        compute_memo = {};
+        last_compute_kept = nullptr;
         shader_generation = generation;
     }
     const DrawOracle oracle{*this};
@@ -2446,12 +2475,23 @@ void DrawContext::ApplyDynamicState(const GraphicsPipeline& active) {
         cmd.SetBlendConstants(blend_color);
     }
     if (dynamic_dirty & DIRTY_STENCIL) {
-        for (u32 face = 0; face < 2; ++face) {
-            const VkStencilFaceFlags flag =
-                face == 0 ? VK_STENCIL_FACE_FRONT_BIT : VK_STENCIL_FACE_BACK_BIT;
-            cmd.SetStencilCompareMask(flag, stencil[face].value_mask);
-            cmd.SetStencilWriteMask(flag, stencil[face].write_mask);
-            cmd.SetStencilReference(flag, stencil[face].reference);
+        if (stencil[0].value_mask == stencil[1].value_mask) {
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].value_mask);
+        } else {
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_FRONT_BIT, stencil[0].value_mask);
+            cmd.SetStencilCompareMask(VK_STENCIL_FACE_BACK_BIT, stencil[1].value_mask);
+        }
+        if (stencil[0].write_mask == stencil[1].write_mask) {
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].write_mask);
+        } else {
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_FRONT_BIT, stencil[0].write_mask);
+            cmd.SetStencilWriteMask(VK_STENCIL_FACE_BACK_BIT, stencil[1].write_mask);
+        }
+        if (stencil[0].reference == stencil[1].reference) {
+            cmd.SetStencilReference(VK_STENCIL_FACE_FRONT_AND_BACK, stencil[0].reference);
+        } else {
+            cmd.SetStencilReference(VK_STENCIL_FACE_FRONT_BIT, stencil[0].reference);
+            cmd.SetStencilReference(VK_STENCIL_FACE_BACK_BIT, stencil[1].reference);
         }
     }
     if (dynamic_dirty & DIRTY_BIAS) {
@@ -2699,7 +2739,10 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
     {
         // A conditional-rendering region cannot straddle a render pass begin or end.
         const bool suspended = host->HostSuspendCondition();
-        const bool ready = PrepareOutsidePass(plan) && BeginPass();
+        if (pass_open && pass_read_only_depth != plan.read_only_depth) {
+            EndPass(BreakCause::LayoutChange);
+        }
+        const bool ready = PrepareOutsidePass(plan) && BeginPass(plan.read_only_depth);
         if (suspended) {
             host->HostResumeCondition();
         }
@@ -2810,21 +2853,47 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
         bound_pipeline = handle;
         vertex_dirty = true;
-        bound_state.OnPipelineBind(*active->layout, active->descriptors.UsesPushConstants());
+        bound_state.OnPipelineBind(active->layout, active->descriptors.UsesPushConstants());
     }
     if (active->dynamic_fixed && (!fixed_state_set || fixed_state != active->fixed_values)) {
         const DynamicFixedState& v = active->fixed_values;
-        cmd.SetCullModeEXT(v.cull_mode);
-        cmd.SetFrontFaceEXT(v.front_face);
-        cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
-        cmd.SetDepthTestEnableEXT(v.depth_test_enable);
-        cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
-        cmd.SetDepthCompareOpEXT(v.depth_compare_op);
-        cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
-        cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
-                            v.front.depth_fail, v.front.compare);
-        cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass, v.back.depth_fail,
-                            v.back.compare);
+        const bool all = !fixed_state_set;
+        if (all || fixed_state.cull_mode != v.cull_mode) {
+            cmd.SetCullModeEXT(v.cull_mode);
+        }
+        if (all || fixed_state.front_face != v.front_face) {
+            cmd.SetFrontFaceEXT(v.front_face);
+        }
+        if (all || fixed_state.depth_bias_enable != v.depth_bias_enable) {
+            cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
+        }
+        if (all || fixed_state.depth_test_enable != v.depth_test_enable) {
+            cmd.SetDepthTestEnableEXT(v.depth_test_enable);
+        }
+        if (all || fixed_state.depth_write_enable != v.depth_write_enable) {
+            cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
+        }
+        if (all || fixed_state.depth_compare_op != v.depth_compare_op) {
+            cmd.SetDepthCompareOpEXT(v.depth_compare_op);
+        }
+        if (all || fixed_state.stencil_test_enable != v.stencil_test_enable) {
+            cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
+        }
+        const bool front_changed = all || fixed_state.front != v.front;
+        const bool back_changed = all || fixed_state.back != v.back;
+        if (front_changed && back_changed && v.front == v.back) {
+            cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, v.front.fail, v.front.pass,
+                                v.front.depth_fail, v.front.compare);
+        } else {
+            if (front_changed) {
+                cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
+                                    v.front.depth_fail, v.front.compare);
+            }
+            if (back_changed) {
+                cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass,
+                                    v.back.depth_fail, v.back.compare);
+            }
+        }
         fixed_state = v;
         fixed_state_set = true;
     }

@@ -150,7 +150,7 @@ Config Read() {
             static_cast<u32>(wait == 1 ? 250 : (std::min<u64>)(wait, 5000));
     }
     config.try_barrier_merge = static_cast<u32>(EnvNumber("EDEN_NX2_TRY_BARRIER_MERGE", 0));
-    config.try_stage_span = EnvFlag("EDEN_NX2_TRY_STAGE_SPAN");
+    config.try_stage_span = EnvFlag("EDEN_NX2_TRY_STAGE_SPAN", true);
     config.try_ubo_mirror = EnvFlag("EDEN_NX2_TRY_UBO_MIRROR");
     // Vertex/index ranges from VRAM: on by default (OoT Kokiri village 39-40 -> 36-37 ms GPU, every
     // range served). =0 turns a switch off; EDEN_NX2_TRY_VTXCOV=0 turns all four coverage switches off.
