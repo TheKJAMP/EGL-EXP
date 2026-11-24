@@ -417,7 +417,9 @@ BcGpuEncoder* Context::Impl::BcEncoder() {
     return bc_encoder.get();
 }
 
-std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<BcScratch>& slot,
+                                                               u64 budget, u32 width, u32 height,
+                                                               u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
     for (size_t i = 0; i < bc_scratches.size(); ++i) {
         if (bc_scratches[i] && bc_scratches[i]->Fits(width, height, layers, bc7)) {
@@ -466,6 +468,16 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height
         }
         return nullptr;
     }
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+    return AcquireBcScratchFrom(bc_scratch, BC_SCRATCH_BUDGET, width, height, layers);
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchSlot(size_t slot, u32 width, u32 height,
+                                                               u32 layers) {
+    return AcquireBcScratchFrom(bc_scratch_ring[slot], BC_SMALL_SCRATCH_MAX_BYTES, width, height,
+                                layers);
 }
 
 void Context::Impl::CompleteBcTimes(const BcUploadTimes& times) {
@@ -652,6 +664,7 @@ Context::Impl::~Impl() {
     commands.clear();
     inflight.clear();
     draw_contexts.clear();
+    bindless_layout_dirty.clear();
     draw_resources.reset();
     storage_index.clear();
     storage_cache.clear();
@@ -687,8 +700,12 @@ Context::Impl::~Impl() {
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
+    bc_scratch.reset();
+    bc_scratch_ring = {};
     bc_scratches.clear();
     staging_cache = {};
+    large_staging_cache = {};
+    download_cache = {};
     quad_indirect.reset();
     allocator.reset();
     command_buffer_allocations.clear();
@@ -824,12 +841,13 @@ void Context::Impl::Dispatch(Command& command) {
                          "exact buffer lookup cache and lazy raw mirror invalidation active");
             }
             impl.mkw_coalesce_early_submit =
-                impl.mario_kart_world && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
+                c.title_id != 0 && std::getenv("EDEN_NX2_NVN_EARLY_SUBMIT_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_FIRST_US") == nullptr &&
                 std::getenv("EDEN_NX2_NVN_EARLY_PASS_US") == nullptr;
             if (impl.mkw_coalesce_early_submit && impl.options.early_submit) {
-                LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: early submit at most twice per "
-                                        "submission; live passes and shadows use the pass budget");
+                LOG_INFO(Render_Vulkan, "[nvn] title {:#018x}: early submit coalesced; live "
+                                        "passes, shadows, and queued GPU work avoid extra splits",
+                         c.title_id);
             }
             if (c.title_id != 0) {
                 if (!impl.options.barrier_merge &&
@@ -1259,10 +1277,52 @@ vk::Buffer Context::Impl::AcquireStaging(u64 size) {
                 return std::move(buffer);
             }
         }
+    } else if (size > STAGING_CHUNK && size <= (u64{128} << 20)) {
+        std::scoped_lock lock{staging_cache_mutex};
+        size_t best = large_staging_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+            if (!large_staging_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = large_staging_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= size * 2 && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < large_staging_cache.size()) {
+            stats.staging_chunks_reused.fetch_add(1, std::memory_order_relaxed);
+            return std::move(large_staging_cache[best]);
+        }
     }
     // GPU untile and ASTC decode can read the staged GOBs directly.
     return CreateHostBuffer(size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
                             MemoryUsage::Upload, AllocationKind::Staging);
+}
+
+vk::Buffer Context::Impl::AcquireDownload(u64 size) {
+    const u64 alloc_size = (std::max)(size, u64{64} << 10);
+    const u64 max_reuse = (std::max)(size * 2, u64{1} << 20);
+    {
+        std::scoped_lock lock{download_cache_mutex};
+        size_t best = download_cache.size();
+        u64 best_size = ~u64{0};
+        for (size_t i = 0; i < download_cache.size(); ++i) {
+            if (!download_cache[i]) {
+                continue;
+            }
+            const u64 buf_size = download_cache[i].Mapped().size();
+            if (buf_size >= size && buf_size <= max_reuse && buf_size < best_size) {
+                best = i;
+                best_size = buf_size;
+            }
+        }
+        if (best < download_cache.size()) {
+            return std::move(download_cache[best]);
+        }
+    }
+    return CreateHostBuffer(alloc_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT, MemoryUsage::Download);
 }
 
 void Context::Impl::CompleteMain() {
@@ -1352,6 +1412,7 @@ void Context::Impl::CompleteMain() {
                     } else {
                         landed.assign(1, {0, readback.pool->size}); // not taken for long: all
                     }
+                    readback.pool->has_landed_writebacks.store(true, std::memory_order_release);
                 }
             }
         }
@@ -1445,14 +1506,32 @@ void Context::Impl::CompleteMain() {
             std::scoped_lock lock{staging_cache_mutex};
             auto free = staging_cache.begin();
             for (auto& buffer : flight->staging) {
-                if (buffer.Mapped().size() != STAGING_CHUNK) {
-                    continue;
+                const u64 buf_size = buffer.Mapped().size();
+                if (buf_size == STAGING_CHUNK) {
+                    free = std::find_if(free, staging_cache.end(),
+                                        [](const auto& slot) { return !slot; });
+                    if (free != staging_cache.end()) {
+                        *free++ = std::move(buffer);
+                    }
+                } else if (buf_size > STAGING_CHUNK && buf_size <= (u64{128} << 20)) {
+                    size_t target = large_staging_cache.size();
+                    u64 smallest = ~u64{0};
+                    for (size_t i = 0; i < large_staging_cache.size(); ++i) {
+                        if (!large_staging_cache[i]) {
+                            target = i;
+                            break;
+                        }
+                        const u64 cur_size = large_staging_cache[i].Mapped().size();
+                        if (cur_size < smallest) {
+                            smallest = cur_size;
+                            target = i;
+                        }
+                    }
+                    if (target < large_staging_cache.size() &&
+                        (!large_staging_cache[target] || buf_size > smallest)) {
+                        large_staging_cache[target] = std::move(buffer);
+                    }
                 }
-                free = std::find_if(free, staging_cache.end(), [](const auto& slot) { return !slot; });
-                if (free == staging_cache.end()) {
-                    break;
-                }
-                *free++ = std::move(buffer);
             }
         }
         flight->staging.clear();
@@ -1468,6 +1547,16 @@ void Context::Impl::CompleteMain() {
                 draw_resources->ReleaseDescriptorPools(flight->descriptor_pools);
             } else {
                 flight->descriptor_pools.clear();
+            }
+        }
+        if (gpu_complete && flight->download && !device_lost.load(std::memory_order_acquire) &&
+            flight->download.Mapped().size() <= (u64{16} << 20)) {
+            std::scoped_lock lock{download_cache_mutex};
+            for (auto& slot : download_cache) {
+                if (!slot) {
+                    slot = std::move(flight->download);
+                    break;
+                }
             }
         }
         flight->download.reset();

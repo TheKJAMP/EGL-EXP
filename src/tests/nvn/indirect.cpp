@@ -1062,16 +1062,10 @@ TEST_CASE("NVN indirect: render conditions are evaluated on the GPU when the dev
     const Vulkan::Nvn::ContextStats stats = context.Stats();
     if (vulkan->device->IsExtConditionalRendering()) {
         CHECK(stats.render_conditions_cpu == 0);
-        if (stats.pools_imported != 0) {
-            // The first condition computes both modes of the pair in one batch; the second and
-            // the third (mode 0 again) are served by those predicates.
-            CHECK(stats.render_conditions_gpu == 2);
-            CHECK(stats.render_conditions_prefetched == 2);
-        } else {
-            // Mirrored pools take CPU writes at the next upload: each condition at its own point.
-            CHECK(stats.render_conditions_gpu == 3);
-            CHECK(stats.render_conditions_prefetched == 0);
-        }
+        // The first condition computes both modes of the pair in one batch; the second and
+        // the third (mode 0 again) are served by those predicates (imported and mirrored pools alike).
+        CHECK(stats.render_conditions_gpu == 2);
+        CHECK(stats.render_conditions_prefetched == 2);
     } else {
         CHECK(stats.render_conditions_gpu == 0);
         CHECK(stats.render_conditions_cpu == 3);

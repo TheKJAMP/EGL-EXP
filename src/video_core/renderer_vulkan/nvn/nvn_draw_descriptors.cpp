@@ -8,6 +8,9 @@
 #include <algorithm>
 #include <bit>
 #include <cstring>
+#include <mutex>
+#include <set>
+#include <tuple>
 #include <unordered_map>
 
 #include <fmt/format.h>
@@ -867,8 +870,8 @@ bool DrawContext::ViewKeyOf(const Texture& texture, const Storage& s, Shader::Te
         if (!own_format && texture.host.storage_view != VK_FORMAT_UNDEFINED) {
             key.format = texture.host.storage_view;
         }
-        if ((s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 || s.astc_gpu ||
-            (!own_format && texture.host.storage_view == VK_FORMAT_UNDEFINED)) {
+        if (((s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 && !s.can_upgrade_storage) ||
+            s.astc_gpu || (!own_format && texture.host.storage_view == VK_FORMAT_UNDEFINED)) {
             compatible = false;
         }
     }
@@ -914,6 +917,10 @@ std::shared_ptr<Texture> DrawContext::ScaledTextureFor(Texture& texture, bool gr
 
 bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool graphics) {
     plan.graphics = graphics;
+    if (graphics) {
+        compute_groups = {};
+        compute_thread_group = {};
+    }
     const VC::DescriptorLayout& layout = pipe.descriptors;
     static const bool read_only_depth_probe = [] {
         const char* value = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
@@ -928,11 +935,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         depth_attachment->host.format == VK_FORMAT_D32_SFLOAT &&
         depth_attachment->aspect == VK_IMAGE_ASPECT_DEPTH_BIT &&
         depth_attachment->samples == VK_SAMPLE_COUNT_1_BIT && depth_attachment->levels == 1 &&
-        depth_attachment->layers == 1 && !layout.uses_bindless_table &&
-        !layout.stores_raw_global_memory && !MakeDynamicFixedState(fixed).depth_write_enable &&
+        depth_attachment->layers == 1 && !layout.stores_raw_global_memory &&
+        !MakeDynamicFixedState(fixed).depth_write_enable &&
         std::ranges::none_of(layout.bindings, [](const VC::DescriptorBinding& binding) {
             return binding.is_written;
         });
+    if (pass_open && pass_read_only_depth && allow_read_only_depth) {
+        plan.read_only_depth = true;
+    }
     scratch_writes.clear();
     scratch_buffers.clear();
     scratch_images.clear();
@@ -1242,6 +1252,17 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             note(uniform ? DescReason::UniformUnresolved : DescReason::StorageUnresolved);
             return fallback();
         }
+        if (graphics && !write && !unsized) {
+            if (const BufferRef copy = TryCopyMirrorRangeToArena(
+                    *ref.pool, ref.pool_offset, binding.address, size, uniform ? 256 : 64);
+                copy.buffer) {
+                if (cs_mode != CostSplit::Mode::Count) [[unlikely]] {
+                    CostSplitNote(uniform ? CostSplit::Data::Uniform : CostSplit::Data::Storage,
+                                  ref, size, true);
+                }
+                return VkDescriptorBufferInfo{copy.buffer, copy.offset, size};
+            }
+        }
         // A written storage range of an imported pool lives in host memory: shader stores and
         // atomics would cross PCIe (15-19 ns per atomic measured). A small one is bound through a
         // device-local shadow for as long as nothing else uses the bytes (nvn_draw_shadow.cpp);
@@ -1522,7 +1543,8 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                             !twin && key.format == VK_FORMAT_D32_SFLOAT &&
                             wanted == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL) {
                             plan.read_only_depth = true;
-                            plan.UseImage(texture->storage, wanted, true);
+                            plan.UseImage(texture->storage, wanted, true, false, false, false,
+                                          key.format);
                         } else if (graphics && IsBoundTarget(&s)) {
                             // A render target of this very draw: the pass writes it, so sample a
                             // copy of it made before the pass (copy-on-read).
@@ -1602,8 +1624,11 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
                                 }
                             }
                         } else {
+                            const bool write_only_img =
+                                is_image && binding.is_written && !binding.is_read;
                             plan.UseImage(texture->storage, wanted, !is_image,
-                                          is_image && binding.is_written);
+                                          is_image && binding.is_written, write_only_img, is_image,
+                                          key.format);
                         }
                         if (bound) {
                             if (twin) {
@@ -1986,7 +2011,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
                                           *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
                                           region);
             }
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
             ++counters.placeholder_copies;
             continue;
         }
@@ -2003,7 +2028,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
             };
             host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
             if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
                 record->copied.Record(copy.source, this, render_target_epoch.value, {0, 1, 0, 1});
             }
@@ -2030,7 +2055,7 @@ void DrawContext::RecordFeedbackCopies(DrawPlan& plan) {
             host->HostCmd().CopyImage(*source.image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                                       *scratch.image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, region);
         }
-        host->HostMarkWritten();
+        host->HostMarkTransferWritten();
         if (DrawResources::Scratch* record = resources.FindScratch(scratch)) {
             record->copied.Record(copy.source, this, render_target_epoch.value,
                                   {copy.level, copy.levels, copy.layer, copy.layers});
@@ -2067,18 +2092,60 @@ void DrawContext::PruneFreshFeedback(DrawPlan& plan) {
 bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     bool need = false;
     BreakCause cause = BreakCause::FeedbackCopy;
-    // A counter report of the open pass is written when the pass ends. A draw that writes its
-    // bytes (or any pool through raw global memory) must come after it; a draw that reads them
-    // only once a game barrier ordered the report (pass_reports_ordered, see Op::Barrier): before
-    // that the read is not ordered after the report on the console either.
-    if (pass_open && host->HostReportsPending()) {
-        bool uses_report = plan.raw_global_writes || (pass_reports_ordered && plan.raw_global);
-        for (const DrawPlan::RangeUse& use : plan.ranges) {
-            uses_report = uses_report ||
-                          ((use.write || pass_reports_ordered) &&
-                           host->HostReportPending(*use.pool, use.offset, use.size));
+    if (!pass_open && pending_clears.Any()) {
+        const auto storage_range = [](const Storage& st, u64& serial, u64& lo, u64& hi) {
+            const Storage& base = st.scale_owner ? *st.scale_owner : st;
+            serial = base.pool_serial;
+            lo = base.pool_offset;
+            hi = base.pool_offset + base.layout.size;
+        };
+        const auto target_overlaps_plan = [&](const TargetBinding& target) {
+            if (!target.texture || !target.texture->storage) {
+                return false;
+            }
+            u64 t_serial = 0, t_lo = 0, t_hi = 0;
+            storage_range(*target.texture->storage, t_serial, t_lo, t_hi);
+            for (const DrawPlan::ImageUse& use : plan.images) {
+                if (!use.owner) {
+                    continue;
+                }
+                u64 u_serial = 0, u_lo = 0, u_hi = 0;
+                storage_range(*use.owner, u_serial, u_lo, u_hi);
+                if (u_serial == t_serial && u_lo < t_hi && t_lo < u_hi) {
+                    return true;
+                }
+            }
+            return false;
+        };
+        bool flush_clears = !plan.feedback.empty() || target_overlaps_plan(depth_target);
+        for (u32 i = 0; !flush_clears && i < color_target_count; ++i) {
+            flush_clears = target_overlaps_plan(color_targets[i]);
         }
-        if (uses_report) {
+        if (flush_clears) {
+            FlushPendingClears(BreakCause::FeedbackCopy);
+        }
+    }
+    // A pending counter report is written in batch order once needed outside a pass or by an
+    // ordered reader. A draw that writes its bytes (or any pool through raw global memory) must
+    // come after it; a draw inside an open pass that reads an in-pass report only once a game
+    // barrier ordered the report (HostOrderedReportsPending, see Op::Barrier).
+    bool resolve_reports = false;
+    if (host->HostReportsPending()) {
+        const bool ordered = !pass_open || host->HostOrderedReportsPending();
+        const bool ordered_only = pass_open;
+        resolve_reports = plan.raw_global_writes || (ordered && plan.raw_global);
+        for (const DrawPlan::RangeUse& use : plan.ranges) {
+            if (resolve_reports) {
+                break;
+            }
+            if (use.write) {
+                resolve_reports = host->HostReportPending(*use.pool, use.offset, use.size);
+            } else if (ordered) {
+                resolve_reports =
+                    host->HostReportPending(*use.pool, use.offset, use.size, ordered_only);
+            }
+        }
+        if (resolve_reports && pass_open) {
             cause = BreakCause::ReportRead;
             need = true;
         }
@@ -2087,18 +2154,50 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
     // its contents record commands" answered BEFORE the pass is begun or continued.
     for (DrawPlan::ImageUse& use : plan.images) {
         Storage& s = *use.owner;
-        use.needs_contents = host->HostNeedsCommands(s, false);
+        bool overwrite = false;
+        if (!plan.graphics && use.write_only && s.levels == 1 && s.layers == 1 &&
+            s.type == VK_IMAGE_TYPE_2D && !s.sparse && !host->HostIsCpuReadablePool(s)) {
+            const u64 gx = static_cast<u64>(compute_groups[0]) * compute_thread_group[0];
+            const u64 gy = static_cast<u64>(compute_groups[1]) * compute_thread_group[1];
+            const u64 gz = (std::max<u64>)(
+                static_cast<u64>(compute_groups[2]) * compute_thread_group[2], 1);
+            if (gx * gy * gz >= static_cast<u64>(s.extent.width) * s.extent.height) {
+                overwrite = true;
+            }
+        }
+        use.will_overwrite = overwrite;
+        use.needs_upgrade_storage =
+            use.is_storage_image && (s.usage & VK_IMAGE_USAGE_STORAGE_BIT) == 0 &&
+            s.can_upgrade_storage;
+        use.needs_upgrade_formats =
+            s.pending_unrestricted_formats || use.view_format_needs_unrestricted ||
+            (use.view_format != VK_FORMAT_UNDEFINED && !s.FormatListAllows(use.view_format));
+        if ((use.needs_upgrade_storage || use.needs_upgrade_formats) && !s.image) {
+            host->HostUpgradeImageCaps(s, use.needs_upgrade_storage, use.needs_upgrade_formats);
+            use.needs_upgrade_storage = false;
+            use.needs_upgrade_formats = false;
+        }
+        const bool layout_only_ready =
+            use.layout_only && s.image && s.contents_valid && !s.force_upload;
+        use.needs_contents =
+            layout_only_ready ? false : host->HostNeedsCommands(s, use.will_overwrite);
         use.skip = !s.image;
         if (!use.skip && s.current_layout != use.layout &&
             (s.current_layout == VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL ||
-             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL) &&
+             s.current_layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL ||
+             s.current_layout == VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL) &&
             (use.layout == VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL ||
              use.layout == VK_IMAGE_LAYOUT_DEPTH_STENCIL_READ_ONLY_OPTIMAL)) {
             NoteFlipTarget(use.owner, use.layout);
         }
-        if (!use.skip && (use.needs_contents || s.current_layout != use.layout)) {
+        if (!use.skip && (use.needs_contents || s.current_layout != use.layout ||
+                          use.needs_upgrade_storage || use.needs_upgrade_formats)) {
             if (!need) {
-                cause = use.needs_contents ? BreakCause::ContentsUpload : BreakCause::LayoutChange;
+                cause = (use.needs_contents && !use.needs_upgrade_storage &&
+                         !use.needs_upgrade_formats)
+                            ? BreakCause::ContentsUpload
+                            : BreakCause::LayoutChange;
                 if (pass_open && Debug::Get().op_log &&
                     Debug::FrameSelected(impl.presents_recorded + 1)) {
                     LOG_INFO(Render_Vulkan,
@@ -2159,6 +2258,9 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
         EndPass(cause);
     }
     if (!pass_open) {
+        if (resolve_reports) {
+            host->HostResolveCounterBatch();
+        }
         if (plan.flush_inline && !inline_updates.empty()) {
             FlushInlineUpdates();
         }
@@ -2170,9 +2272,20 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             }
             Storage& s = *use.owner;
             host->HostNoteTouched(use.owner);
-            if (use.needs_contents) {
-                host->HostEnsureContents(s, false);
+            if (use.needs_upgrade_storage || use.needs_upgrade_formats) {
+                if (!host->HostUpgradeImageCaps(s, use.needs_upgrade_storage,
+                                                use.needs_upgrade_formats)) {
+                    use.skip = true;
+                    continue;
+                }
             }
+            if (use.needs_contents || use.will_overwrite) {
+                const char* const caller = use.from_bindless_prime
+                                               ? "BindlessPrime"
+                                               : (plan.graphics ? "Draw" : "Compute");
+                host->HostEnsureContents(s, use.will_overwrite, caller);
+            }
+            bool need_transition = true;
             if (use.sample_only) {
                 // Sampled in GENERAL only where the image is (BuildDescriptors): when loading the
                 // contents moved it out, it is sampled read-only.
@@ -2180,18 +2293,28 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                     s.current_layout != VK_IMAGE_LAYOUT_GENERAL) {
                     use.layout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
                 }
-                if (s.current_layout == use.layout) {
-                    continue;
-                }
+                need_transition = s.current_layout != use.layout;
             }
-            transition_scratch.emplace_back(&s, use.layout);
+            if (need_transition) {
+                transition_scratch.emplace_back(&s, use.layout);
+            }
+            if (use.from_bindless_prime && (use.needs_contents || use.will_overwrite) &&
+                host->HostUploadEarlySubmitDue()) {
+                if (!transition_scratch.empty()) {
+                    host->HostTransitionMany(transition_scratch, false);
+                    transition_scratch.clear();
+                }
+                host->HostSubmitUploadPiece();
+            }
         }
         host->HostTransitionMany(transition_scratch, false);
+        mirror_upload_scratch.clear();
         for (const DrawPlan::RangeUse& use : plan.ranges) {
             if (use.pool->backing == Pool::Backing::Mirror) {
-                host->HostUploadRange(*use.pool, use.offset, use.size);
+                mirror_upload_scratch.push_back({use.pool, use.offset, use.size});
             }
         }
+        host->HostUploadRanges(mirror_upload_scratch);
         if (shadow.any) {
             ApplyShadows(plan, true);
         }
@@ -2205,7 +2328,7 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
                 };
                 host->HostCmd().CopyBuffer(copy.src, copy.dst, region);
             }
-            host->HostMarkWritten();
+            host->HostMarkTransferWritten();
         }
         // A dispatch orders after earlier dispatches only as NVN does (behind a game barrier);
         // the replay's own commands above flushed for themselves.
@@ -2231,6 +2354,20 @@ bool DrawContext::PrepareOutsidePass(DrawPlan& plan) {
             if (use.redirected) {
                 host->HostNoteShadowedWrite(*use.pool, use.offset, use.size);
             } else {
+                if (use.pool->backing == Pool::Backing::Mirror && use.size >= (u64{1} << 20)) {
+                    static std::mutex ssbo_diag_mutex;
+                    static std::set<std::tuple<u64, u64, u64>> ssbo_diag_seen;
+                    std::scoped_lock lock{ssbo_diag_mutex};
+                    if (ssbo_diag_seen.size() < 8 &&
+                        ssbo_diag_seen.emplace(use.pool->serial, use.offset, use.size).second) {
+                        LOG_INFO(Render_Vulkan,
+                                 "[nvn] large mirror ssbo write #{}: {} prog={:016x} "
+                                 "pool={:#x} off={:#x} sz={:#x} flags={:#x}",
+                                 ssbo_diag_seen.size(), plan.graphics ? "graphics" : "compute",
+                                 ProfStageHash(plan.graphics ? 1u : STAGE_COMPUTE),
+                                 use.pool->serial, use.offset, use.size, use.pool->flags);
+                    }
+                }
                 host->HostNotePoolWrite(*use.pool, use.offset, use.size);
             }
         }

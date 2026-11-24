@@ -112,13 +112,16 @@ struct CounterBatch {
         reports_end = (std::max)(reports_end, offset + sizeof(u64));
     }
     /// A report still to be written overlaps [offset, offset + size) of `pool`.
-    [[nodiscard]] bool Writes(const void* pool, u64 offset, u64 size) const noexcept {
+    [[nodiscard]] bool Writes(const void* pool, u64 offset, u64 size,
+                              size_t limit = ~size_t{0}) const noexcept {
         // Every draw of a pass with pending reports asks for each range it uses: most ranges are
         // nowhere near the reports (in any pool).
-        if (offset >= reports_end || offset + size <= reports_begin) {
+        if (limit == 0 || offset >= reports_end || offset + size <= reports_begin) {
             return false;
         }
-        for (const Report& report : reports) {
+        const size_t count = (std::min)(limit, reports.size());
+        for (size_t i = 0; i < count; ++i) {
+            const Report& report = reports[i];
             if (report.pool == pool && report.offset < offset + size &&
                 offset < report.offset + sizeof(u64)) {
                 return true;
@@ -348,7 +351,7 @@ public:
     /// (query: add, reset: zero, report: store), stores the accumulator back, and the report
     /// values are copied to their buffers. Every query of the batch has ended.
     void ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, CounterBatch& batch, u32 queue,
-                      u64 seq);
+                      u64 seq, bool trailing_barrier = true);
 
     /// Writes a GPU timestamp and registers `report` (its query field is filled in) for the
     /// completion thread.

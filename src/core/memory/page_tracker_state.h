@@ -86,6 +86,13 @@ public:
     /// Appends the merged [begin, end) page runs written since their last collect inside
     /// [page_begin, page_end) and makes them clean (armed) again.
     void CollectDirty(u64 id, u64 page_begin, u64 page_end, std::vector<std::pair<u64, u64>>& runs);
+    /// Appends the merged [begin, end) page runs currently marked dirty inside [page_begin, page_end)
+    /// without clearing them or re-arming any page.
+    void PeekDirty(u64 id, u64 page_begin, u64 page_end, std::vector<std::pair<u64, u64>>& runs) const;
+    /// Appends the merged [begin, end) page runs written inside [page_begin, page_end), clears their
+    /// dirty bits, and disarms those pages (no claim change on already-dirty pages).
+    void CollectDirtyAndDisarm(u64 id, u64 page_begin, u64 page_end,
+                               std::vector<std::pair<u64, u64>>& runs);
     [[nodiscard]] bool AnyDirty(u64 id, u64 page_begin, u64 page_end) const;
     /// The owner's write epoch: a counter that grows each time a page of the owner turns dirty (a
     /// guest write to an armed page, a remap of one). Read it without any lock; while it equals a

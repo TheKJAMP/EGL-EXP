@@ -60,7 +60,14 @@ public:
                                                      VkImage image,
                                                      std::span<const Level> levels) const;
 
+    /// Records a single level dispatch into `cmd` (outside a render pass) using an existing
+    /// GENERAL storage `view` (2D array, `VIEW_FORMAT`), avoiding per-upload image view creation.
+    void RecordWithView(vk::CommandBuffer cmd, VkBuffer input, u64 input_offset, u64 input_size,
+                        VkImageView view, const Level& level) const;
+
 private:
+    void DispatchLevel(vk::CommandBuffer cmd, VkBuffer input, u64 input_offset, u64 input_size,
+                       VkImageView view, const Level& level) const;
     const Device& device;
     vk::DescriptorSetLayout set_layout;
     vk::PipelineLayout pipeline_layout;

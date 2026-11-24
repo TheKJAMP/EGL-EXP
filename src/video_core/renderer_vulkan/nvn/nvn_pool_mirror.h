@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include <algorithm>
 #include <atomic>
 #include <memory>
 #include <span>
@@ -17,11 +18,20 @@ namespace Vulkan::Nvn {
 
 enum class MirrorWriteCoverage { None, Partial, Full };
 
+struct MirrorWriteCursor {
+    bool snapshot_ready{};
+    std::pair<u64, u64> full_range{};
+};
+
 /// Pending GPU writes own these mirror bytes until completion writes them back to the guest.
 [[nodiscard]] inline MirrorWriteCoverage ClassifyMirrorWrites(
-    u64 begin, u64 end, std::span<const std::pair<u64, u64>> pending) {
+    u64 begin, u64 end, std::span<const std::pair<u64, u64>> pending,
+    std::pair<u64, u64>& full_range) {
     if (begin >= end) {
         return MirrorWriteCoverage::None;
+    }
+    if (full_range.first <= begin && end <= full_range.second) {
+        return MirrorWriteCoverage::Full;
     }
     auto coverage = MirrorWriteCoverage::None;
     for (const auto& [lo, hi] : pending) {
@@ -29,11 +39,61 @@ enum class MirrorWriteCoverage { None, Partial, Full };
             continue;
         }
         if (lo <= begin && hi >= end) {
+            full_range = {lo, hi};
             return MirrorWriteCoverage::Full;
         }
         coverage = MirrorWriteCoverage::Partial;
     }
     return coverage;
+}
+
+/// Sorts non-empty half-open ranges `[begin, end)` and merges overlapping or adjacent spans.
+inline void MergePendingWrites(std::vector<std::pair<u64, u64>>& ranges) {
+    std::erase_if(ranges, [](const auto& range) { return range.first >= range.second; });
+    if (ranges.size() <= 1) {
+        return;
+    }
+    std::ranges::sort(ranges);
+    size_t out = 0;
+    for (size_t i = 1; i < ranges.size(); ++i) {
+        if (ranges[i].first <= ranges[out].second) {
+            ranges[out].second = (std::max)(ranges[out].second, ranges[i].second);
+        } else {
+            ranges[++out] = ranges[i];
+        }
+    }
+    ranges.resize(out + 1);
+}
+
+/// Subtracts sorted disjoint intervals `subtract` from sorted disjoint intervals `parts` in O(P + D).
+inline void SubtractSortedRanges(std::span<const std::pair<u64, u64>> parts,
+                                 std::span<const std::pair<u64, u64>> subtract,
+                                 std::vector<std::pair<u64, u64>>& out) {
+    out.clear();
+    size_t j = 0;
+    for (const auto& [part_begin, part_end] : parts) {
+        u64 cur = part_begin;
+        if (cur >= part_end) {
+            continue;
+        }
+        while (j < subtract.size() && subtract[j].second <= cur) {
+            ++j;
+        }
+        while (j < subtract.size() && subtract[j].first < part_end) {
+            if (subtract[j].first > cur) {
+                out.emplace_back(cur, subtract[j].first);
+            }
+            if (subtract[j].second >= part_end) {
+                cur = part_end;
+                break;
+            }
+            cur = (std::max)(cur, subtract[j].second);
+            ++j;
+        }
+        if (cur < part_end) {
+            out.emplace_back(cur, part_end);
+        }
+    }
 }
 
 /// Which 4 KiB pages of a pool mirror hold the pool's bytes (DESIGN.md "Pool mirrors"). A valid

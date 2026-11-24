@@ -314,9 +314,10 @@ uvec2 EncodeChannel(in float values[16]) {
     if (a0 == a1) {
         return uvec2(bits_lo, bits_hi);
     }
+    const float inv_range = 7.0 / float(a0 - a1);
+    const float f_a1 = float(a1);
     for (uint i = 0u; i < 16u; ++i) {
-        const float t = (values[i] * 255.0 - float(a1)) / float(a0 - a1);
-        const uint q = uint(clamp(round(t * 7.0), 0.0, 7.0));
+        const uint q = uint(clamp(round((values[i] * 255.0 - f_a1) * inv_range), 0.0, 7.0));
         const uint index = q == 7u ? 0u : (q == 0u ? 1u : 8u - q);
         const uint bit = 16u + 3u * i;
         if (bit < 32u) {

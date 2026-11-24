@@ -228,26 +228,41 @@ BcGpuEncoder::BcGpuEncoder(const Device& device_, bool bc7, std::span<const u32>
         .codeSize = static_cast<u32>(code.size_bytes()),
         .pCode = code.data(),
     });
-    pipeline = logical.CreateComputePipeline(
-        VkComputePipelineCreateInfo{
-            .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
-            .pNext = nullptr,
-            .flags = 0,
-            .stage{
-                .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+    auto make_pipeline = [&](u32 spec_refine) {
+        const VkSpecializationMapEntry spec_entry{
+            .constantID = 0,
+            .offset = 0,
+            .size = sizeof(u32),
+        };
+        const VkSpecializationInfo spec_info{
+            .mapEntryCount = 1,
+            .pMapEntries = &spec_entry,
+            .dataSize = sizeof(u32),
+            .pData = &spec_refine,
+        };
+        return logical.CreateComputePipeline(
+            VkComputePipelineCreateInfo{
+                .sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO,
                 .pNext = nullptr,
                 .flags = 0,
-                .stage = VK_SHADER_STAGE_COMPUTE_BIT,
-                .module = *module,
-                .pName = "main",
-                .pSpecializationInfo = nullptr,
+                .stage{
+                    .sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO,
+                    .pNext = nullptr,
+                    .flags = 0,
+                    .stage = VK_SHADER_STAGE_COMPUTE_BIT,
+                    .module = *module,
+                    .pName = "main",
+                    .pSpecializationInfo = &spec_info,
+                },
+                .layout = *pipeline_layout,
+                .basePipelineHandle = {},
+                .basePipelineIndex = 0,
             },
-            .layout = *pipeline_layout,
-            .basePipelineHandle = {},
-            .basePipelineIndex = 0,
-        },
-        // Compiled on a worker like the ASTC decoder: no shared, externally synchronized cache.
-        VK_NULL_HANDLE);
+            // Compiled on a worker like the ASTC decoder: no shared, externally synchronized cache.
+            VK_NULL_HANDLE);
+    };
+    pipeline = make_pipeline(0u);
+    pipeline_refined = make_pipeline(1u);
     if (!bc7) {
         return;
     }
@@ -449,7 +464,7 @@ void BcGpuEncoder::Record(vk::CommandBuffer cmd, VkImageView source, u32 width, 
         .mode = static_cast<u32>(blocks) | (refine ? MODE_REFINE : 0u),
         .out_offset = 0,
     };
-    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *(refine ? pipeline_refined : pipeline));
     cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
     cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
     cmd.Dispatch((constants.blocks_x + 7) / 8, (constants.blocks_y + 7) / 8, layers);

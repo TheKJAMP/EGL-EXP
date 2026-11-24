@@ -174,6 +174,7 @@ TEST_CASE("MKW adaptive present only shortens the two-vblank gameplay interval",
 }
 
 TEST_CASE("MKW early submit keeps bounded overlap through long passes and shadows", "[nvn][mkw]") {
+    using Vulkan::Nvn::CoalescedEarlySubmitDue;
     using Vulkan::Nvn::MkwEarlySubmitDue;
     CHECK_FALSE(MkwEarlySubmitDue(0, 299, 300, 4000, false, false));
     CHECK(MkwEarlySubmitDue(0, 300, 300, 4000, false, false));
@@ -186,6 +187,17 @@ TEST_CASE("MKW early submit keeps bounded overlap through long passes and shadow
     CHECK_FALSE(MkwEarlySubmitDue(0, 5000, 300, 0, true, true));
     CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, false, false));
     CHECK_FALSE(MkwEarlySubmitDue(2, 100000, 300, 4000, true, true));
+
+    // Non-MKW titles uncap piece count at natural boundaries while still coalescing open passes and
+    // live storage shadows up to early_pass_us.
+    CHECK_FALSE(CoalescedEarlySubmitDue(1499, 1500, 4000, false, false));
+    CHECK(CoalescedEarlySubmitDue(1500, 1500, 4000, false, false));
+    CHECK_FALSE(CoalescedEarlySubmitDue(3999, 1500, 4000, true, false));
+    CHECK(CoalescedEarlySubmitDue(4000, 1500, 4000, true, false));
+    CHECK_FALSE(CoalescedEarlySubmitDue(3999, 1500, 4000, false, true));
+    CHECK(CoalescedEarlySubmitDue(4000, 1500, 4000, false, true));
+    CHECK_FALSE(CoalescedEarlySubmitDue(100000, 1500, 0, true, false));
+    CHECK_FALSE(CoalescedEarlySubmitDue(100000, 1500, 0, false, true));
 }
 
 TEST_CASE("NVN present depth limit: EDEN_NX2_MAX_FRAMES_IN_FLIGHT parsing", "[nvn][present]") {

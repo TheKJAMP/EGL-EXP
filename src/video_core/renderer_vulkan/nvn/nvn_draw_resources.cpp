@@ -565,7 +565,8 @@ void DrawResources::ReleaseSampler(u64 serial, u64 after_seq) {
     impl.retired.push_back({after_seq, [variants]() mutable { variants->clear(); }});
 }
 
-VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
+VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key,
+                                   bool for_framebuffer) {
     // A stand-in changes BC format when a later upload classifies it differently (smart BC,
     // RefitStandin recreates its image as BC1/BC4/BC5/BC3). A ViewKey made before that (a clear's,
     // an attachment's, one memoised by a caller) still names the old format, and a view of another
@@ -597,6 +598,9 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
     }
     for (auto& [existing, view] : views.views) {
         if (existing == key_valid) {
+            if (for_framebuffer) {
+                views.used_in_framebuffer = true;
+            }
             return *view;
         }
     }
@@ -637,6 +641,9 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
             },
         });
         views.views.emplace_back(key_valid, std::move(view));
+        if (for_framebuffer) {
+            views.used_in_framebuffer = true;
+        }
         return *views.views.back().second;
     } catch (const vk::Exception& exception) {
         LOG_ERROR(Render_Vulkan,
@@ -650,14 +657,20 @@ VkImageView DrawResources::GetView(const Texture& texture, const ViewKey& key) {
 
 std::vector<vk::ImageView> DrawResources::TakeStorageViews(const Storage& storage) {
     std::vector<vk::ImageView> taken;
+    bool any_framebuffer = false;
     for (auto& [serial, views] : texture_views) {
         if (views.storage.get() != &storage) {
             continue;
         }
+        any_framebuffer |= (!views.views.empty() && views.used_in_framebuffer);
+        views.used_in_framebuffer = false;
         for (auto& [key, view] : views.views) {
             taken.push_back(std::move(view));
         }
         views.views.clear();
+    }
+    if (any_framebuffer) {
+        ++framebuffer_views_epoch;
     }
     return taken;
 }
@@ -667,9 +680,13 @@ std::shared_ptr<TextureViews> DrawResources::TakeViews(u64 serial) {
     if (it == texture_views.end()) {
         return nullptr;
     }
+    const bool was_framebuffer = it->second.used_in_framebuffer;
     auto result = std::make_shared<TextureViews>(std::move(it->second));
     texture_views.erase(it);
     ++views_epoch;
+    if (was_framebuffer) {
+        ++framebuffer_views_epoch;
+    }
     return result;
 }
 

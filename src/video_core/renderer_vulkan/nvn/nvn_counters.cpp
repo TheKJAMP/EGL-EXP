@@ -20,6 +20,17 @@ namespace {
 constexpr VkPipelineStageFlags ALL_STAGES = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT;
 constexpr VkAccessFlags ALL_ACCESS = VK_ACCESS_MEMORY_READ_BIT | VK_ACCESS_MEMORY_WRITE_BIT;
 
+void Barrier(vk::CommandBuffer cmd, VkPipelineStageFlags src_stage, VkPipelineStageFlags dst_stage,
+             VkAccessFlags src_access, VkAccessFlags dst_access) {
+    const VkMemoryBarrier barrier{
+        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
+        .pNext = nullptr,
+        .srcAccessMask = src_access,
+        .dstAccessMask = dst_access,
+    };
+    cmd.PipelineBarrier(src_stage, dst_stage, 0, barrier);
+}
+
 /// Bytes of the scratch buffer: accumulators, the condition/fold slot ring, the resolve areas.
 constexpr u32 RING_BASE = CounterEngine::MAX_QUEUES * CounterEngine::ACCUMULATOR_STRIDE;
 constexpr u32 AREA_BASE = RING_BASE + CounterEngine::SLOT_COUNT * CounterEngine::SLOT_SIZE;
@@ -246,13 +257,7 @@ u32 CounterEngine::AllocateArea(u64 seq, u32 bytes) {
 }
 
 void CounterEngine::Sync(vk::CommandBuffer cmd) const {
-    const VkMemoryBarrier barrier{
-        .sType = VK_STRUCTURE_TYPE_MEMORY_BARRIER,
-        .pNext = nullptr,
-        .srcAccessMask = ALL_ACCESS,
-        .dstAccessMask = ALL_ACCESS,
-    };
-    cmd.PipelineBarrier(ALL_STAGES, ALL_STAGES, 0, barrier);
+    Barrier(cmd, ALL_STAGES, ALL_STAGES, VK_ACCESS_MEMORY_WRITE_BIT, ALL_ACCESS);
 }
 
 void CounterEngine::Dispatch(vk::CommandBuffer cmd, u32 base_word, u32 mode,
@@ -277,7 +282,8 @@ void CounterEngine::RecordConditions(vk::CommandBuffer cmd,
         return;
     }
     ASSERT(conditions.size() <= MAX_CONDITION_BATCH);
-    Sync(cmd);
+    Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     // Both counters of every pair next to each other in its slot; one copy per source buffer.
     condition_copies.clear();
     for (size_t i = 0; i < conditions.size(); ++i) {
@@ -300,7 +306,9 @@ void CounterEngine::RecordConditions(vk::CommandBuffer cmd,
         cmd.CopyBuffer(source, *scratch,
                        vk::Span<VkBufferCopy>(condition_regions.data(), condition_regions.size()));
     }
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     ResolveConstants constants{};
     constants.base = first_slot / 4;
     constants.mode = MODE_CONDITIONS;
@@ -315,7 +323,9 @@ void CounterEngine::RecordConditions(vk::CommandBuffer cmd,
                            {});
     cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
     cmd.Dispatch(1, 1, 1);
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT, VK_ACCESS_SHADER_WRITE_BIT,
+            VK_ACCESS_CONDITIONAL_RENDERING_READ_BIT_EXT);
     stats.conditions_gpu.fetch_add(conditions.size(), std::memory_order_relaxed);
 }
 
@@ -406,33 +416,41 @@ void CounterEngine::FoldOcclusion(vk::CommandBuffer cmd, CounterFlight& flight, 
     const VkQueryPool pool = *flight.blocks[query.block].occlusion;
     cmd.EndQuery(pool, query.slot);
     const u32 slot_offset = AllocateSlot(seq);
-    Sync(cmd);
+    Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
     cmd.CopyQueryPoolResults(pool, query.slot, 1, *scratch, slot_offset + SLOT_QUERY_RESULT,
                              sizeof(u64), VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT,
+            VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     Dispatch(cmd, slot_offset / 4, MODE_FOLD, (queue % MAX_QUEUES) * ACCUMULATOR_STRIDE / 4);
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_TRANSFER_BIT, ALL_STAGES,
+            VK_ACCESS_SHADER_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT, ALL_ACCESS);
     stats.occlusion_folds.fetch_add(1, std::memory_order_relaxed);
 }
 
 void CounterEngine::ResetAccumulator(vk::CommandBuffer cmd, u32 queue) {
-    Sync(cmd);
+    Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_WRITE_BIT);
     cmd.FillBuffer(*scratch, (queue % MAX_QUEUES) * ACCUMULATOR_STRIDE, ACCUMULATOR_STRIDE, 0);
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, ALL_STAGES, VK_ACCESS_TRANSFER_WRITE_BIT,
+            ALL_ACCESS);
 }
 
 void CounterEngine::CopyAccumulator(vk::CommandBuffer cmd, u32 queue, VkBuffer dst,
                                     u64 dst_offset) {
-    Sync(cmd);
+    Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+            VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
     const VkBufferCopy region{.srcOffset = (queue % MAX_QUEUES) * ACCUMULATOR_STRIDE,
                               .dstOffset = dst_offset,
                               .size = sizeof(u64)};
     cmd.CopyBuffer(*scratch, dst, region);
-    Sync(cmd);
+    Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, ALL_STAGES, VK_ACCESS_TRANSFER_WRITE_BIT,
+            ALL_ACCESS);
 }
 
 void CounterEngine::ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, CounterBatch& batch,
-                                 u32 queue, u64 seq) {
+                                 u32 queue, u64 seq, bool trailing_barrier) {
     if (batch.Empty()) {
         return;
     }
@@ -443,22 +461,32 @@ void CounterEngine::ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, C
     const u32 report_bytes = static_cast<u32>(batch.reports.size() * sizeof(u64));
     const u32 area = AllocateArea(seq, query_bytes + report_bytes);
     const u32 reports_area = area + query_bytes;
-    Sync(cmd);
     // The query results in batch order; consecutive slots of one pool go in one copy.
     const size_t query_count = batch.queries.size();
-    for (size_t i = 0; i < query_count;) {
-        const QueryRef first = batch.queries[i];
-        u32 run = 1;
-        while (i + run < query_count && batch.queries[i + run].block == first.block &&
-               batch.queries[i + run].slot == first.slot + run) {
-            ++run;
+    if (query_count != 0) {
+        Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT);
+        for (size_t i = 0; i < query_count;) {
+            const QueryRef first = batch.queries[i];
+            u32 run = 1;
+            while (i + run < query_count && batch.queries[i + run].block == first.block &&
+                   batch.queries[i + run].slot == first.slot + run) {
+                ++run;
+            }
+            cmd.CopyQueryPoolResults(*flight.blocks[first.block].occlusion, first.slot, run,
+                                     *scratch, area + i * sizeof(u64), sizeof(u64),
+                                     VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+            i += run;
         }
-        cmd.CopyQueryPoolResults(*flight.blocks[first.block].occlusion, first.slot, run, *scratch,
-                                 area + i * sizeof(u64), sizeof(u64),
-                                 VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
-        i += run;
+        Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
+    } else {
+        Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT,
+                VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
     }
-    Sync(cmd);
     // One dispatch per RESOLVE_CHUNK_EVENTS events; each starts from the accumulator the one
     // before stored (the barrier between them orders that).
     ResolveConstants constants{};
@@ -483,51 +511,69 @@ void CounterEngine::ResolveBatch(vk::CommandBuffer cmd, CounterFlight& flight, C
             reports_before += event == CounterBatch::Event::Report ? 1 : 0;
         }
         if (first != 0) {
-            Sync(cmd);
+            Barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                    VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT);
         }
         cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
         cmd.Dispatch(1, 1, 1);
     }
-    Sync(cmd);
-    // The report values, in guest order. Reports to one buffer share a copy until one overlaps an
-    // earlier region written since the last barrier, of any buffer copied so far (the later
-    // report must win: copied after a barrier).
-    report_regions.clear();
-    region_offsets.clear();
-    VkBuffer region_buffer = VK_NULL_HANDLE;
-    const auto flush = [&] {
-        if (!report_regions.empty()) {
-            cmd.CopyBuffer(*scratch, region_buffer,
-                           vk::Span<VkBufferCopy>(report_regions.data(), report_regions.size()));
-            report_regions.clear();
+    if (!batch.reports.empty()) {
+        if (query_count != 0) {
+            Barrier(cmd, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                    VK_ACCESS_SHADER_WRITE_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
+        } else {
+            Barrier(cmd, ALL_STAGES, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_MEMORY_WRITE_BIT,
+                    VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_TRANSFER_WRITE_BIT);
         }
-    };
-    // A collision of two buffers' keys only costs an extra barrier.
-    const auto region_key = [](VkBuffer buffer, u64 offset) {
-        return static_cast<u64>(std::hash<VkBuffer>{}(buffer)) * 0x9E3779B97F4A7C15ULL + offset;
-    };
-    for (size_t r = 0; r < batch.reports.size(); ++r) {
-        const CounterBatch::Report& report = batch.reports[r];
-        // Report offsets are 4-byte aligned (ReportCounter): two 8-byte values overlap when
-        // their offsets are at most 4 apart.
-        const u64 key = region_key(report.buffer, report.offset);
-        const bool overlaps = region_offsets.contains(key) || region_offsets.contains(key + 4) ||
-                              (report.offset >= 4 && region_offsets.contains(key - 4));
-        if (report.buffer != region_buffer || overlaps) {
-            flush();
-            if (overlaps) {
-                Sync(cmd);
-                region_offsets.clear();
+        // The report values, in guest order. Reports to one buffer share a copy until one overlaps
+        // an earlier region written since the last barrier, of any buffer copied so far (the later
+        // report must win: copied after a barrier).
+        report_regions.clear();
+        region_offsets.clear();
+        VkBuffer region_buffer = VK_NULL_HANDLE;
+        const auto flush = [&] {
+            if (!report_regions.empty()) {
+                cmd.CopyBuffer(
+                    *scratch, region_buffer,
+                    vk::Span<VkBufferCopy>(report_regions.data(), report_regions.size()));
+                report_regions.clear();
             }
-            region_buffer = report.buffer;
+        };
+        // A collision of two buffers' keys only costs an extra barrier.
+        const auto region_key = [](VkBuffer buffer, u64 offset) {
+            return static_cast<u64>(std::hash<VkBuffer>{}(buffer)) * 0x9E3779B97F4A7C15ULL +
+                   offset;
+        };
+        for (size_t r = 0; r < batch.reports.size(); ++r) {
+            const CounterBatch::Report& report = batch.reports[r];
+            // Report offsets are 4-byte aligned (ReportCounter): two 8-byte values overlap when
+            // their offsets are at most 4 apart.
+            const u64 key = region_key(report.buffer, report.offset);
+            const bool overlaps = region_offsets.contains(key) ||
+                                  region_offsets.contains(key + 4) ||
+                                  (report.offset >= 4 && region_offsets.contains(key - 4));
+            if (report.buffer != region_buffer || overlaps) {
+                flush();
+                if (overlaps) {
+                    Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                            VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+                    region_offsets.clear();
+                }
+                region_buffer = report.buffer;
+            }
+            report_regions.push_back(VkBufferCopy{.srcOffset = reports_area + r * sizeof(u64),
+                                                  .dstOffset = report.offset,
+                                                  .size = sizeof(u64)});
+            region_offsets.insert(key);
         }
-        report_regions.push_back(VkBufferCopy{.srcOffset = reports_area + r * sizeof(u64),
-                                              .dstOffset = report.offset,
-                                              .size = sizeof(u64)});
-        region_offsets.insert(key);
+        flush();
     }
-    flush();
-    Sync(cmd);
+    if (trailing_barrier) {
+        Barrier(cmd, VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                ALL_STAGES, VK_ACCESS_TRANSFER_WRITE_BIT | VK_ACCESS_SHADER_WRITE_BIT, ALL_ACCESS);
+    }
     batch.Clear();
     stats.occlusion_folds.fetch_add(1, std::memory_order_relaxed);
 }

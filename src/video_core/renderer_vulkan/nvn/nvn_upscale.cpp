@@ -68,6 +68,23 @@ void LogNetworkReplacement(const char* stage, const VideoCore::Upscaler::Rect& i
     }
 }
 
+void LogMovieReplacement(const char* stage, const VideoCore::Upscaler::Rect& input,
+                         const VideoCore::Upscaler::Rect& output, VkFormat in_fmt,
+                         VkFormat out_fmt) {
+    static Common::BootCounter boot;
+    static std::set<std::string> logged;
+    if (boot.First()) {
+        logged.clear();
+    }
+    std::string line = fmt::format(
+        "movie upscale network replaced by {} (input {}x{} fmt {} -> {}x{} fmt {})", stage,
+        input.width, input.height, static_cast<u32>(in_fmt), output.width, output.height,
+        static_cast<u32>(out_fmt));
+    if (logged.insert(line).second) {
+        LOG_INFO(Render_Vulkan, "[nvn] {}", line);
+    }
+}
+
 [[nodiscard]] u32 LevelSize(u32 size, u32 level) {
     return (std::max)(size >> level, 1u);
 }
@@ -125,6 +142,10 @@ bool DrawContext::EvaluateDlss(const UpscaleJob& job, bool dlaa,
             .base_layer = image.layer,
             .layers = 1,
         };
+        if (!image.texture->storage->FormatListAllows(key.format) ||
+            image.texture->storage->pending_unrestricted_formats) {
+            host->HostUpgradeImageCaps(*image.texture->storage, false, true);
+        }
         out.view = resources.GetView(*image.texture, key);
         if (!out.view) {
             return out;
@@ -325,6 +346,12 @@ bool DrawContext::UpscaleWithoutDlss(const UpscaleJob& job, bool use_fsr) {
                                                 job.input.layer, 1};
     const VkImageSubresourceLayers output_layers{VK_IMAGE_ASPECT_COLOR_BIT, job.output.level,
                                                  job.output.layer, 1};
+    // BlitImage reads the raw image format without a VkImageView; format reinterpretation
+    // (such as UNORM -> sRGB on movie frames) must go through FSR1's sampled view.
+    if (!use_fsr && job.input.format != VK_FORMAT_UNDEFINED &&
+        job.input.format != input.storage->host.format) {
+        use_fsr = true;
+    }
     if (use_fsr) {
         const VkExtent2D extent{output_rect.width, output_rect.height};
         if (!impl.upscaler_fsr || !impl.upscaler_fsr_extent ||
@@ -344,6 +371,10 @@ bool DrawContext::UpscaleWithoutDlss(const UpscaleJob& job, bool use_fsr) {
             .base_layer = job.input.layer,
             .layers = 1,
         };
+        if (!input.storage->FormatListAllows(key.format) ||
+            input.storage->pending_unrestricted_formats) {
+            host->HostUpgradeImageCaps(*input.storage, false, true);
+        }
         const VkImageView input_view = resources.GetView(input, key);
         if (!input_view) {
             return false;
@@ -380,6 +411,9 @@ bool DrawContext::UpscaleWithoutDlss(const UpscaleJob& job, bool use_fsr) {
         host->HostTransition(*input.storage, VK_IMAGE_LAYOUT_GENERAL);
         host->HostTransition(*output.storage, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
         host->HostFlushBarrier();
+        const bool same_extent =
+            input_rect.width == output_rect.width && input_rect.height == output_rect.height;
+        const VkFilter filter = same_extent ? VK_FILTER_NEAREST : VK_FILTER_LINEAR;
         const VkImageBlit region{
             .srcSubresource = input_layers,
             .srcOffsets = {{static_cast<s32>(input_rect.x), static_cast<s32>(input_rect.y), 0},
@@ -392,7 +426,7 @@ bool DrawContext::UpscaleWithoutDlss(const UpscaleJob& job, bool use_fsr) {
         };
         host->HostCmd().BlitImage(*input.storage->image, VK_IMAGE_LAYOUT_GENERAL,
                                   *output.storage->image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                                  region, VK_FILTER_LINEAR);
+                                  region, filter);
     }
     host->HostTransition(*output.storage, VK_IMAGE_LAYOUT_GENERAL);
     host->HostNoteTouched(job.output.texture->storage);
@@ -462,10 +496,15 @@ bool DrawContext::RunUpscale(const UpscaleJob& job, const char*& stage) {
             return true;
         }
     }
-    const bool use_fsr = backend == VideoCore::Upscaler::Backend::Fsr || dlss_requested;
+    const bool reinterprets_input =
+        job.input.format != VK_FORMAT_UNDEFINED &&
+        job.input.format != job.input.texture->storage->host.format;
+    const bool use_fsr =
+        reinterprets_input ||
+        (!same_extent && (backend == VideoCore::Upscaler::Backend::Fsr || dlss_requested));
     stage = dlaa_input_too_large ? "FSR1 (DLAA requested, input larger than output)"
-            : use_fsr         ? (dlss_requested ? "FSR1 (DLSS unavailable)" : "FSR1")
-                              : "bilinear";
+            : use_fsr            ? (dlss_requested ? "FSR1 (DLSS unavailable)" : "FSR1")
+                                 : (same_extent ? "copy (1:1)" : "bilinear");
     if (UpscaleWithoutDlss(job, use_fsr)) {
         return true;
     }
@@ -724,6 +763,49 @@ bool DrawContext::UpscaleNetwork(const VideoCore::Upscaler::Rect& input_rect,
     }
     NoteUpscale(impl, job, stage);
     LogNetworkReplacement(stage, job.input_rect, job.output_rect, basis);
+    return true;
+}
+
+bool DrawContext::UpscaleMovieNetwork(Texture& input, Texture& output) {
+    if (!input.storage || !output.storage) {
+        return false;
+    }
+    const bool covers_output = output.storage->levels == 1 && output.storage->layers == 1 &&
+                               output.desc.width == output.storage->extent.width &&
+                               output.desc.height == output.storage->extent.height;
+    if (!host->HostEnsureContents(*input.storage, false) ||
+        !host->HostEnsureContents(*output.storage, covers_output)) {
+        return false;
+    }
+    const u64 seq = host->HostFlight().seq;
+    impl.NoteUse(input.serial, seq);
+    impl.NoteUse(output.serial, seq);
+
+    UpscaleJob job;
+    job.input.texture = &input;
+    job.output.texture = &output;
+    job.input_rect = {0, 0, input.desc.width, input.desc.height};
+    job.output_rect = {0, 0, output.desc.width, output.desc.height};
+    job.input.x = 0;
+    job.input.y = 0;
+    job.output.x = 0;
+    job.output.y = 0;
+    job.host_inputs = true;
+    // The decoded movie frames carry sRGB bytes in an A8B8G8R8_UNORM texture while the upscale
+    // target's storage is A8B8G8R8_SRGB. Reinterpreting the input view as sRGB lets FSR1 decode
+    // to linear before filtering and lets BlitImage re-encode to sRGB accurately.
+    if (input.storage->host.format == VK_FORMAT_A8B8G8R8_UNORM_PACK32 &&
+        output.storage->host.format == VK_FORMAT_A8B8G8R8_SRGB_PACK32) {
+        job.input.format = VK_FORMAT_A8B8G8R8_SRGB_PACK32;
+    }
+    const char* stage = nullptr;
+    if (!RunUpscale(job, stage)) {
+        return false;
+    }
+    host->HostMarkWritten();
+    NoteUpscale(impl, job, stage);
+    LogMovieReplacement(stage, job.input_rect, job.output_rect,
+                        ViewFormat(input, job.input.format), output.storage->host.format);
     return true;
 }
 

@@ -98,6 +98,7 @@ struct UniformSnapshotCpuPages {
     std::unordered_map<u64, UniformSnapshotPageState> written;
     /// Presents so far (QueuePresentTexture).
     u64 presents{};
+    u64 last_rearm_presents{};
 };
 
 /// Reusable scratch of the capture (the submit thread's; the recorder keeps one).
@@ -123,6 +124,12 @@ inline constexpr u64 UNIFORM_SNAPSHOT_MERGE_GAP = 256;
 inline constexpr u64 UNIFORM_SNAPSHOT_MERGE_LIMIT = 64 * 1024;
 /// The largest uniform binding the replay binds (the rest of a longer one is not read).
 inline constexpr u64 UNIFORM_SNAPSHOT_MAX_BINDING = 64 * 1024;
+
+/// Collects dirty pages for all tracked uniform pools, stamping them with `stamp_presents`
+/// (the frame that just ended = old presents + 1), and re-arms them once per frame.
+void RearmUniformSnapshotPools(UniformSnapshotPools& pools, UniformSnapshotCpuPages& cpu,
+                               GuestMemory& memory, std::vector<std::pair<u64, u64>>& runs,
+                               u64 stamp_presents);
 
 /// Copies the uniform ranges `lists` bind (BindUniformBuffers records with their deferred arrays
 /// already resolved) that lie in `pools`, whose pages the CPU wrote recently and the GPU never.

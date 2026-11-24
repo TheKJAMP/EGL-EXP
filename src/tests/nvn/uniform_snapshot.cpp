@@ -150,8 +150,8 @@ public:
         }
         std::memcpy(bytes.data() + (va - BASE), src, size);
         for (u64 page = va >> 12; page <= (va + size - 1) >> 12; ++page) {
-            if (armed.contains(page)) {
-                dirty.insert(page);
+            if (armed.contains(page) && dirty.insert(page).second) {
+                write_epoch->fetch_add(1, std::memory_order_release);
             }
         }
         return true;
@@ -163,23 +163,48 @@ public:
         return 1;
     }
     void Arm(u64, u64 va, u64 size) override {
+        ++arm_calls;
         for (u64 page = va >> 12; page < (va + size) >> 12; ++page) {
             armed.insert(page);
-            dirty.erase(page);
+            if (dirty.erase(page) != 0 && write_epoch) {
+                // Arming starts clean without bumping epoch.
+            }
         }
     }
     void TakeWritten(u64, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
+        ++take_calls;
         for (u64 page = va >> 12; page < (va + size) >> 12; ++page) {
             if (dirty.erase(page) != 0) {
                 runs.emplace_back(page << 12, (page + 1) << 12);
             }
         }
     }
+    void PeekWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
+        if (!use_peek_and_epoch) {
+            TakeWritten(id, va, size, runs);
+            return;
+        }
+        ++peek_calls;
+        for (u64 page = va >> 12; page < (va + size) >> 12; ++page) {
+            if (dirty.contains(page)) {
+                runs.emplace_back(page << 12, (page + 1) << 12);
+            }
+        }
+    }
+    std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64) override {
+        return use_peek_and_epoch ? write_epoch : nullptr;
+    }
 
     void Fill(u64 va, size_t size, u8 value) {
         const std::vector<u8> data(size, value);
         REQUIRE(Write(va, data.data(), size));
     }
+
+    bool use_peek_and_epoch{};
+    size_t arm_calls{};
+    size_t take_calls{};
+    size_t peek_calls{};
+    std::shared_ptr<std::atomic<u64>> write_epoch{std::make_shared<std::atomic<u64>>(0)};
 
 private:
     std::vector<u8> bytes;
@@ -250,4 +275,63 @@ TEST_CASE("nvn uniform snapshot: only pages the CPU wrote lately and the GPU nev
         shared.Forget(B, B + 0x100000);
         CHECK(shared.Runs() == 0);
     }
+}
+
+TEST_CASE("nvn uniform snapshot: PeekWritten avoids intra-frame re-arm and rearms once per present",
+          "[nvn]") {
+    constexpr u64 B = TrackingMemory::BASE;
+    TrackingMemory memory;
+    memory.use_peek_and_epoch = true;
+    UniformSnapshotPools pools{{B, UniformSnapshotPool{B + 0x100000}}};
+    UniformSnapshotCpuPages cpu;
+    UniformSnapshotShared shared;
+    shared.Reset(UniformSnapshotMode::Strict);
+    UniformSnapshotScratch scratch;
+    UniformSnapshotTotals totals;
+    const auto lists = BindList({{B + 0x1000, 0x100}, {B + 0x5000, 0x100}});
+    const auto capture = [&] {
+        return CaptureUniformSnapshot(lists, pools, cpu, shared, memory, 0, scratch, totals);
+    };
+
+    // First capture arms seen pages; no TakeWritten or PeekWritten yet (epoch unchanged).
+    CHECK(capture() == nullptr);
+    CHECK(memory.take_calls == 0);
+    CHECK(memory.peek_calls == 0);
+
+    // CPU writes B + 0x1000 and captures repeatedly in the same frame: zero TakeWritten re-arms,
+    // and once stamped in this frame no more PeekWritten calls either.
+    memory.Fill(B + 0x1000, 0x100, 0x42);
+    auto snap1 = capture();
+    REQUIRE(snap1 != nullptr);
+    CHECK(memory.take_calls == 0);
+    // B+0x1000 and B+0x5000 are two disjoint page runs, so the first capture peeks both (2 calls).
+    const size_t peeks_after_first = memory.peek_calls;
+    CHECK(peeks_after_first == 2);
+
+    memory.Fill(B + 0x1000, 0x100, 0x43);
+    auto snap2 = capture();
+    REQUIRE(snap2 != nullptr);
+    CHECK(snap2->bytes[0] == 0x43);
+    CHECK(memory.take_calls == 0);
+    // B+0x1000 is already stamped for this frame, so peek runs for B+0x5000 only (+1 = 3).
+    CHECK(memory.peek_calls == 3);
+
+    // Write B+0x5000 too: after both pages are stamped for this frame, further captures skip Peek.
+    memory.Fill(B + 0x5000, 0x100, 0x77);
+    REQUIRE(capture() != nullptr);
+    const size_t peeks_both_stamped = memory.peek_calls;
+    REQUIRE(capture() != nullptr);
+    CHECK(memory.peek_calls == peeks_both_stamped);
+    CHECK(memory.take_calls == 0);
+
+    // Simulated present rearms once and preserves 2-frame recency.
+    RearmUniformSnapshotPools(pools, cpu, memory, scratch.runs, cpu.presents + 1);
+    ++cpu.presents;
+    cpu.last_rearm_presents = cpu.presents;
+    CHECK(memory.take_calls == 1);
+    CHECK(capture() != nullptr);
+    RearmUniformSnapshotPools(pools, cpu, memory, scratch.runs, cpu.presents + 1);
+    ++cpu.presents;
+    cpu.last_rearm_presents = cpu.presents;
+    CHECK(capture() == nullptr);
 }

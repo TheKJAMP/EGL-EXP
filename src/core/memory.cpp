@@ -1500,21 +1500,45 @@ void PageTracker::Arm(u64 id, u64 va, u64 size) {
     impl.page_tracker_state.Arm(id, va >> YUZU_PAGEBITS, ((va + size - 1) >> YUZU_PAGEBITS) + 1);
 }
 
-void PageTracker::CollectDirty(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+namespace {
+
+template <typename Fn>
+void CollectPageRuns(u64 va, u64 size, std::mutex& mutex,
+                     std::vector<std::pair<u64, u64>>& runs, Fn&& fn) {
     if (size == 0) {
         return;
     }
     va &= 0xffffffffffffULL;
     const size_t first = runs.size();
     {
-        std::scoped_lock lk{impl.read_trap_mutex};
-        impl.page_tracker_state.CollectDirty(id, va >> YUZU_PAGEBITS,
-                                             ((va + size - 1) >> YUZU_PAGEBITS) + 1, runs);
+        std::scoped_lock lk{mutex};
+        fn(va >> YUZU_PAGEBITS, ((va + size - 1) >> YUZU_PAGEBITS) + 1);
     }
     for (size_t i = first; i < runs.size(); ++i) {
         runs[i].first <<= YUZU_PAGEBITS;
         runs[i].second <<= YUZU_PAGEBITS;
     }
+}
+
+} // Anonymous namespace
+
+void PageTracker::CollectDirty(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+    CollectPageRuns(va, size, impl.read_trap_mutex, runs, [&](u64 begin, u64 end) {
+        impl.page_tracker_state.CollectDirty(id, begin, end, runs);
+    });
+}
+
+void PageTracker::PeekDirty(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+    CollectPageRuns(va, size, impl.read_trap_mutex, runs, [&](u64 begin, u64 end) {
+        impl.page_tracker_state.PeekDirty(id, begin, end, runs);
+    });
+}
+
+void PageTracker::CollectDirtyAndDisarm(u64 id, u64 va, u64 size,
+                                        std::vector<std::pair<u64, u64>>& runs) {
+    CollectPageRuns(va, size, impl.read_trap_mutex, runs, [&](u64 begin, u64 end) {
+        impl.page_tracker_state.CollectDirtyAndDisarm(id, begin, end, runs);
+    });
 }
 
 bool PageTracker::AnyDirty(u64 id, u64 va, u64 size) {

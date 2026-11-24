@@ -124,15 +124,17 @@ void DrawContext::OrderIndirectArguments(const BufferRef& args, u64 args_size,
         EndPass(BreakCause::PassBufferWrites);
         host->HostMarkWritten();
     }
-    // Arguments, counts or indices a counter report of the open pass writes (when the pass ends).
+    // Arguments, counts or indices a pending counter report writes.
     const auto reported = [&](const BufferRef& ref, u64 size) {
         return ref.pool != nullptr && host->HostReportPending(*ref.pool, ref.pool_offset, size);
     };
-    if (pass_open && host->HostReportsPending() &&
+    if (host->HostReportsPending() &&
         (reported(args, args_size) || (has_count && reported(count, COUNT_SIZE)) ||
          (index != nullptr && reported(*index, index->range)))) {
-        EndPass(BreakCause::ReportRead);
-        host->HostMarkWritten();
+        if (pass_open) {
+            EndPass(BreakCause::ReportRead);
+        }
+        host->HostResolveCounterBatch();
     }
 }
 

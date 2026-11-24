@@ -172,10 +172,6 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                static_cast<u32>(Settings::values.anti_aliasing.GetValue()));
         });
     }
-    if (replacement_wanted) {
-        // The compute chain behind a game's upscaling network: kept only while one may be replaced.
-        NoteComputeChain();
-    }
     static const bool dlss_trace = std::getenv("EDEN_NX2_DLSS_TRACE") != nullptr;
     if (dlss_trace) {
         static Common::BootCounter boot;
@@ -210,10 +206,148 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                      output ? static_cast<u32>(output->host.format) : 0);
         }
     }
+    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
+    const bool uses_tensor = ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
+                                                          control->inst_bytes);
+    static const bool movie_network_replace = [] {
+        const char* value = std::getenv("EDEN_NX2_UPSCALE_REPLACE");
+        return value == nullptr || std::string_view{value} != "0";
+    }();
+    const auto is_movie_colour = [](const std::shared_ptr<Texture>& tex) {
+        return tex && tex->storage &&
+               (tex->storage->aspect & VK_IMAGE_ASPECT_COLOR_BIT) != 0 && !tex->host.depth &&
+               !VideoCore::Surface::IsPixelFormatInteger(tex->host.pixel_format) &&
+               tex->storage->type == VK_IMAGE_TYPE_2D &&
+               tex->storage->samples == VK_SAMPLE_COUNT_1_BIT;
+    };
+    if (movie_network_skip > 0) {
+        if (!movie_network_input) {
+            movie_network_skip = 0;
+        } else {
+            std::shared_ptr<Texture> output;
+            if (control->compute.image_count > 0) {
+                const u64 in_w = movie_network_input->desc.width;
+                const u64 in_h = movie_network_input->desc.height;
+                const size_t img_limit =
+                    (std::min<size_t>)(control->compute.image_count, bound.image.size());
+                for (size_t i = 0; i < img_limit; ++i) {
+                    const u64 handle = bound.image[i];
+                    if (handle == 0) {
+                        continue;
+                    }
+                    auto cand =
+                        TextureOfId(VideoCommon::Nvn::TextureIdOf(static_cast<u32>(handle)));
+                    if (!is_movie_colour(cand) || cand->serial == movie_network_input->serial) {
+                        continue;
+                    }
+                    const u64 out_w = cand->desc.width;
+                    const u64 out_h = cand->desc.height;
+                    const u64 cross_a = out_w * in_h;
+                    const u64 cross_b = out_h * in_w;
+                    if (out_w > in_w && out_h > in_h && out_w <= in_w * 4 &&
+                        (cross_a > cross_b ? cross_a - cross_b : cross_b - cross_a) * 32 <=
+                            cross_a) {
+                        output = std::move(cand);
+                        break;
+                    }
+                }
+            }
+            if (output) {
+                auto input_tex = std::move(movie_network_input);
+                movie_network_skip = 0;
+                if (UpscaleMovieNetwork(*input_tex, *output)) {
+                    host->HostCmd().ForgetComputePipeline();
+                    skipped();
+                    return;
+                }
+            } else if (!uses_tensor) {
+                movie_network_input.reset();
+                movie_network_skip = 0;
+            } else {
+                --movie_network_skip;
+                if (movie_network_skip == 0) {
+                    movie_network_input.reset();
+                }
+                skipped();
+                return;
+            }
+        }
+    } else if (movie_network_replace && replacement_wanted && uses_tensor &&
+               control->thread_group == std::array<u32, 3>{32, 1, 1} &&
+               control->compute.image_count == 0) {
+        const size_t tex_limit =
+            (std::min<size_t>)(control->compute.texture_count, bound.combined.size());
+        const auto recently_compute_written = [&](const Texture& tex) {
+            const u64 serial =
+                VideoCore::Upscaler::NetworkTextureSerial(tex.serial, tex.desc.view_of);
+            const u32 chain_size = static_cast<u32>(impl.compute_chain.size());
+            const u32 check_count = (std::min<u32>)(impl.compute_chain_count, 4u);
+            for (u32 i = 0; i < check_count; ++i) {
+                const auto& entry =
+                    impl.compute_chain[(impl.compute_chain_next + chain_size - 1 - i) % chain_size];
+                for (const u64 written : entry.written) {
+                    if (written != 0 && written == serial) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+        std::shared_ptr<Texture> fallback_tex;
+        std::shared_ptr<Texture> input_tex;
+        size_t chosen_slot = 0;
+        size_t fallback_slot = 0;
+        for (size_t i = 0; i < tex_limit; ++i) {
+            const u64 handle = bound.combined[i];
+            if (handle == 0) {
+                continue;
+            }
+            auto tex = TextureOfId(VideoCommon::Nvn::TextureIdOf(static_cast<u32>(handle)));
+            if (!is_movie_colour(tex) || !tex->storage->image || tex->desc.width < 640 ||
+                tex->desc.height < 360) {
+                continue;
+            }
+            if (recently_compute_written(*tex)) {
+                input_tex = std::move(tex);
+                chosen_slot = i;
+                break;
+            }
+            if (!fallback_tex) {
+                fallback_tex = std::move(tex);
+                fallback_slot = i;
+            }
+        }
+        if (!input_tex && fallback_tex) {
+            input_tex = std::move(fallback_tex);
+            chosen_slot = fallback_slot;
+        }
+        if (input_tex) {
+            static Common::BootCounter boot;
+            static std::unordered_set<u64> logged;
+            if (boot.First()) {
+                logged.clear();
+            }
+            if (logged.insert(program_hash).second) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] movie tensor network detected (hash={:016x}, slot={}, input={}x{}); "
+                         "replacing chain with HLE upscale",
+                         program_hash, chosen_slot, input_tex->desc.width, input_tex->desc.height);
+            }
+            movie_network_input = std::move(input_tex);
+            movie_network_skip = 16;
+            skipped();
+            return;
+        }
+    }
+
+    if (replacement_wanted) {
+        // The compute chain behind a game's upscaling network: kept only while one may be replaced.
+        NoteComputeChain();
+    }
+
     const bool ndsr_shape = VideoCore::Upscaler::IsNdsrDispatchShape(
         control->thread_group, control->compute.texture_count, control->compute.image_count,
         push_constants[1].size());
-    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
     if (replacement_wanted && !ndsr_shape) {
         log_skip(program_hash, "dispatch shape", [&] {
             return fmt::format("hash={:016x} threads={}x{}x{} textures={} images={} push_bytes={}",
@@ -222,9 +356,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                control->compute.image_count, push_constants[1].size());
         });
     }
-    const bool tensor = ndsr_shape && !bound.combined.empty() &&
-                        ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
-                                                     control->inst_bytes);
+    const bool tensor = ndsr_shape && !bound.combined.empty() && uses_tensor;
     if (replacement_wanted && ndsr_shape && bound.combined.empty()) {
         log_skip(program_hash, "no sampled texture", [&] { return fmt::format("hash={:016x}", program_hash); });
     } else if (replacement_wanted && ndsr_shape && !tensor) {
@@ -523,6 +655,7 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
                                        : nullptr,
                              true};
     compute_groups = indirect ? std::array<u32, 3>{} : std::array<u32, 3>{p.x, p.y, p.z};
+    compute_thread_group = indirect ? std::array<u32, 3>{} : control->thread_group;
     if (!BindDescriptors(*compute, VK_PIPELINE_BIND_POINT_COMPUTE)) {
         skipped();
         return;

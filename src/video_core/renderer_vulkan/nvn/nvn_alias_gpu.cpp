@@ -30,13 +30,13 @@ struct PushConstants {
 };
 static_assert(sizeof(PushConstants) == 48);
 
-constexpr u32 WORKGROUP_SIZE = 256;
-constexpr u32 MAX_GROUPS_X = 65535;
+constexpr u32 GROUP_X = 16;
+constexpr u32 GROUP_Y = 8;
 
 } // Anonymous namespace
 
 bool AliasTransferGpu::Supported(const Device& device) {
-    return device.IsKhrPushDescriptorSupported() && device.MaxPushDescriptors() >= 1 &&
+    return device.IsKhrPushDescriptorSupported() && device.MaxPushDescriptors() >= 2 &&
            device.IsStorageBuffer8BitAccessSupported();
 }
 
@@ -44,19 +44,28 @@ AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
     // The shader addresses the scratch buffer with 32-bit offsets.
     max_scratch = (std::min<u64>)(device.GetMaxStorageBufferRange(), u64{1} << 30);
     const vk::Device& logical = device.GetLogical();
-    const VkDescriptorSetLayoutBinding binding{
-        .binding = 0,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .descriptorCount = 1,
-        .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
-        .pImmutableSamplers = nullptr,
-    };
+    const std::array<VkDescriptorSetLayoutBinding, 2> bindings{{
+        {
+            .binding = 0,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        },
+        {
+            .binding = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .descriptorCount = 1,
+            .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
+            .pImmutableSamplers = nullptr,
+        },
+    }};
     set_layout = logical.CreateDescriptorSetLayout({
         .sType = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
         .pNext = nullptr,
         .flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR,
-        .bindingCount = 1,
-        .pBindings = &binding,
+        .bindingCount = static_cast<u32>(bindings.size()),
+        .pBindings = bindings.data(),
     });
     const VkPushConstantRange push_range{
         .stageFlags = VK_SHADER_STAGE_COMPUTE_BIT,
@@ -106,29 +115,50 @@ AliasTransferGpu::AliasTransferGpu(const Device& device_) : device{device_} {
 AliasTransferGpu::~AliasTransferGpu() = default;
 
 void AliasTransferGpu::Begin(vk::CommandBuffer cmd, VkBuffer scratch, u64 size) const {
+    const u64 aligned_size = (size + 3) & ~u64{3};
     const VkDescriptorBufferInfo buffer_info{
         .buffer = scratch,
         .offset = 0,
-        .range = (std::min)(size, max_scratch),
+        .range = (std::min)(aligned_size, max_scratch),
     };
-    const VkWriteDescriptorSet write{
-        .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-        .pNext = nullptr,
-        .dstSet = VK_NULL_HANDLE,
-        .dstBinding = 0,
-        .dstArrayElement = 0,
-        .descriptorCount = 1,
-        .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-        .pImageInfo = nullptr,
-        .pBufferInfo = &buffer_info,
-        .pTexelBufferView = nullptr,
-    };
+    const std::array<VkWriteDescriptorSet, 2> writes{{
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 0,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &buffer_info,
+            .pTexelBufferView = nullptr,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = 1,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &buffer_info,
+            .pTexelBufferView = nullptr,
+        },
+    }};
     cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
-    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, write);
+    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
 }
 
 void AliasTransferGpu::Dispatch(vk::CommandBuffer cmd, Mode mode, u32 window_offset,
                                 u32 window_size, const Piece& piece) const {
+    const u32 gx = (piece.cols + GROUP_X - 1) / GROUP_X;
+    const u32 gy = (piece.rows + GROUP_Y - 1) / GROUP_Y;
+    const u32 gz = piece.slices;
+    if (gx == 0 || gy == 0 || gz == 0) {
+        return;
+    }
     const PushConstants constants{
         .mode = static_cast<u32>(mode),
         .tight_offset = piece.tight_offset,
@@ -144,10 +174,7 @@ void AliasTransferGpu::Dispatch(vk::CommandBuffer cmd, Mode mode, u32 window_off
         .pitch = piece.pitch,
     };
     cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
-    const u64 texels = static_cast<u64>(piece.cols) * piece.rows * piece.slices;
-    const u64 groups = (texels + WORKGROUP_SIZE - 1) / WORKGROUP_SIZE;
-    cmd.Dispatch(static_cast<u32>((std::min<u64>)(groups, MAX_GROUPS_X)),
-                 static_cast<u32>((groups + MAX_GROUPS_X - 1) / MAX_GROUPS_X), 1);
+    cmd.Dispatch(gx, gy, gz);
 }
 
 } // namespace Vulkan::Nvn

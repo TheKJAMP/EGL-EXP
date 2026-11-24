@@ -123,6 +123,71 @@ AstcGpuDecoder::AstcGpuDecoder(const Device& device_) : device{device_} {
 
 AstcGpuDecoder::~AstcGpuDecoder() = default;
 
+void AstcGpuDecoder::DispatchLevel(vk::CommandBuffer cmd, VkBuffer input, u64 input_offset,
+                                   u64 input_size, VkImageView view, const Level& level) const {
+    const u64 binding_offset = input_offset + level.offset;
+    const VkDescriptorBufferInfo buffer_info{
+        .buffer = input,
+        .offset = binding_offset,
+        .range = (std::min)(input_size - level.offset, max_range),
+    };
+    const VkDescriptorImageInfo image_info{
+        .sampler = VK_NULL_HANDLE,
+        .imageView = view,
+        .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
+    };
+    const std::array<VkWriteDescriptorSet, 2> writes{{
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = BINDING_INPUT,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
+            .pImageInfo = nullptr,
+            .pBufferInfo = &buffer_info,
+            .pTexelBufferView = nullptr,
+        },
+        {
+            .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+            .pNext = nullptr,
+            .dstSet = VK_NULL_HANDLE,
+            .dstBinding = BINDING_OUTPUT,
+            .dstArrayElement = 0,
+            .descriptorCount = 1,
+            .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
+            .pImageInfo = &image_info,
+            .pBufferInfo = nullptr,
+            .pTexelBufferView = nullptr,
+        },
+    }};
+    cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
+    // The shader's addressing is block_linear_unswizzle_2d's: a row of blocks is `stride`
+    // bytes (rounded up to whole 64-byte GOB columns), a tile is 2^tile_height GOBs tall.
+    const u32 stride = level.columns * ASTC_BLOCK_BYTES;
+    const u32 gobs_in_x =
+        (stride + Tegra::Texture::GOB_SIZE_X - 1) >> Tegra::Texture::GOB_SIZE_X_SHIFT;
+    const u32 x_shift = Tegra::Texture::GOB_SIZE_SHIFT + level.tile_height + level.tile_depth;
+    const PushConstants constants{
+        .block_dims = {level.block_width, level.block_height},
+        .layer_stride = level.layer_stride,
+        .block_size = gobs_in_x << x_shift,
+        .x_shift = x_shift,
+        .block_height = level.tile_height,
+        .block_height_mask = (1u << level.tile_height) - 1u,
+        .native_tiling = 1,
+    };
+    cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
+    cmd.Dispatch((level.columns + 7) / 8, (level.rows + 7) / 8, level.layers);
+}
+
+void AstcGpuDecoder::RecordWithView(vk::CommandBuffer cmd, VkBuffer input, u64 input_offset,
+                                    u64 input_size, VkImageView view, const Level& level) const {
+    cmd.BindPipeline(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline);
+    DispatchLevel(cmd, input, input_offset, input_size, view, level);
+}
+
 std::vector<vk::ImageView> AstcGpuDecoder::Record(vk::CommandBuffer cmd, VkBuffer input,
                                                   u64 input_offset, u64 input_size, VkImage image,
                                                   std::span<const Level> levels) const {
@@ -156,60 +221,7 @@ std::vector<vk::ImageView> AstcGpuDecoder::Record(vk::CommandBuffer cmd, VkBuffe
                 .layerCount = VK_REMAINING_ARRAY_LAYERS,
             },
         }));
-        const u64 binding_offset = input_offset + level.offset;
-        const VkDescriptorBufferInfo buffer_info{
-            .buffer = input,
-            .offset = binding_offset,
-            .range = (std::min)(input_size - level.offset, max_range),
-        };
-        const VkDescriptorImageInfo image_info{
-            .sampler = VK_NULL_HANDLE,
-            .imageView = *views.back(),
-            .imageLayout = VK_IMAGE_LAYOUT_GENERAL,
-        };
-        const std::array<VkWriteDescriptorSet, 2> writes{{
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .pNext = nullptr,
-                .dstSet = VK_NULL_HANDLE,
-                .dstBinding = BINDING_INPUT,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER,
-                .pImageInfo = nullptr,
-                .pBufferInfo = &buffer_info,
-                .pTexelBufferView = nullptr,
-            },
-            {
-                .sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
-                .pNext = nullptr,
-                .dstSet = VK_NULL_HANDLE,
-                .dstBinding = BINDING_OUTPUT,
-                .dstArrayElement = 0,
-                .descriptorCount = 1,
-                .descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_IMAGE,
-                .pImageInfo = &image_info,
-                .pBufferInfo = nullptr,
-                .pTexelBufferView = nullptr,
-            },
-        }};
-        cmd.PushDescriptorSetKHR(VK_PIPELINE_BIND_POINT_COMPUTE, *pipeline_layout, 0, writes);
-        // The shader's addressing is block_linear_unswizzle_2d's: a row of blocks is `stride`
-        // bytes (rounded up to whole 64-byte GOB columns), a tile is 2^tile_height GOBs tall.
-        const u32 stride = level.columns * ASTC_BLOCK_BYTES;
-        const u32 gobs_in_x = (stride + Tegra::Texture::GOB_SIZE_X - 1) >> Tegra::Texture::GOB_SIZE_X_SHIFT;
-        const u32 x_shift = Tegra::Texture::GOB_SIZE_SHIFT + level.tile_height + level.tile_depth;
-        const PushConstants constants{
-            .block_dims = {level.block_width, level.block_height},
-            .layer_stride = level.layer_stride,
-            .block_size = gobs_in_x << x_shift,
-            .x_shift = x_shift,
-            .block_height = level.tile_height,
-            .block_height_mask = (1u << level.tile_height) - 1u,
-            .native_tiling = 1,
-        };
-        cmd.PushConstants(*pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT, constants);
-        cmd.Dispatch((level.columns + 7) / 8, (level.rows + 7) / 8, level.layers);
+        DispatchLevel(cmd, input, input_offset, input_size, *views.back(), level);
     }
     return views;
 }

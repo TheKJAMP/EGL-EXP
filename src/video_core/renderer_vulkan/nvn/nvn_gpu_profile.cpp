@@ -105,9 +105,13 @@ std::string DescribeTag(const Tag& tag) {
                           : tag.hash_a == SUB_INLINE  ? " inline-update"
                           : tag.hash_a == SUB_MIRROR  ? " mirror-upload"
                           : tag.hash_a == SUB_STORAGE ? " image-upload"
-                          : tag.hash_a == SUB_SHADOW  ? " storage-shadow"
-                          : tag.hash_a == SUB_VERTEX  ? " vertex-stage"
-                                                      : "";
+                          : tag.hash_a == SUB_SHADOW   ? " storage-shadow"
+                          : tag.hash_a == SUB_VERTEX   ? " vertex-stage"
+                          : tag.hash_a == SUB_READBACK    ? " mirror-readback"
+                          : tag.hash_a == SUB_COUNTERS    ? " counters"
+                          : tag.hash_a == SUB_ALIAS_COPY  ? " alias-copy"
+                          : tag.hash_a == SUB_ALIAS_BYTES ? " alias-bytes"
+                                                          : "";
         text += fmt::format("{} fmt={} {}x{} n={}", sub, FormatName(tag.format), tag.width,
                             tag.height, tag.count);
         break;

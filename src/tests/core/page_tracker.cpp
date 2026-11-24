@@ -109,6 +109,54 @@ TEST_CASE("PageTracker: armed pages trap the first write, then run free until co
     CHECK(Collect(state, id).empty());
 }
 
+TEST_CASE("PageTracker: PeekDirty and CollectDirtyAndDisarm avoid Protection changes",
+          "[core][page_tracker]") {
+    FakeSink sink;
+    PageTrackerState state{sink};
+    const u64 id = state.Register(10, 18, false);
+    const std::shared_ptr<const std::atomic<u64>> epoch = state.WriteEpoch(id);
+    REQUIRE(id != 0);
+    REQUIRE(epoch != nullptr);
+
+    state.Arm(id, 12, 16);
+    const size_t after_arm_applies = sink.applies;
+    state.OnWrite(13, 15);
+    const size_t after_write_applies = sink.applies;
+    const u64 after_write_epoch = epoch->load();
+
+    // PeekDirty observes dirty runs without clearing state or changing protections.
+    Runs peek;
+    state.PeekDirty(id, 10, 18, peek);
+    CHECK(peek == Runs{{13, 15}});
+    CHECK(state.AnyDirty(id, 13, 15));
+    CHECK(sink.applies == after_write_applies);
+    Runs peek2;
+    state.PeekDirty(id, 10, 18, peek2);
+    CHECK(peek2 == Runs{{13, 15}});
+
+    // CollectDirtyAndDisarm returns dirty runs, disarms them, and emits zero ApplyClaim calls.
+    Runs disarmed_runs;
+    state.CollectDirtyAndDisarm(id, 10, 18, disarmed_runs);
+    CHECK(disarmed_runs == Runs{{13, 15}});
+    CHECK_FALSE(state.AnyDirty(id, 10, 18));
+    CHECK(sink.applies == after_write_applies);
+
+    // Disarmed pages (13..15) stay untracked on further writes, while still-armed pages (12, 15) trap.
+    state.OnWrite(13, 15);
+    CHECK(epoch->load() == after_write_epoch);
+    CHECK_FALSE(state.AnyDirty(id, 13, 15));
+    state.OnWrite(12, 13);
+    CHECK(epoch->load() == after_write_epoch + 1);
+
+    // Re-arming resumes tracking on 13..15.
+    state.Arm(id, 13, 15);
+    CHECK(sink.applies > after_arm_applies);
+    state.OnWrite(14, 15);
+    peek.clear();
+    state.PeekDirty(id, 10, 18, peek);
+    CHECK(peek == Runs{{12, 13}, {14, 15}});
+}
+
 TEST_CASE("PageTracker: a collect of a sub-range leaves the rest dirty", "[core][page_tracker]") {
     FakeSink sink;
     PageTrackerState state{sink};
@@ -379,6 +427,28 @@ Common::PageType TypeOf(const Common::PageTable& table, u64 va) {
 constexpr u64 PAGE = Core::Memory::YUZU_PAGESIZE;
 
 } // Anonymous namespace
+
+TEST_CASE("PageTracker: PeekDirty and CollectDirtyAndDisarm with process memory",
+          "[core][page_tracker]") {
+    WithProcessMemory(4, [](Core::Memory::Memory& memory, Common::PageTable&, u8*) {
+        auto& tracker = memory.PageTracker();
+        const u64 tid = tracker.Register(RIG_BASE, 4 * PAGE, true);
+        SCOPE_EXIT {
+            tracker.Unregister(tid);
+        };
+        memory.Write32(RIG_BASE + PAGE, 0x1234);
+        Runs runs;
+        tracker.PeekDirty(tid, RIG_BASE, 4 * PAGE, runs);
+        CHECK(runs == Runs{{RIG_BASE + PAGE, RIG_BASE + 2 * PAGE}});
+        runs.clear();
+        tracker.CollectDirtyAndDisarm(tid, RIG_BASE, 4 * PAGE, runs);
+        CHECK(runs == Runs{{RIG_BASE + PAGE, RIG_BASE + 2 * PAGE}});
+        memory.Write32(RIG_BASE + PAGE, 0x5678);
+        runs.clear();
+        tracker.PeekDirty(tid, RIG_BASE, 4 * PAGE, runs);
+        CHECK(runs.empty());
+    });
+}
 
 TEST_CASE("PageTracker: off unless enabled, and then memory behaves as without it",
           "[core][page_tracker]") {

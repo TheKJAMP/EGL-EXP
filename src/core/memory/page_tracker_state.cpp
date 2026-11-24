@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <type_traits>
 
 #include "core/memory/page_tracker_state.h"
 
@@ -226,9 +227,18 @@ void PageTrackerState::Arm(u64 id, u64 page_begin, u64 page_end) {
     }
 }
 
-void PageTrackerState::CollectDirty(u64 id, u64 page_begin, u64 page_end,
-                                    std::vector<std::pair<u64, u64>>& runs) {
-    Owner* const owner = Find(id);
+namespace {
+
+enum class DirtyScanMode {
+    CollectAndArm,
+    PeekOnly,
+    CollectAndDisarm,
+};
+
+template <typename OwnerPtr, typename EmitFn>
+void ScanDirtyPages(OwnerPtr owner, u64 page_begin, u64 page_end,
+                    std::vector<std::pair<u64, u64>>& runs, DirtyScanMode mode,
+                    EmitFn&& emit_page) {
     if (owner == nullptr || owner->dirty_count == 0) {
         return;
     }
@@ -240,27 +250,61 @@ void PageTrackerState::CollectDirty(u64 id, u64 page_begin, u64 page_end,
     const size_t first_run = runs.size();
     const u64 first = page_begin - owner->page_begin;
     const u64 last = page_end - owner->page_begin;
-    RunEmitter emitter{sink};
     for (u64 word = first >> 6; word <= (last - 1) >> 6; ++word) {
         u64 bits = owner->dirty[word] & WordMask(word, first, last);
         if (bits == 0) {
             continue;
         }
-        owner->dirty[word] &= ~bits;
+        if constexpr (!std::is_const_v<std::remove_pointer_t<OwnerPtr>>) {
+            if (mode != DirtyScanMode::PeekOnly) {
+                owner->dirty[word] &= ~bits;
+                if (mode == DirtyScanMode::CollectAndDisarm) {
+                    owner->armed[word] &= ~bits;
+                }
+            }
+        }
         while (bits != 0) {
             const u64 bit = static_cast<u64>(std::countr_zero(bits));
             bits &= bits - 1;
             const u64 page = owner->page_begin + (word << 6) + bit;
-            --owner->dirty_count;
+            if constexpr (!std::is_const_v<std::remove_pointer_t<OwnerPtr>>) {
+                if (mode != DirtyScanMode::PeekOnly) {
+                    --owner->dirty_count;
+                }
+            }
             if (runs.size() > first_run && runs.back().second == page) {
                 ++runs.back().second;
             } else {
                 runs.emplace_back(page, page + 1);
             }
-            bool tracked;
-            emitter.Add(page, ClaimOf(page, tracked));
+            emit_page(page);
         }
     }
+}
+
+} // namespace
+
+void PageTrackerState::CollectDirty(u64 id, u64 page_begin, u64 page_end,
+                                    std::vector<std::pair<u64, u64>>& runs) {
+    RunEmitter emitter{sink};
+    ScanDirtyPages(Find(id), page_begin, page_end, runs, DirtyScanMode::CollectAndArm,
+                   [&](u64 page) {
+                       bool tracked;
+                       emitter.Add(page, ClaimOf(page, tracked));
+                   });
+}
+
+void PageTrackerState::PeekDirty(u64 id, u64 page_begin, u64 page_end,
+                                 std::vector<std::pair<u64, u64>>& runs) const {
+    ScanDirtyPages(Find(id), page_begin, page_end, runs, DirtyScanMode::PeekOnly, [](u64) {});
+}
+
+void PageTrackerState::CollectDirtyAndDisarm(u64 id, u64 page_begin, u64 page_end,
+                                             std::vector<std::pair<u64, u64>>& runs) {
+    // Every dirty page was armed=1 & dirty=1 (write claim false) and becomes armed=0 & dirty=0
+    // (write claim still false), so ClaimOf(page) is unchanged and zero host protections change.
+    ScanDirtyPages(Find(id), page_begin, page_end, runs, DirtyScanMode::CollectAndDisarm,
+                   [](u64) {});
 }
 
 bool PageTrackerState::AnyDirty(u64 id, u64 page_begin, u64 page_end) const {

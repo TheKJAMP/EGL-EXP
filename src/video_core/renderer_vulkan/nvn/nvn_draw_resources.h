@@ -58,6 +58,7 @@ struct ViewKey {
 struct TextureViews {
     std::shared_ptr<Storage> storage;
     std::vector<std::pair<ViewKey, vk::ImageView>> views;
+    bool used_in_framebuffer{false};
 };
 
 struct DummyImage {
@@ -437,9 +438,10 @@ struct DrawResources {
     // --- views ---
     std::unordered_map<u64, TextureViews> texture_views;
     u64 views_epoch{1}; ///< Bumped when a texture_views node is erased (Texture::view_slot dies).
+    u64 framebuffer_views_epoch{1}; ///< Bumped when any cached image view is destroyed or detached.
     u64 samplers_epoch{1}; ///< Bumped when a sampler is released (DrawContext::sampler_slots).
     /// Image view of a texture object for `key`, created on first use. Null on failure.
-    VkImageView GetView(const Texture& texture, const ViewKey& key);
+    VkImageView GetView(const Texture& texture, const ViewKey& key, bool for_framebuffer = false);
     /// Detaches the views of a destroyed texture so they can be released after its last use.
     std::shared_ptr<TextureViews> TakeViews(u64 serial);
     /// Detaches the views of every texture over `storage`, whose image is being replaced, so they

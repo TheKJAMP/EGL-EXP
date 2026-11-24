@@ -99,6 +99,7 @@ private:
     vk::PipelineLayout pipeline_layout;
     vk::ShaderModule module;
     vk::Pipeline pipeline;
+    vk::Pipeline pipeline_refined;
 
     vk::DescriptorSetLayout copy_set_layout;
     vk::PipelineLayout copy_pipeline_layout;

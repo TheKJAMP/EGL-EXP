@@ -27,6 +27,15 @@ struct DrawPlan {
         /// layout records nothing and is not noted as written by the GPU.
         bool sample_only{false};
         bool write{false};
+        bool write_only{false};
+        bool will_overwrite{false};
+        bool is_storage_image{false};
+        bool view_format_needs_unrestricted{false};
+        bool needs_upgrade_storage{false};
+        bool needs_upgrade_formats{false};
+        VkFormat view_format{VK_FORMAT_UNDEFINED};
+        bool layout_only{false};
+        bool from_bindless_prime{false};
     };
     /// A buffer range the draw (or dispatch) uses. Descriptor bindings carry the index of their
     /// VkDescriptorBufferInfo (`DrawContext::scratch_buffers`), which a storage shadow patches.
@@ -136,7 +145,9 @@ struct DrawPlan {
         rescale_words.Clear();
     }
     void UseImage(const std::shared_ptr<Storage>& storage, VkImageLayout layout,
-                  bool sample_only = false, bool write = false) {
+                  bool sample_only = false, bool write = false, bool write_only_image = false,
+                  bool is_storage_img = false, VkFormat view_fmt = VK_FORMAT_UNDEFINED,
+                  bool layout_only = false, bool from_bindless_prime = false) {
         image_writes |= write;
         for (ImageUse& use : images) {
             if (use.owner == storage) {
@@ -145,10 +156,32 @@ struct DrawPlan {
                 }
                 use.sample_only = use.sample_only && sample_only;
                 use.write |= write;
+                use.write_only = use.write_only && write_only_image;
+                use.is_storage_image |= is_storage_img;
+                use.layout_only &= layout_only;
+                use.from_bindless_prime &= from_bindless_prime;
+                if (view_fmt != VK_FORMAT_UNDEFINED) {
+                    if (use.view_format == VK_FORMAT_UNDEFINED) {
+                        use.view_format = view_fmt;
+                    } else if (view_fmt != use.view_format &&
+                               !storage->FormatListAllows(view_fmt)) {
+                        use.view_format_needs_unrestricted = true;
+                    }
+                }
                 return;
             }
         }
-        images.push_back({storage, layout, false, false, sample_only, write});
+        images.push_back({
+            .owner = storage,
+            .layout = layout,
+            .sample_only = sample_only,
+            .write = write,
+            .write_only = write_only_image,
+            .is_storage_image = is_storage_img,
+            .view_format = view_fmt,
+            .layout_only = layout_only,
+            .from_bindless_prime = from_bindless_prime,
+        });
     }
     /// The layout the plan puts `storage` in (`fallback` when the plan does not use it).
     [[nodiscard]] VkImageLayout LayoutOf(const Storage* storage, VkImageLayout fallback) const {

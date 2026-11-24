@@ -286,10 +286,10 @@ inline constexpr std::uint32_t Sm86HmmaOpcode = 0x23c;
     return false;
 }
 
-/// A game's upscaling network dispatch, recognised by structure alone: the NDSR dispatch shape,
-/// tensor-core math in the program, and rectangle words that describe a strictly larger output
-/// (the input rectangle is smaller than the output one on both axes). DK's NDSR programs and OoT's
-/// (same SDK family) both classify; no title, build or program hash is involved.
+/// A game's upscaling or AA network dispatch, recognised by structure alone: the NDSR dispatch
+/// shape, tensor-core math in the program, and rectangle words where the input fits within the
+/// output on both axes (including 1:1 native-resolution tensor AA passes). DK's NDSR programs and
+/// OoT's (same SDK family) both classify; no title, build or program hash is involved.
 [[nodiscard]] constexpr bool IsUpscaleNetworkDispatch(std::array<std::uint32_t, 3> thread_group,
                                                       std::uint32_t texture_count,
                                                       std::uint32_t image_count,
@@ -297,7 +297,8 @@ inline constexpr std::uint32_t Sm86HmmaOpcode = 0x23c;
                                                       bool uses_tensor_math, const Rect& input,
                                                       const Rect& output) noexcept {
     return IsNdsrDispatchShape(thread_group, texture_count, image_count, push_constant_bytes) &&
-           uses_tensor_math && input.width < output.width && input.height < output.height;
+           uses_tensor_math && input.width > 0 && input.height > 0 &&
+           input.width <= output.width && input.height <= output.height;
 }
 
 /// Whether the game's own upscaling network is replaced by the host's upscaler. `backend` is the

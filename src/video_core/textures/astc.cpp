@@ -11,6 +11,7 @@
 // <http://gamma.cs.unc.edu/FasTC/>
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <cassert>
 #include <cstring>
@@ -1989,12 +1990,7 @@ static void DecompressBlock(std::span<const u8, 16> inBuf, const u32 blockWidth,
                     C0 = ReplicateByteTo16(C0);
                     C1 = ReplicateByteTo16(C1);
                     const u32 C = (C0 * (64 - weight) + C1 * weight + 32) / 64;
-                    if (C == 65535) {
-                        p.Component(c) = 255;
-                    } else {
-                        double Cf = static_cast<double>(C);
-                        p.Component(c) = static_cast<u16>(255.0 * (Cf / 65536.0) + 0.5);
-                    }
+                    p.Component(c) = static_cast<u16>((255 * C + (1u << 15)) >> 16);
                 }
             }
 
@@ -2007,35 +2003,43 @@ void Decompress(std::span<const uint8_t> data, uint32_t width, uint32_t height, 
     const u32 rows = Common::DivideUp(height, block_height);
     const u32 cols = Common::DivideUp(width, block_width);
 
-    Common::ThreadWorker& workers{GetThreadWorkers()};
-
-    for (u32 z = 0; z < depth; ++z) {
+    const auto decode_row = [=](u32 z, u32 y_index) {
         const u32 depth_offset = z * height * width * 4;
-        for (u32 y_index = 0; y_index < rows; ++y_index) {
-            auto decompress_stride = [data, width, height, block_width, block_height, output, rows,
-                                      cols, z, depth_offset, y_index] {
-                const u32 y = y_index * block_height;
-                for (u32 x_index = 0; x_index < cols; ++x_index) {
-                    const u32 block_index = (z * rows * cols) + (y_index * cols) + x_index;
-                    const u32 x = x_index * block_width;
+        const u32 y = y_index * block_height;
+        for (u32 x_index = 0; x_index < cols; ++x_index) {
+            const u32 block_index = (z * rows * cols) + (y_index * cols) + x_index;
+            const u32 x = x_index * block_width;
 
-                    const std::span<const u8, 16> blockPtr{data.subspan(block_index * 16, 16)};
+            const std::span<const u8, 16> block_data{data.subspan(block_index * 16, 16)};
 
-                    // Blocks can be at most 12x12
-                    std::array<u32, 12 * 12> uncompData;
-                    DecompressBlock(blockPtr, block_width, block_height, uncompData);
+            // Blocks can be at most 12x12.
+            std::array<u32, 12 * 12> texels;
+            DecompressBlock(block_data, block_width, block_height, texels);
 
-                    u32 decompWidth = (std::min)(block_width, width - x);
-                    u32 decompHeight = (std::min)(block_height, height - y);
+            const u32 decoded_width = (std::min)(block_width, width - x);
+            const u32 decoded_height = (std::min)(block_height, height - y);
 
-                    const std::span<u8> outRow = output.subspan(depth_offset + (y * width + x) * 4);
-                    for (u32 h = 0; h < decompHeight; ++h) {
-                        std::memcpy(outRow.data() + h * width * 4,
-                                    uncompData.data() + h * block_width, decompWidth * 4);
-                    }
-                }
-            };
-            workers.QueueWork(std::move(decompress_stride));
+            const std::span<u8> out_row = output.subspan(depth_offset + (y * width + x) * 4);
+            for (u32 h = 0; h < decoded_height; ++h) {
+                std::memcpy(out_row.data() + h * width * 4, texels.data() + h * block_width,
+                            decoded_width * 4);
+            }
+        }
+    };
+
+    // For small mips, queuing each row and waiting for the shared pool costs more than decoding.
+    constexpr u64 INLINE_TEXELS = 32 * 32;
+    if (depth == 1 && static_cast<u64>(rows) * cols * block_width * block_height <= INLINE_TEXELS) {
+        for (u32 y = 0; y < rows; ++y) {
+            decode_row(0, y);
+        }
+        return;
+    }
+
+    Common::ThreadWorker& workers{GetThreadWorkers()};
+    for (u32 z = 0; z < depth; ++z) {
+        for (u32 y = 0; y < rows; ++y) {
+            workers.QueueWork([decode_row, z, y] { decode_row(z, y); });
         }
         workers.WaitForRequests();
     }

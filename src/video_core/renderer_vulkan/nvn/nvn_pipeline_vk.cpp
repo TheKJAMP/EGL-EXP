@@ -72,11 +72,18 @@ std::span<const VkSubpassDependency> RenderPassDependencies(bool sync_diet) {
 // ================================================================================================
 
 VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key,
-                                                bool read_only_depth) {
+                                                bool read_only_depth, u16 clear_mask) {
     std::scoped_lock lock{render_pass_mutex};
-    auto& passes = read_only_depth ? read_only_depth_passes : render_passes;
-    if (const auto it = passes.find(key); it != passes.end()) {
-        return *it->second;
+    if (clear_mask == 0) {
+        auto& passes = read_only_depth ? read_only_depth_passes : render_passes;
+        if (const auto it = passes.find(key); it != passes.end()) {
+            return *it->second;
+        }
+    } else {
+        const ClearRenderPassKey clear_key{key, clear_mask, read_only_depth};
+        if (const auto it = clear_render_passes.find(clear_key); it != clear_render_passes.end()) {
+            return *it->second;
+        }
     }
     const VkSampleCountFlagBits samples =
         static_cast<VkSampleCountFlagBits>(key.samples == 0 ? 1 : key.samples);
@@ -91,11 +98,12 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key,
         }
         color_references[slot] = {static_cast<u32>(descriptions.size()),
                                   VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL};
+        const bool clear_color = (clear_mask & (1u << slot)) != 0;
         descriptions.push_back({
             .flags = 0,
             .format = format,
             .samples = samples,
-            .loadOp = VK_ATTACHMENT_LOAD_OP_LOAD,
+            .loadOp = clear_color ? VK_ATTACHMENT_LOAD_OP_CLEAR : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = VK_ATTACHMENT_STORE_OP_STORE,
             .stencilLoadOp = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
             .stencilStoreOp = VK_ATTACHMENT_STORE_OP_DONT_CARE,
@@ -114,15 +122,21 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key,
         depth_reference = {static_cast<u32>(descriptions.size()), depth_layout};
         const bool depth = FormatHasDepth(depth_format);
         const bool stencil = FormatHasStencil(depth_format);
+        const bool clear_depth = (clear_mask & RENDER_PASS_CLEAR_DEPTH) != 0;
+        const bool clear_stencil = (clear_mask & RENDER_PASS_CLEAR_STENCIL) != 0;
         descriptions.push_back({
             .flags = 0,
             .format = depth_format,
             .samples = samples,
-            .loadOp = depth ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .loadOp = !depth      ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                      : clear_depth ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                    : VK_ATTACHMENT_LOAD_OP_LOAD,
             .storeOp = read_only_depth ? VK_ATTACHMENT_STORE_OP_NONE
                        : depth ? VK_ATTACHMENT_STORE_OP_STORE
                                : VK_ATTACHMENT_STORE_OP_DONT_CARE,
-            .stencilLoadOp = stencil ? VK_ATTACHMENT_LOAD_OP_LOAD : VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+            .stencilLoadOp = !stencil      ? VK_ATTACHMENT_LOAD_OP_DONT_CARE
+                             : clear_stencil ? VK_ATTACHMENT_LOAD_OP_CLEAR
+                                             : VK_ATTACHMENT_LOAD_OP_LOAD,
             .stencilStoreOp =
                 stencil ? VK_ATTACHMENT_STORE_OP_STORE : VK_ATTACHMENT_STORE_OP_DONT_CARE,
             .initialLayout = depth_layout,
@@ -155,7 +169,13 @@ VkRenderPass PipelineCache::Impl::GetRenderPass(const RenderPassKey& key,
         .pDependencies = dependencies.data(),
     });
     const VkRenderPass handle = *pass;
-    passes.emplace(key, std::move(pass));
+    if (clear_mask == 0) {
+        auto& passes = read_only_depth ? read_only_depth_passes : render_passes;
+        passes.emplace(key, std::move(pass));
+    } else {
+        clear_render_passes.emplace(ClearRenderPassKey{key, clear_mask, read_only_depth},
+                                    std::move(pass));
+    }
     return handle;
 }
 // ================================================================================================

@@ -28,8 +28,10 @@ enum class TexTarget : s32 {
 
 /// NVN texture flag bits (NVNtextureFlags) the layout depends on.
 namespace TexFlag {
-constexpr s32 Sparse = 0x20;
+constexpr s32 Image = 0x04;
+constexpr s32 Compressible = 0x08;
 constexpr s32 Linear = 0x10;
+constexpr s32 Sparse = 0x20;
 constexpr s32 LinearRenderTarget = 0x40;
 constexpr s32 MinimalLayout = 0x200;
 } // namespace TexFlag

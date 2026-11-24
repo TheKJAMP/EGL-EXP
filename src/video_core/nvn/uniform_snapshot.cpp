@@ -153,17 +153,58 @@ void AssignPools(std::vector<Range>& ranges, const UniformSnapshotPools& pools) 
     ranges.resize(kept);
 }
 
+void MarkWrittenRuns(const std::vector<std::pair<u64, u64>>& runs, UniformSnapshotCpuPages& cpu,
+                     u64 stamp) {
+    for (const auto& [begin, end] : runs) {
+        for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
+            cpu.written[page].written = stamp;
+        }
+    }
+}
+
+} // namespace
+
+void RearmUniformSnapshotPools(UniformSnapshotPools& pools, UniformSnapshotCpuPages& cpu,
+                               GuestMemory& memory, std::vector<std::pair<u64, u64>>& runs,
+                               u64 stamp_presents) {
+    for (auto& [pool_begin, pool] : pools) {
+        if (pool.track_id == 0) {
+            continue;
+        }
+        u64 ep = 0;
+        if (pool.write_epoch) {
+            ep = pool.write_epoch->load(std::memory_order_acquire);
+            if (ep == pool.epoch_clean) {
+                continue;
+            }
+        }
+        runs.clear();
+        memory.TakeWritten(pool.track_id, pool_begin, pool.end - pool_begin, runs);
+        MarkWrittenRuns(runs, cpu, stamp_presents);
+        if (pool.write_epoch) {
+            pool.epoch_clean = ep;
+        }
+    }
+}
+
+namespace {
+
 /// Keeps the ranges whose every page the guest CPU wrote in this frame or the previous one.
-/// Takes the pages written since the last capture from the page tracker (which arms them again)
-/// and arms the pages seen for the first time (they qualify from their next write on). A pool the
-/// tracker cannot follow keeps its ranges (nothing tells its CPU writes from its GPU writes there;
-/// the GPU history still applies).
+/// Peeks written pages during a frame without re-arming (`QueuePresentTexture` calls
+/// `RearmUniformSnapshotPools` once per frame), and arms pages seen for the first time (they
+/// qualify from their next write on). A pool the tracker cannot follow keeps its ranges (nothing
+/// tells its CPU writes from its GPU writes there; the GPU history still applies).
 u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                    UniformSnapshotCpuPages& cpu, GuestMemory& memory,
                    std::vector<std::pair<u64, u64>>& runs) {
-    constexpr u64 RECENT_FRAMES = 16;
+    if (cpu.last_rearm_presents != cpu.presents) {
+        // Callers (such as tests) that bump `cpu.presents` directly get the same once-per-frame
+        // collect+rearm as QueuePresentTexture.
+        RearmUniformSnapshotPools(pools, cpu, memory, runs, cpu.last_rearm_presents + 1);
+        cpu.last_rearm_presents = cpu.presents;
+    }
     const u64 current_present = cpu.presents + 1;
-    const u64 recent = cpu.presents > RECENT_FRAMES ? cpu.presents - RECENT_FRAMES : 0;
+    const u64 recent = cpu.presents;
     // One pass per run of touched pages of one pool: the tracker is asked once per run.
     size_t i = 0;
     while (i < ranges.size()) {
@@ -187,8 +228,13 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
             ++j;
         }
         if (pool.track_id != 0) {
+            const u64 cur_epoch =
+                pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
+            const bool epoch_unchanged = pool.write_epoch && cur_epoch == pool.epoch_clean;
             u64 arm_from = 0;
             u64 arm_count = 0;
+            u64 need_first = ~u64{0};
+            u64 need_last = 0;
             const auto flush_arm = [&] {
                 if (arm_count != 0) {
                     memory.Arm(pool.track_id, arm_from << PAGE_BITS, arm_count << PAGE_BITS);
@@ -196,56 +242,37 @@ u64 KeepCpuWritten(std::vector<Range>& ranges, UniformSnapshotPools& pools,
                 }
             };
             for (u64 page = first; page <= last; ++page) {
-                if (cpu.written.try_emplace(page, UniformSnapshotPageState{}).second) {
+                const auto [it, inserted] =
+                    cpu.written.try_emplace(page, UniformSnapshotPageState{});
+                if (inserted) {
+                    if (pool.write_epoch) {
+                        it->second.checked = cur_epoch;
+                    }
                     if (arm_count == 0 || arm_from + arm_count != page) {
                         flush_arm();
                         arm_from = page;
                     }
                     ++arm_count;
+                } else if (it->second.written < current_present && !epoch_unchanged &&
+                           (!pool.write_epoch || it->second.checked != cur_epoch)) {
+                    if (pool.write_epoch) {
+                        it->second.checked = cur_epoch;
+                    }
+                    need_first = (std::min)(need_first, page);
+                    need_last = page;
                 }
             }
             flush_arm();
-
-            const u64 cur_epoch =
-                pool.write_epoch ? pool.write_epoch->load(std::memory_order_acquire) : 0;
-            const bool epoch_unchanged = pool.write_epoch && cur_epoch == pool.epoch_clean;
-            if (!epoch_unchanged) {
-                u64 sub_first = 0;
-                bool in_sub = false;
-                const auto flush_sub = [&](u64 sub_end_exclusive) {
-                    runs.clear();
-                    memory.TakeWritten(pool.track_id, sub_first << PAGE_BITS,
-                                       (sub_end_exclusive - sub_first) << PAGE_BITS, runs);
-                    for (const auto& [begin, end] : runs) {
-                        for (u64 page = begin >> PAGE_BITS; page < (end >> PAGE_BITS); ++page) {
-                            cpu.written[page].written = current_present;
-                        }
-                    }
-                    in_sub = false;
-                };
-                for (u64 page = first; page <= last; ++page) {
-                    UniformSnapshotPageState& state = cpu.written[page];
-                    const bool stale = state.written == 0 || state.written < recent;
-                    const bool needs_check =
-                        stale && (!pool.write_epoch || state.checked != cur_epoch);
-                    if (needs_check) {
-                        state.checked = cur_epoch;
-                        if (!in_sub) {
-                            sub_first = page;
-                            in_sub = true;
-                        }
-                    } else if (in_sub) {
-                        flush_sub(page);
-                    }
-                }
-                if (in_sub) {
-                    flush_sub(last + 1);
-                }
+            if (need_first <= need_last) {
+                runs.clear();
+                memory.PeekWritten(pool.track_id, need_first << PAGE_BITS,
+                                   (need_last - need_first + 1) << PAGE_BITS, runs);
+                MarkWrittenRuns(runs, cpu, current_present);
             }
         }
         i = j;
     }
-    // Written within RECENT_FRAMES (or never yet checked cleanly for untracked pools).
+    // Written in this frame (presents + 1) or the previous one (presents).
     size_t kept = 0;
     u64 last_pool_begin = ~u64{0};
     bool last_tracked = false;

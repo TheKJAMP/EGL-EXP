@@ -1115,8 +1115,13 @@ u64 Recorder::QueuePresentTexture(u64 queue_va, u64 window_va, u32 slot) {
     queue->last_seq.store(seq);
     window->slot_seq[slot].store(seq);
     ++impl->stats.presents;
-    // The uniform snapshot's "written lately" is this frame or the last.
+    // The uniform snapshot's "written lately" is this frame or the last; re-arm once per present.
+    if (impl->uniform_snapshot.load(std::memory_order_relaxed) != UniformSnapshotMode::Off) {
+        RearmUniformSnapshotPools(impl->snapshot_pools, impl->snapshot_cpu, impl->memory,
+                                  impl->snapshot_scratch.runs, impl->snapshot_cpu.presents + 1);
+    }
     ++impl->snapshot_cpu.presents;
+    impl->snapshot_cpu.last_rearm_presents = impl->snapshot_cpu.presents;
     impl->sink.Present(PresentRequest{seq, queue->index, window->textures[slot], slot,
                                       window->interval, window->crop});
     return seq;
@@ -1687,8 +1692,28 @@ u32 Recorder::Impl::BufferBytesFrom(u64 address) {
         if (span.begin <= address && address < span.end) {
             end = (std::max)(end, span.end);
         }
+        std::sort(buffer_spans_index.begin(), buffer_spans_index.end(),
+                  [](const IndexedBufferSpan& a, const IndexedBufferSpan& b) {
+                      return a.begin < b.begin || (a.begin == b.begin && a.max_end > b.max_end);
+                  });
+        u64 running_max = 0;
+        for (IndexedBufferSpan& entry : buffer_spans_index) {
+            running_max = (std::max)(running_max, entry.max_end);
+            entry.max_end = running_max;
+        }
+        buffer_spans_dirty = false;
     }
-    return static_cast<u32>((std::min<u64>)(end != 0 ? end - address : 0, 0xFFFF'FFFFu));
+    const auto it = std::upper_bound(
+        buffer_spans_index.begin(), buffer_spans_index.end(), address,
+        [](u64 addr, const IndexedBufferSpan& entry) { return addr < entry.begin; });
+    if (it == buffer_spans_index.begin()) {
+        return 0;
+    }
+    const u64 max_end = std::prev(it)->max_end;
+    if (max_end <= address) {
+        return 0;
+    }
+    return static_cast<u32>((std::min<u64>)(max_end - address, 0xFFFF'FFFFu));
 }
 
 std::optional<BufferInfo> Recorder::GetBuffer(u64 buffer_va) {

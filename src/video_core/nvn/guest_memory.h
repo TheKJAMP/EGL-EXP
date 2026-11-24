@@ -68,6 +68,15 @@ public:
         static_cast<void>(size);
         static_cast<void>(runs);
     }
+    virtual void PeekWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+        TakeWritten(id, va, size, runs);
+    }
+    [[nodiscard]] virtual bool SupportsDisarmWritten() const {
+        return false;
+    }
+    virtual void DisarmWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) {
+        TakeWritten(id, va, size, runs);
+    }
     [[nodiscard]] virtual bool AnyWritten(u64 id, u64 va, u64 size) {
         static_cast<void>(id);
         static_cast<void>(va);

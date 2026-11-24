@@ -13,6 +13,7 @@
 #include <numeric>
 #include <optional>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include <fmt/format.h>
@@ -98,9 +99,7 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
             if (!mario_kart_world) {
-                for (Pool::MirrorPage& page : pool.mirror_pages) {
-                    page.trusted = false;
-                }
+                pool.ClearAllMirrorTrusted();
             }
             // Textures of the pool must see raw writes even in Mario Kart World; only the mirror
             // page exception is Mario Kart World specific. The store names no page: the textures
@@ -110,18 +109,23 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
             pool.raw_write_gen = ++pool.cpu_write_gen;
         }
     }
-    std::vector<std::pair<u64, u64>> writebacks;
-    {
-        std::scoped_lock lock{pool.dirty_mutex};
-        writebacks.swap(pool.landed_writebacks);
-    }
-    if (!writebacks.empty()) {
-        ++pool.cpu_write_gen;
-        for (const auto& [offset, end] : writebacks) {
-            for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
-                const size_t index = static_cast<size_t>(page);
-                if (index < pool.page_write_gen.size()) {
-                    pool.page_write_gen[index] = pool.cpu_write_gen;
+    if (pool.has_landed_writebacks.load(std::memory_order_acquire)) {
+        thread_local std::vector<std::pair<u64, u64>> writebacks;
+        writebacks.clear();
+        {
+            std::scoped_lock lock{pool.dirty_mutex};
+            writebacks.swap(pool.landed_writebacks);
+            pool.has_landed_writebacks.store(false, std::memory_order_relaxed);
+        }
+        if (!writebacks.empty()) {
+            ++pool.cpu_write_gen;
+            for (const auto& [offset, end] : writebacks) {
+                for (u64 page = offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end;
+                     ++page) {
+                    const size_t index = static_cast<size_t>(page);
+                    if (index < pool.page_write_gen.size()) {
+                        pool.page_write_gen[index] = pool.cpu_write_gen;
+                    }
                 }
             }
         }
@@ -135,13 +139,15 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         if (pool.mirror_track == 0) {
             return false;
         }
-        // Watched from now on: a page hashed after this shows any later CPU write. No page is
-        // trusted yet.
-        memory->Arm(pool.mirror_track, pool.address, pool.size);
+        // Pages are armed lazily only when their contents become trusted (ArmPoolMirrorPages).
+        const size_t page_count =
+            static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE);
+        pool.page_write_gen.assign(page_count, 0);
+        pool.mirror_armed_bits.assign((page_count + 63) / 64, 0);
         pool.mirror_write_epoch = memory->WriteEpoch(pool.mirror_track);
-        // mirror_epoch_clean stays as it was: the next call collects writes made right after Arm.
-        pool.page_write_gen.assign(
-            static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE), 0);
+        pool.mirror_epoch_clean = pool.mirror_write_epoch
+                                      ? pool.mirror_write_epoch->load(std::memory_order_acquire)
+                                      : 0;
         return true;
     }
     u64 epoch = 0;
@@ -151,11 +157,12 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
             return true;
         }
     }
-    // The whole pool: a taken write lives on as an untrusted page until that page is hashed, so a
-    // range checked later does not lose it.
+    // The whole pool: a taken write lives on as an untrusted (disarmed) page until that page is
+    // hashed and trusted again, avoiding immediate re-arm mprotect faults on hot CPU pages.
     thread_local std::vector<std::pair<u64, u64>> written;
     written.clear();
-    memory->TakeWritten(pool.mirror_track, pool.address, pool.size, written);
+    const bool disarmed = memory->SupportsDisarmWritten();
+    memory->DisarmWritten(pool.mirror_track, pool.address, pool.size, written);
     if (!written.empty()) {
         ++pool.cpu_write_gen;
     }
@@ -164,7 +171,11 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         const u64 to = (std::min)(end - pool.address, pool.size);
         for (u64 page = from / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < to; ++page) {
             const size_t index = static_cast<size_t>(page);
+            if (disarmed && (index >> 6) < pool.mirror_armed_bits.size()) {
+                pool.mirror_armed_bits[index >> 6] &= ~(u64{1} << (index & 63));
+            }
             if (index < pool.mirror_pages.size()) {
+                pool.SetMirrorPageTrusted(index, false);
                 pool.mirror_pages[index].trusted = false;
                 if (pool.raw_written_through &&
                     pool.mirror_pages[index].raw_epoch != pool.split_raw_epoch_seen) {
@@ -178,6 +189,72 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
     }
     pool.mirror_epoch_clean = epoch; // read before the take: a write in between shows as a change
     return true;
+}
+
+void Context::Impl::ArmPoolMirrorPages(Pool& pool, u64 first_page, u64 last_page) {
+    if (pool.mirror_track == 0 || pool.page_write_gen.empty() || pool.mirror_armed_bits.empty() ||
+        first_page > last_page) {
+        return;
+    }
+    last_page = (std::min)(last_page, static_cast<u64>(pool.page_write_gen.size()) - 1);
+    if (first_page > last_page) {
+        return;
+    }
+    const size_t first_word = static_cast<size_t>(first_page >> 6);
+    const size_t last_word = static_cast<size_t>(last_page >> 6);
+    const u64 first_mask = ~u64{0} << (first_page & 63);
+    const u64 last_mask = ~u64{0} >> (63u - (last_page & 63));
+    bool all_armed = false;
+    if (first_word == last_word) {
+        const u64 mask = first_mask & last_mask;
+        all_armed = (pool.mirror_armed_bits[first_word] & mask) == mask;
+    } else if ((pool.mirror_armed_bits[first_word] & first_mask) == first_mask &&
+               (pool.mirror_armed_bits[last_word] & last_mask) == last_mask) {
+        all_armed = true;
+        for (size_t w = first_word + 1; w < last_word; ++w) {
+            if (pool.mirror_armed_bits[w] != ~u64{0}) {
+                all_armed = false;
+                break;
+            }
+        }
+    }
+    if (all_armed) {
+        return;
+    }
+    VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+    if (memory == nullptr) {
+        return;
+    }
+    u64 run_begin = 0;
+    u64 run_count = 0;
+    const auto flush_arm = [&] {
+        if (run_count != 0) {
+            const u64 byte_offset = run_begin * Pool::MIRROR_PAGE;
+            const u64 byte_size = (std::min)(run_count * Pool::MIRROR_PAGE, pool.size - byte_offset);
+            memory->Arm(pool.mirror_track, pool.address + byte_offset, byte_size);
+            run_count = 0;
+        }
+    };
+    for (u64 page = first_page; page <= last_page; ++page) {
+        const size_t w = static_cast<size_t>(page >> 6);
+        if ((page & 63) == 0 && page + 63 <= last_page && pool.mirror_armed_bits[w] == ~u64{0}) {
+            flush_arm();
+            page += 63;
+            continue;
+        }
+        const u64 mask = u64{1} << (page & 63);
+        if ((pool.mirror_armed_bits[w] & mask) != 0) {
+            flush_arm();
+            continue;
+        }
+        pool.mirror_armed_bits[w] |= mask;
+        if (run_count == 0 || run_begin + run_count != page) {
+            flush_arm();
+            run_begin = page;
+        }
+        ++run_count;
+    }
+    flush_arm();
 }
 
 bool Context::Impl::PoolWrittenSince(const Pool& pool, u64 offset, u64 size, u32 gen) {
@@ -332,6 +409,8 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // contents are stale, and equal pages mean the bytes are the trusted ones again.
     if (written && s.page_hashes.size() == last_page - first_page + 1 &&
         last_page < check_pool->page_write_gen.size()) {
+        last_page < pool.page_write_gen.size()) {
+        ArmPoolMirrorPages(pool, first_page, last_page);
         std::vector<u8> page_scratch;
         const auto page_begin = std::chrono::steady_clock::now();
         if (const u8* bytes = GuestBytes(pool, s.pool_offset, size, page_scratch)) {
@@ -399,6 +478,9 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // signature alone.
     const bool signature_only = watching || !full;
     const bool gathered_lines = pool.IsVirtual() && signature_only;
+    if (tracked && full && !watching) {
+        ArmPoolMirrorPages(pool, first_page, last_page);
+    }
     std::vector<u8> scratch;
     const auto guest_begin = std::chrono::steady_clock::now();
     const u8* data = gathered_lines ? nullptr : GuestBytes(pool, s.pool_offset, size, scratch);
@@ -620,6 +702,7 @@ void Context::Impl::SetStandin(Storage& s, AstcStandin standin) {
                               (std::max)(s.extent.height >> level, 1u), 1, block_bytes);
     }
     s.vram_bytes = bytes * s.layers;
+    NoteBindlessStorageChanged(s);
 }
 
 vk::Image Context::Impl::TakeRecycledImage(const VkImageCreateInfo& info) {
@@ -721,9 +804,17 @@ bool Context::Impl::EnsureImage(Storage& s) {
         ChooseSmartStandin(s);
     }
     try {
+        const bool use_format_list =
+            s.view_format_count != 0 && device.IsKhrImageFormatListSupported();
+        const VkImageFormatListCreateInfo format_list{
+            .sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO,
+            .pNext = nullptr,
+            .viewFormatCount = s.view_format_count,
+            .pViewFormats = s.view_formats.data(),
+        };
         const VkImageCreateInfo image_info{
             .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .pNext = nullptr,
+            .pNext = use_format_list ? &format_list : nullptr,
             .flags = s.create_flags,
             .imageType = s.type,
             .format = s.host.format,
@@ -747,6 +838,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
             ++s.image_gen;
             if (s.image && s.sparse->Attach(*this, s, reason)) {
                 s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+                NoteBindlessLayoutDirty(s);
+                NoteBindlessStorageChanged(s);
                 stats.storages_created.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -759,6 +852,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
             // The whole-storage paths start from scratch.
             s.contents_valid = false;
             s.origin = StorageOrigin::None;
+            NoteBindlessStorageChanged(s);
         }
         s.image = TakeRecycledImage(image_info);
         if (!s.image) {
@@ -767,6 +861,7 @@ bool Context::Impl::EnsureImage(Storage& s) {
         ++s.image_gen;
     } catch (const vk::Exception& exception) {
         s.image_failed = true;
+        NoteBindlessStorageChanged(s);
         stats.textures_failed.fetch_add(1, std::memory_order_relaxed);
         LOG_ERROR(Render_Vulkan, "[nvn] texture storage ({}x{}x{}, {} levels, format {:#x}) image failed: {}",
                   s.extent.width, s.extent.height, s.extent.depth, s.levels, s.desc.format,
@@ -774,6 +869,8 @@ bool Context::Impl::EnsureImage(Storage& s) {
         return false;
     }
     s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
+    NoteBindlessLayoutDirty(s);
+    NoteBindlessStorageChanged(s);
     s.last_used_present = stats.presents.load(std::memory_order_relaxed);
     stats.storages_created.fetch_add(1, std::memory_order_relaxed);
     if (s.cached) {
@@ -1044,7 +1141,9 @@ void Context::Impl::MapVirtualNow(u64 pool_serial, const std::vector<VC::Virtual
                 });
                 continue;
             }
-            storage.contents_valid = false;
+            if (std::exchange(storage.contents_valid, false)) {
+                NoteBindlessStorageChanged(storage);
+            }
             storage.origin = StorageOrigin::None;
             storage.gpu_write_gen = 0; // no longer a source for overlapping textures
             storage.linear_writeback_seq = 0;
@@ -1253,7 +1352,7 @@ void Context::Impl::NotifyCpuWriteNow(u64 address, u64 size, bool host_write) {
             Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
             mirror_page.checked = 0;
             if (untrust) {
-                mirror_page.trusted = false;
+                pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
             }
         }
     }
@@ -2292,7 +2391,9 @@ void Context::Impl::FlushTextureNow(CmdFlushTexture& command) {
     if (!pool.mirror_pages.empty()) {
         const u64 end = s.pool_offset + storage_size;
         for (u64 page = s.pool_offset / Pool::MIRROR_PAGE; page * Pool::MIRROR_PAGE < end; ++page) {
-            pool.mirror_pages[static_cast<size_t>(page)].trusted = false;
+            Pool::MirrorPage& mirror_page = pool.mirror_pages[static_cast<size_t>(page)];
+            pool.SetMirrorPageTrusted(static_cast<size_t>(page), false);
+            mirror_page.checked = 0;
         }
     }
     // The guest bytes are the texture's contents now: from here on it is a CPU-sourced storage.

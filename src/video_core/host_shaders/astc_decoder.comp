@@ -79,7 +79,8 @@ uvec4 color_endpoint_data;
 int color_bitsread = 0;
 
 #define MAX_WEIGHT_VALUES 64
-uint result_vector[MAX_WEIGHT_VALUES];
+// Bank-conflict-free per-thread 16-bit storage (8 KiB <= 16 KiB Vulkan/GL minimum, 1 column per thread)
+shared uint s_result[32][64];
 
 int result_index = 0;
 uint result_vector_max_index;
@@ -117,6 +118,34 @@ EncodingData CreateEncodingData(uint encoding, uint num_bits, uint bit_val, uint
                         ((bit_val) << 16u) | ((quint_trit_val) << 24u));
 }
 
+uint GetResultU16(uint idx) {
+    const uint packed = s_result[idx >> 1u][gl_LocalInvocationIndex];
+    return (idx & 1u) != 0u ? (packed >> 16u) : (packed & 0xFFFFu);
+}
+
+void SetResultU16(uint idx, uint val) {
+    const uint slot = idx >> 1u;
+    uint packed = s_result[slot][gl_LocalInvocationIndex];
+    packed = (idx & 1u) != 0u ? ((packed & 0xFFFFu) | ((val & 0xFFFFu) << 16u))
+                              : ((packed & 0xFFFF0000u) | (val & 0xFFFFu));
+    s_result[slot][gl_LocalInvocationIndex] = packed;
+}
+
+uint PackEncoding16(EncodingData val) {
+    const uint enc = Encoding(val);
+    const uint nb = NumBits(val);
+    const uint bv = BitValue(val);
+    const uint qt = QuintTritValue(val);
+    return (enc & 3u) | ((nb & 15u) << 2u) | ((bv & 255u) << 6u) | ((qt & 7u) << 12u);
+}
+
+EncodingData UnpackEncoding16(uint p) {
+    const uint enc = p & 3u;
+    const uint nb = (p >> 2u) & 15u;
+    const uint bv = (enc == JUST_BITS) ? ((p >> 6u) & 255u) : ((p >> 6u) & 63u);
+    const uint qt = (enc == JUST_BITS) ? 0u : ((p >> 12u) & 7u);
+    return CreateEncodingData(enc, nb, bv, qt);
+}
 
 void ResultEmplaceBack(EncodingData val) {
     if (result_index >= result_vector_max_index) {
@@ -124,7 +153,13 @@ void ResultEmplaceBack(EncodingData val) {
         result_limit_reached = true;
         return;
     }
-    result_vector[result_index] = val.data;
+    const uint idx = uint(result_index);
+    const uint packed = PackEncoding16(val);
+    if ((idx & 1u) == 0u) {
+        s_result[idx >> 1u][gl_LocalInvocationIndex] = packed;
+    } else {
+        SetResultU16(idx, packed);
+    }
     ++result_index;
 }
 
@@ -324,8 +359,7 @@ uint StreamColorBits(uint num_bits) {
 }
 
 EncodingData GetEncodingFromVector(uint index) {
-    const uint data = result_vector[index];
-    return EncodingData(data);
+    return UnpackEncoding16(GetResultU16(index));
 }
 
 // Returns the number of bits required to encode n_vals values.
@@ -474,7 +508,7 @@ void DecodeIntegerSequence(uint max_range, uint num_values) {
     }
 }
 
-void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, out uint color_values[32]) {
+void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits) {
     uint num_values = 0;
     for (uint i = 0; i < num_partitions; i++) {
         num_values += ((modes[i] >> 2) + 1) << 1;
@@ -505,7 +539,7 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
         A = ReplicateBitTo9((bitval & 1));
         switch (encoding) {
         case JUST_BITS:
-            color_values[out_index++] = FastReplicateTo8(bitval, bitlen);
+            SetResultU16(out_index++, FastReplicateTo8(bitval, bitlen));
             break;
         case TRIT: {
             D = QuintTritValue(val);
@@ -584,8 +618,11 @@ void DecodeColorValues(uvec4 modes, uint num_partitions, uint color_data_bits, o
             uint T = (D * C) + B;
             T ^= A;
             T = (A & 0x80) | (T >> 2);
-            color_values[out_index++] = T;
+            SetResultU16(out_index++, T);
         }
+    }
+    for (uint z = out_index; z < num_values && z < 32u; ++z) {
+        SetResultU16(z, 0u);
     }
 }
 
@@ -761,17 +798,17 @@ void DecodeHDREndpointMode11(uint v0, uint v1, uint v2, uint v3, uint v4, uint v
     e1 = ivec3(r1, g1, b1);
 }
 
-void ComputeEndpoints(out uvec4 ep1, out uvec4 ep2, uint color_endpoint_mode, uint color_values[32],
+void ComputeEndpoints(out uvec4 ep1, out uvec4 ep2, uint color_endpoint_mode,
                       inout uint colvals_index) {
 #define READ_UINT_VALUES(N)                                                                        \
     uvec4 V[2];                                                                                    \
     for (uint i = 0; i < N; i++) {                                                                 \
-        V[i / 4][i % 4] = color_values[colvals_index++];                      \
+        V[i / 4][i % 4] = GetResultU16(colvals_index++);                                           \
     }
 #define READ_INT_VALUES(N)                                                                         \
     ivec4 V[2];                                                                                    \
     for (uint i = 0; i < N; i++) {                                                                 \
-        V[i / 4][i % 4] = int(color_values[colvals_index++]);                      \
+        V[i / 4][i % 4] = int(GetResultU16(colvals_index++));                                      \
     }
 
     switch (color_endpoint_mode) {
@@ -1013,14 +1050,13 @@ void UnquantizeTexelWeights(uvec2 size, bool is_dual_plane) {
     const uint area = size.x * size.y;
     const uint loop_count = min(result_index, area * num_planes);
     for (uint itr = 0; itr < loop_count; ++itr) {
-        result_vector[itr] =
-            UnquantizeTexelWeight(GetEncodingFromVector(itr));
+        SetResultU16(itr, UnquantizeTexelWeight(GetEncodingFromVector(itr)));
     }
 }
 
 uint GetUnquantizedTexelWeight(uint offset_base, uint plane, bool is_dual_plane) {
     const uint offset = is_dual_plane ? 2 * offset_base + plane : offset_base;
-    return result_vector[offset];
+    return GetResultU16(offset);
 }
 
 // Scale from a texel position to the weight grid; they depend only on the block size.
@@ -1335,11 +1371,10 @@ void DecompressBlock(ivec3 coord) {
     {
         // This decode phase should at most push 32 elements into the vector
         result_vector_max_index = 32;
-        uint color_values[32];
         uint colvals_index = 0;
-        DecodeColorValues(color_endpoint_mode, num_partitions, color_data_bits, color_values);
+        DecodeColorValues(color_endpoint_mode, num_partitions, color_data_bits);
         for (uint i = 0; i < num_partitions; i++) {
-            ComputeEndpoints(endpoints0[i], endpoints1[i], color_endpoint_mode[i], color_values,
+            ComputeEndpoints(endpoints0[i], endpoints1[i], color_endpoint_mode[i],
                              colvals_index);
         }
     }
@@ -1376,19 +1411,25 @@ void DecompressBlock(ivec3 coord) {
     if (num_partitions > 1) {
         partition_setup = SetupPartition(partition_index, num_partitions);
     }
+    const bool single_partition = num_partitions == 1u;
+    const uint p0_cem = color_endpoint_mode[0];
+    const uvec4 p0_ep0 = endpoints0[0];
+    const uvec4 p0_ep1 = endpoints1[0];
     for (uint j = 0; j < block_dims.y; j++) {
         for (uint i = 0; i < block_dims.x; i++) {
             uint local_partition = 0;
-            if (num_partitions > 1) {
+            if (!single_partition) {
                 local_partition = Select2DPartition(partition_setup, i, j);
             }
-            const uint local_cem = color_endpoint_mode[local_partition];
+            const uint local_cem = single_partition ? p0_cem : color_endpoint_mode[local_partition];
+            const uvec4 ep0 = single_partition ? p0_ep0 : endpoints0[local_partition];
+            const uvec4 ep1 = single_partition ? p0_ep1 : endpoints1[local_partition];
             const uvec4 weight_vec = GetUnquantizedWeightVector(j, i, size_params, plane_index, dual_plane);
 
             vec4 p;
             if (IsHDRColorEndpointMode(local_cem)) {
-                const uvec4 C0 = endpoints0[local_partition] << 4u;
-                const uvec4 C1 = endpoints1[local_partition] << 4u;
+                const uvec4 C0 = ep0 << 4u;
+                const uvec4 C1 = ep1 << 4u;
                 const uvec4 C = (C0 * (uvec4(64) - weight_vec) + C1 * weight_vec + uvec4(32)) / 64u;
                 const uvec4 E = (C & uvec4(0xF800u)) >> 11u;
                 const uvec4 M = C & uvec4(0x7FFu);
@@ -1404,14 +1445,14 @@ void DecompressBlock(ivec3 coord) {
                         unpackHalf2x16(half_bits.z).x, unpackHalf2x16(half_bits.w).x);
 
                 if (local_cem == 14u) {
-                    const uint a0 = ReplicateByteTo16(uvec4(endpoints0[local_partition].x)).x;
-                    const uint a1 = ReplicateByteTo16(uvec4(endpoints1[local_partition].x)).x;
+                    const uint a0 = ReplicateByteTo16(uvec4(ep0.x)).x;
+                    const uint a1 = ReplicateByteTo16(uvec4(ep1.x)).x;
                     const uint Ca = (a0 * (64u - weight_vec.x) + a1 * weight_vec.x + 32u) / 64u;
                     p.x = float(Ca) / 65535.0f;
                 }
             } else {
-                const uvec4 C0 = ReplicateByteTo16(endpoints0[local_partition]);
-                const uvec4 C1 = ReplicateByteTo16(endpoints1[local_partition]);
+                const uvec4 C0 = ReplicateByteTo16(ep0);
+                const uvec4 C1 = ReplicateByteTo16(ep1);
                 const vec4 Cf =
                     vec4((C0 * (uvec4(64) - weight_vec) + C1 * weight_vec + uvec4(32)) / 64);
                 p = Cf / 65535.0f;

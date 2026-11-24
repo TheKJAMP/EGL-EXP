@@ -15,10 +15,14 @@
 //   mode 1 (gather):  window -> tightly copied texel bytes (only texels inside the window).
 // One invocation per texel; all byte moves are exclusive to their texel, so no atomics.
 
-layout(local_size_x = 256) in;
+layout(local_size_x = 16, local_size_y = 8, local_size_z = 1) in;
 
 layout(std430, binding = 0) buffer Memory {
     uint8_t bytes[];
+};
+
+layout(std430, binding = 1) buffer MemoryWords {
+    uint words[];
 };
 
 layout(push_constant) uniform PushConstants {
@@ -59,16 +63,64 @@ uint BlockLinearOffset(uint xb, uint y, uint z) {
 }
 
 void main() {
-    const uint group = gl_WorkGroupID.y * 65535u + gl_WorkGroupID.x;
-    const uint index = group * 256u + gl_LocalInvocationID.x;
-    if (index >= pc.cols * pc.rows * pc.slices) {
+    const uint x = gl_GlobalInvocationID.x;
+    const uint y = gl_GlobalInvocationID.y;
+    const uint z = gl_GlobalInvocationID.z;
+    if (x >= pc.cols || y >= pc.rows || z >= pc.slices) {
         return;
     }
-    const uint x = index % pc.cols;
-    const uint rest = index / pc.cols;
-    const uint y = rest % pc.rows;
-    const uint z = rest / pc.rows;
+    const uint index = (z * pc.rows + y) * pc.cols + x;
     const uint tight = pc.tight_offset + index * pc.bpp;
+    // In Switch 2 GOB order, bits 0..3 of BlockLinearOffset(xb, y, z) equal (xb & 15u), and
+    // flipping bits 5..6 preserves bits 0..3. Thus for any power-of-two texel size bpp <= 16,
+    // x * bpp is aligned to bpp so all bpp bytes of a texel stay contiguous in one 16-byte row.
+    if (pc.bpp != 0u && (pc.bpp & (pc.bpp - 1u)) == 0u && pc.bpp <= 16u) {
+        const uint base_offset =
+            (pc.pitch != 0u) ? (y * pc.pitch + x * pc.bpp) : BlockLinearOffset(x * pc.bpp, y, z);
+        const int base_at = pc.piece_base + int(base_offset);
+        if (base_at >= 0 && uint(base_at) <= pc.window_size &&
+            (pc.window_size - uint(base_at)) >= pc.bpp) {
+            const uint window_addr = pc.window_offset + uint(base_at);
+            if (pc.bpp >= 4u && ((window_addr | tight) & 3u) == 0u) {
+                const uint word_count = pc.bpp >> 2;
+                const uint w_idx = window_addr >> 2;
+                const uint t_idx = tight >> 2;
+                if (pc.mode == 0u) {
+                    for (uint w = 0u; w < word_count; ++w) {
+                        words[w_idx + w] = words[t_idx + w];
+                    }
+                } else {
+                    for (uint w = 0u; w < word_count; ++w) {
+                        words[t_idx + w] = words[w_idx + w];
+                    }
+                }
+            } else {
+                if (pc.mode == 0u) {
+                    for (uint b = 0u; b < pc.bpp; ++b) {
+                        bytes[window_addr + b] = bytes[tight + b];
+                    }
+                } else {
+                    for (uint b = 0u; b < pc.bpp; ++b) {
+                        bytes[tight + b] = bytes[window_addr + b];
+                    }
+                }
+            }
+            return;
+        }
+        for (uint b = 0u; b < pc.bpp; ++b) {
+            const int at = base_at + int(b);
+            if (at < 0 || uint(at) >= pc.window_size) {
+                continue;
+            }
+            const uint window = pc.window_offset + uint(at);
+            if (pc.mode == 0u) {
+                bytes[window] = bytes[tight + b];
+            } else {
+                bytes[tight + b] = bytes[window];
+            }
+        }
+        return;
+    }
     for (uint b = 0u; b < pc.bpp; ++b) {
         uint offset;
         if (pc.pitch != 0u) {

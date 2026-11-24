@@ -51,6 +51,12 @@ public:
     /// were last armed or collected, sorted and merged, and arms them again. Pages outside the
     /// sub-range keep their state.
     void CollectDirty(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs);
+    /// Appends the page-aligned [begin, end) VA runs currently marked dirty inside [va, va + size)
+    /// without clearing or re-arming any page.
+    void PeekDirty(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs);
+    /// Appends the page-aligned [begin, end) VA runs written inside [va, va + size), clears their
+    /// dirty bits, and disarms those pages without changing host protections.
+    void CollectDirtyAndDisarm(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs);
     /// Whether CollectDirty would report anything for the sub-range (clears nothing).
     [[nodiscard]] bool AnyDirty(u64 id, u64 va, u64 size);
     /// PageTrackerState::WriteEpoch: a lock-free counter of the pages that turned dirty.

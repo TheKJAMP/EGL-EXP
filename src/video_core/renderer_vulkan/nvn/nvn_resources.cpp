@@ -299,7 +299,12 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
     if (desc.flags & PoolFlag::CpuNoAccess) {
         stats.pools_device_local.fetch_add(1, std::memory_order_relaxed);
     }
-    if (options.background_backing) {
+    const bool host_import_available =
+        options.allow_host_import && importer && importer->Available();
+    // Without host import, backing CPU-accessible pools in the background turns every untouched
+    // texture pool into a gigabyte-scale device-local mirror; back them on demand instead.
+    if (options.background_backing &&
+        (host_import_available || (desc.flags & PoolFlag::CpuNoAccess) != 0)) {
         {
             std::scoped_lock lock{backing_queue_mutex};
             backing_queue.push_back(pool);
@@ -649,9 +654,8 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             ns_buffer = since(t);
             path = "mirror";
             pool->backing = Pool::Backing::Mirror;
-            pool->mirror_pages.assign(static_cast<size_t>((desc.size + Pool::MIRROR_PAGE - 1) /
-                                                          Pool::MIRROR_PAGE),
-                                      Pool::MirrorPage{});
+            pool->InitMirrorPages(
+                static_cast<size_t>((desc.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE));
             stats.pools_mirrored.fetch_add(1, std::memory_order_relaxed);
             if (host == nullptr) {
                 stats.pools_mirrored_discontiguous.fetch_add(1, std::memory_order_relaxed);
@@ -745,7 +749,7 @@ bool Context::Impl::UploadPoolRanges(std::span<const PoolUpload> ranges, bool in
                 const VkPipelineStageFlags user_stages =
                     vk::PIPELINE_STAGE_GRAPHICS_COMPUTE_TRANSFER |
                     (device.IsExtConditionalRendering()
-                         ? VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT
+                         ? VkPipelineStageFlags{VK_PIPELINE_STAGE_CONDITIONAL_RENDERING_BIT_EXT}
                          : VkPipelineStageFlags{0});
                 // A pool the replay already uses: earlier submissions may still read or write the
                 // range, later ones read the new bytes.
@@ -905,6 +909,14 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
         if (d.view.set_format) {
             if (const auto host = ResolveHostFormat(device, d.view.format)) {
                 texture->host = *host;
+                if (texture->storage && !texture->storage->FormatListAllows(texture->host.format)) {
+                    if (!texture->storage->image) {
+                        texture->storage->view_format_count = 0;
+                    } else {
+                        texture->storage->pending_unrestricted_formats = true;
+                        NoteBindlessStorageChanged(*texture->storage);
+                    }
+                }
                 // An ASTC view of a BC stand-in reads it as that BC format (its own sRGB-ness).
                 if (texture->storage && texture->storage->host.bc_standin) {
                     Storage& s = *texture->storage;
@@ -1053,15 +1065,6 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                               ? VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT
                               : VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     }
-    if (host->storage) {
-        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-    } else if (host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias) {
-        // Storage-image views use the UNORM format of the same bits (HostFormat::storage_view) or
-        // the format of an NVN view of the same texel size (HostFormat::storage_alias): the
-        // image's own format cannot claim the usage.
-        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
-        storage->create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
-    }
     if (astc_gpu_enabled && host->needs_transcode &&
         VideoCore::Surface::IsPixelFormatASTC(host->pixel_format) &&
         (host->format == VK_FORMAT_A8B8G8R8_SRGB_PACK32 ||
@@ -1114,6 +1117,51 @@ std::shared_ptr<Texture> Context::Impl::BuildTexture(const VC::TextureDesc& d) {
                      d.width, d.height, storage->layers, storage->levels, d.format, d.flags,
                      layout.size / 1048576.0, d.pool_serial, begin, reason);
         }
+    }
+
+    // Defer STORAGE_BIT and restrict initial view formats to {UNORM, SRGB} on color attachments
+    // without TexFlag::Image so drivers (e.g. RADV DCC) can keep framebuffers hardware-compressed
+    // unless a storage image binding or incompatible view actually arrives (Recorder::UpgradeImageCaps).
+    const bool wants_storage =
+        host->storage || host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias;
+    const bool defer_storage =
+        wants_storage && host->attachable && !host->depth && !host->stencil &&
+        !host->needs_transcode && !storage->astc_gpu && !storage->sparse &&
+        (d.flags & TexFlag::Image) == 0;
+    if (defer_storage) {
+        storage->can_upgrade_storage = true;
+        if (device.IsKhrImageFormatListSupported()) {
+            switch (host->format) {
+            case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+            case VK_FORMAT_A8B8G8R8_SRGB_PACK32:
+                storage->view_formats = {VK_FORMAT_A8B8G8R8_UNORM_PACK32,
+                                         VK_FORMAT_A8B8G8R8_SRGB_PACK32};
+                storage->view_format_count = 2;
+                break;
+            case VK_FORMAT_R8G8B8A8_UNORM:
+            case VK_FORMAT_R8G8B8A8_SRGB:
+                storage->view_formats = {VK_FORMAT_R8G8B8A8_UNORM, VK_FORMAT_R8G8B8A8_SRGB};
+                storage->view_format_count = 2;
+                break;
+            case VK_FORMAT_B8G8R8A8_UNORM:
+            case VK_FORMAT_B8G8R8A8_SRGB:
+                storage->view_formats = {VK_FORMAT_B8G8R8A8_UNORM, VK_FORMAT_B8G8R8A8_SRGB};
+                storage->view_format_count = 2;
+                break;
+            default:
+                storage->view_formats = {host->format, VK_FORMAT_UNDEFINED};
+                storage->view_format_count = 1;
+                break;
+            }
+        }
+    } else if (host->storage) {
+        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+    } else if (host->storage_view != VK_FORMAT_UNDEFINED || host->storage_alias) {
+        // Storage-image views use the UNORM format of the same bits (HostFormat::storage_view) or
+        // the format of an NVN view of the same texel size (HostFormat::storage_alias): the
+        // image's own format cannot claim the usage.
+        storage->usage |= VK_IMAGE_USAGE_STORAGE_BIT;
+        storage->create_flags |= VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
     }
 
     // Every MKW ASTC 8x8 copy source and atlas uses the same fixed BC3 format. Smart per-image
@@ -1343,6 +1391,12 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // The backing thread backs pools (and bumps the generation) only under this lock: the pools,
     // the chunks and the generation the table is built from are one consistent state.
     std::scoped_lock backing_lock{backing_mutex};
+    const bool host_import_available =
+        options.allow_host_import && importer && importer->Available();
+    const auto defer = [this, host_import_available](const Pool& pool) {
+        return !host_import_available && !try_storage_vram &&
+               !(pool.flags & PoolFlag::CpuNoAccess);
+    };
     const auto has_own_buffer = [](const Pool& pool) {
         return (pool.backing == Pool::Backing::Imported && !pool.chunk) ||
                pool.backing == Pool::Backing::DeviceLocal;
@@ -1364,6 +1418,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
             continue;
         }
         if (pool->pending) {
+            if (defer(*pool)) {
+                continue;
+            }
             if (!(pool->flags & PoolFlag::CpuNoAccess)) {
                 const u8* host = GuestPointer(pool->address, pool->size);
                 if (host != nullptr && InImportedChunk(host, pool->size)) {
@@ -1465,6 +1522,10 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 continue;
             }
             if (physical->pending) {
+                if (defer(*physical)) {
+                    ++skipped;
+                    continue;
+                }
                 BackPoolLocked(*physical);
             }
             if (physical->upload_pending) {

@@ -319,7 +319,8 @@ struct PipelineCache::Impl {
                                                   const std::function<void(u64)>& look_ahead = {},
                                                   std::optional<u64> prefetch_skip = {});
     std::shared_ptr<ComputePipeline> GetCompute(const ComputeRequest& request, bool* not_ready);
-    VkRenderPass GetRenderPass(const RenderPassKey& key, bool read_only_depth = false);
+    VkRenderPass GetRenderPass(const RenderPassKey& key, bool read_only_depth = false,
+                               u16 clear_mask = 0);
     void Flush();
     void ClearShaders();
     PipelineCacheStats Stats() const;
@@ -637,6 +638,21 @@ struct PipelineCache::Impl {
     std::mutex render_pass_mutex;
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> render_passes;
     std::unordered_map<RenderPassKey, vk::RenderPass, RenderPassKeyHash> read_only_depth_passes;
+    struct ClearRenderPassKey {
+        RenderPassKey key{};
+        u16 clear_mask{};
+        bool read_only_depth{};
+        [[nodiscard]] bool operator==(const ClearRenderPassKey&) const = default;
+    };
+    struct ClearRenderPassKeyHash {
+        size_t operator()(const ClearRenderPassKey& k) const noexcept {
+            const u64 h = RenderPassKeyHash{}(k.key);
+            const u64 extra = (static_cast<u64>(k.clear_mask) << 1) | (k.read_only_depth ? 1u : 0u);
+            return static_cast<size_t>(h ^ (extra * 0x9E3779B97F4A7C15ULL));
+        }
+    };
+    std::unordered_map<ClearRenderPassKey, vk::RenderPass, ClearRenderPassKeyHash>
+        clear_render_passes;
 
     std::mutex layout_cache_mutex;
     std::map<std::vector<u32>, std::shared_ptr<const SharedPipelineLayout>> layout_cache;

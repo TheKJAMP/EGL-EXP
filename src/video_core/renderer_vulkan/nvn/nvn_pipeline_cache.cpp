@@ -1912,8 +1912,9 @@ bool PipelineCache::SyncDiet() const noexcept {
     return impl->options.sync_diet;
 }
 
-VkRenderPass PipelineCache::GetRenderPass(const RenderPassKey& key, bool read_only_depth) {
-    return impl->GetRenderPass(key, read_only_depth);
+VkRenderPass PipelineCache::GetRenderPass(const RenderPassKey& key, bool read_only_depth,
+                                          u16 clear_mask) {
+    return impl->GetRenderPass(key, read_only_depth, clear_mask);
 }
 
 const Shader::Profile& PipelineCache::Profile() const noexcept {

@@ -434,7 +434,10 @@ struct Recorder::Impl {
     struct BufferSpan {
         u64 begin;
         u64 end;
-        u64 serial;
+    };
+    struct IndexedBufferSpan {
+        u64 begin;
+        u64 max_end;
     };
     static constexpr u64 BUFFER_SPAN_CHUNK_SHIFT = 20; // 1 MiB buckets
     static constexpr u64 BUFFER_SPAN_LARGE_LIMIT = u64{16} << 20;

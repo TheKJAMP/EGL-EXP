@@ -1106,3 +1106,42 @@ TEST_CASE("nvn recorder: infinite wait timeout and threads", "[nvn]") {
     gpu.join();
     CHECK(f.recorder.CompletedSeq() == 1);
 }
+
+TEST_CASE("nvn recorder: BufferBytesFrom tracks overlapping spans across initialize and finalize",
+          "[nvn]") {
+    Fixture f;
+    constexpr u64 POOL2_VA = 0x2000'0000'0000ULL;
+    constexpr u64 BIG_POOL_VA = 0x3000'0000'0000ULL;
+    REQUIRE(f.recorder.MemoryPoolInitialize(Obj(10), POOL2_VA, 0x10000, 0));
+    REQUIRE(f.recorder.MemoryPoolInitialize(Obj(11), BIG_POOL_VA, 0x1'2000'0000ULL, 0x1));
+
+    REQUIRE(f.recorder.BufferInitialize(Obj(20), Obj(10), 0x1000, 0x800));  // [0x1000, 0x1800)
+    REQUIRE(f.recorder.BufferInitialize(Obj(21), Obj(10), 0x1200, 0x1200)); // [0x1200, 0x2400)
+    REQUIRE(f.recorder.BufferInitialize(Obj(22), Obj(10), 0x1400, 0x200));  // [0x1400, 0x1600)
+    REQUIRE(f.recorder.BufferInitialize(Obj(23), Obj(10), 0x4000, 0));      // empty span ignored
+    REQUIRE(f.recorder.BufferInitialize(Obj(24), Obj(11), 0, 0x1'2000'0000ULL));
+
+    const auto draw_count_at = [&](u64 index_address) {
+        const u64 h = f.Record(0, [&] {
+            f.recorder.DrawElementsIndirect(Fixture::CMD, 4, 2, index_address, POOL2_VA + 0x8000);
+        });
+        REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{h}) != 0);
+        const auto* hdr = FindRecord(f.sink.submissions.back().lists.at(0), Op::DrawIndexed, 0);
+        REQUIRE(hdr != nullptr);
+        return RecordPayload<DrawIndexedPayload>(hdr)->count;
+    };
+
+    CHECK(draw_count_at(POOL2_VA + 0x0F00) == 0);
+    CHECK(draw_count_at(POOL2_VA + 0x1100) == 0x700);  // inside Obj(20)
+    CHECK(draw_count_at(POOL2_VA + 0x1200) == 0x1200); // max_end from Obj(21)
+    CHECK(draw_count_at(POOL2_VA + 0x1500) == 0x0F00); // Obj(21) outlasts both Obj(20) and Obj(22)
+    CHECK(draw_count_at(POOL2_VA + 0x2400) == 0);
+    CHECK(draw_count_at(POOL2_VA + 0x4000) == 0);      // empty buffer ignored
+    CHECK(draw_count_at(BIG_POOL_VA + 0x1000) == 0xFFFF'FFFFu); // saturates to u32::max
+
+    f.recorder.BufferFinalize(Obj(21));
+    CHECK(draw_count_at(POOL2_VA + 0x1500) == 0x300);  // falls back to Obj(20) ending at 0x1800
+    CHECK(draw_count_at(POOL2_VA + 0x1900) == 0);
+    f.recorder.BufferFinalize(Obj(20));
+    CHECK(draw_count_at(POOL2_VA + 0x1500) == 0x100);  // falls back to Obj(22) ending at 0x1600
+}

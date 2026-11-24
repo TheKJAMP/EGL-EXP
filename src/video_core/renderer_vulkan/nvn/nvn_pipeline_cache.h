@@ -491,6 +491,13 @@ struct PipelineCacheStats {
     u64 lowered_programs{}; ///< lowered stage programs held now
 };
 
+/// Attachment clear bits passed to `PipelineCache::GetRenderPass` to turn `LOAD_OP_LOAD` into
+/// `LOAD_OP_CLEAR` while keeping render-pass compatibility with `clear_mask == 0` pipelines.
+/// Bits 0..7 select color attachment slots 0..7; `RENDER_PASS_CLEAR_DEPTH` and
+/// `RENDER_PASS_CLEAR_STENCIL` select depth and stencil.
+inline constexpr u16 RENDER_PASS_CLEAR_DEPTH = 1u << 8;
+inline constexpr u16 RENDER_PASS_CLEAR_STENCIL = 1u << 9;
+
 /// Thread-safety: see the file comment.
 class PipelineCache {
 public:
@@ -537,7 +544,8 @@ public:
     /// (attachments LOAD/STORE, color attachments in COLOR_ATTACHMENT_OPTIMAL, depth/stencil in
     /// DEPTH_STENCIL_ATTACHMENT_OPTIMAL for the whole pass). Owned by the cache.
     [[nodiscard]] VkRenderPass GetRenderPass(const RenderPassKey& key,
-                                             bool read_only_depth = false);
+                                             bool read_only_depth = false,
+                                             u16 clear_mask = 0);
 
     /// The Shader::Profile / HostTranslateInfo built from the device (as vk_pipeline_cache.cpp).
     [[nodiscard]] const Shader::Profile& Profile() const noexcept;

@@ -96,6 +96,15 @@ public:
     void TakeWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
         memory.PageTracker().CollectDirty(id, va, size, runs);
     }
+    void PeekWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
+        memory.PageTracker().PeekDirty(id, va, size, runs);
+    }
+    bool SupportsDisarmWritten() const override {
+        return true;
+    }
+    void DisarmWritten(u64 id, u64 va, u64 size, std::vector<std::pair<u64, u64>>& runs) override {
+        memory.PageTracker().CollectDirtyAndDisarm(id, va, size, runs);
+    }
     bool AnyWritten(u64 id, u64 va, u64 size) override {
         return memory.PageTracker().AnyDirty(id, va, size);
     }
@@ -221,10 +230,8 @@ bool Runtime::EnsureRecorder(Core::System& system) {
     }
     gate->SetFailureCallback(
         [this, &system](std::string reason) { OnSinkFailure(system, std::move(reason)); });
-    if (system.GetApplicationProcessProgramID() == Settings::MarioKartWorldProgramId) {
-        recorder->SetCommandListBatching(true);
-        LOG_INFO(Core, "[nvn] Mario Kart World: batching command-list copies at submit");
-    }
+    recorder->SetCommandListBatching(true);
+    LOG_INFO(Core, "[nvn] batching command-list copies at submit");
     {
         // Uniform snapshot at submit: on (strict) for Ocarina of Time, the variable overrides it
         // for any title (0 off, 2 raw-reachable pages left to the CPU-written test,

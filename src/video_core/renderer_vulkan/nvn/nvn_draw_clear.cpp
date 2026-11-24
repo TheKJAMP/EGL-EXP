@@ -303,6 +303,11 @@ bool DrawContext::MaskedColorClear(const VC::ClearColorPayload& p, VkRect2D rect
     const VkPipeline clear_pipeline = resources.clears.Get(impl.device, pipeline_key);
     std::array<f32, 4> color;
     std::memcpy(color.data(), p.color, sizeof(color));
+    if (storage.pending_unrestricted_formats || !storage.FormatListAllows(shape.key.format)) {
+        if (!host->HostUpgradeImageCaps(storage, false, true)) {
+            return false;
+        }
+    }
     // One render pass per layer of the attachment (a slice of a 3D texture is a layer).
     for (u32 i = 0; i < shape.layer_count; ++i) {
         ViewKey view_key = shape.key;
