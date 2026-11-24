@@ -1747,7 +1747,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // evicted, recreated, and alias-transferred every frame.
     constexpr u64 PRESSURE_KEEP_PRESENTS = 4;
     const auto kept_recently_used = [&](const Storage& storage) {
-        return !hard_pressure && presents >= storage.last_used_present &&
+        return !hard_pressure && storage_cache_bytes <= budget_target &&
+               presents >= storage.last_used_present &&
                presents - storage.last_used_present < PRESSURE_KEEP_PRESENTS;
     };
     // First the render targets the GPU wrote again since (the game re-uses the bytes for other

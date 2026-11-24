@@ -7968,7 +7968,8 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
     ASSERT(binary_signals.size() <= MaxPresentSignals);
     const size_t first = submitted_segments;
     const size_t count = segments.size() - first;
-    if (impl.submit_batch.batching && !Debug::Get().upload_log) {
+    if (impl.submit_batch.batching && !Debug::Get().upload_log &&
+        impl.options.simulate_device_loss_from_seq == 0) {
         for (size_t k = 0; k < count; ++k) {
             const Segment& segment = segments[first + k];
             const bool last = first + k + 1 == segments.size();
