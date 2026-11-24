@@ -3093,8 +3093,14 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     const UploadPlan& tail_plan = sparse.TailPlan();
     const u64 tail_bytes = layout.TailSize();
     const auto align = [](u64 value) { return (value + 63) / 64 * 64; };
-    // One staging buffer per chunk of at most 64 MiB.
-    constexpr u64 CHUNK_BYTES = u64{64} << 20;
+    // One staging buffer per chunk of at most 32 MiB; bulk multi-chunk uploads reuse a single
+    // local upload buffer and flush between chunks so staging never piles up on host-visible heaps.
+    constexpr u64 CHUNK_BYTES = u64{32} << 20;
+    const u64 est_bytes = static_cast<u64>(uploads.tiles.size()) * align(tile_bytes) +
+                          static_cast<u64>(uploads.tails.size()) * align(tail_plan.staging_size);
+    const bool bulk_upload = est_bytes > CHUNK_BYTES;
+    vk::Buffer local_staging;
+    u64 local_staging_size = 0;
     size_t next_tile = 0;
     size_t next_tail = 0;
     while (next_tile < uploads.tiles.size() || next_tail < uploads.tails.size()) {
@@ -3117,7 +3123,20 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
             total += tail_plan.staging_size;
             ++next_tail;
         }
-        const StagingRange staging = AllocStaging(total, 64);
+        StagingRange staging{};
+        if (bulk_upload) {
+            if (!local_staging || local_staging_size < total) {
+                const u64 alloc_size = (std::max)(total, CHUNK_BYTES);
+                local_staging = impl.CreateHostBuffer(alloc_size, VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+                                                      MemoryUsage::Upload, AllocationKind::Staging);
+                local_staging_size = alloc_size;
+            }
+            staging.buffer = *local_staging;
+            staging.offset = 0;
+            staging.pointer = local_staging.Mapped().data();
+        } else {
+            staging = AllocStaging(total, 64);
+        }
         std::vector<u64> tile_pools(tile_offsets.size(), 0);
         std::vector<u32> tile_gens(tile_offsets.size(), 0);
         if (impl.tex_hash_tracked) {
@@ -3201,6 +3220,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                          .count(),
                      sparse.MappedTiles(), sparse.BoundBytes() / 1048576.0);
         }
+        if (bulk_upload) {
+            local_staging.Flush();
+        }
         if (regions.empty()) {
             continue;
         }
@@ -3232,6 +3254,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                 if (std::exchange(s.contents_valid, false)) {
                     impl.NoteBindlessStorageChanged(s);
                 }
+                if (bulk_upload && local_staging) {
+                    flight.keepalive.push_back(std::make_shared<vk::Buffer>(std::move(local_staging)));
+                }
                 return;
             }
         } else {
@@ -3239,6 +3264,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                                     regions);
         }
         MarkWritten(VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_WRITE_BIT);
+        if (bulk_upload) {
+            FlushAndWait();
+        }
     }
     // From here on the contents are the guest's bytes (a texture the GPU wrote keeps its origin).
     if (s.origin == StorageOrigin::None) {
