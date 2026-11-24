@@ -8,9 +8,11 @@
 #include <cstddef>
 #include <cstdlib>
 #include <cstring>
+#include <unordered_set>
 
 #include <fmt/format.h>
 
+#include "common/cityhash.h"
 #include "common/diag_request.h"
 #include "common/settings.h"
 
@@ -299,8 +301,7 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
     if (desc.flags & PoolFlag::CpuNoAccess) {
         stats.pools_device_local.fetch_add(1, std::memory_order_relaxed);
     }
-    const bool host_import_available =
-        options.allow_host_import && importer && importer->Available();
+    const bool host_import_available = HostImportEnabled();
     // Without host import, backing CPU-accessible pools in the background turns every untouched
     // texture pool into a gigabyte-scale device-local mirror; back them on demand instead.
     if (options.background_backing &&
@@ -459,9 +460,9 @@ void Context::Impl::EnsureBacking(Pool& pool) {
             try {
                 pool.buffer = CreateHostBuffer(pool.size, pool_usage, MemoryUsage::DeviceLocal,
                                                AllocationKind::PoolBuffer);
-                pool.mirror_pages.assign(
-                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE),
-                    Pool::MirrorPage{});
+                pool.InitMirrorPages(
+                    static_cast<size_t>((pool.size + Pool::MIRROR_PAGE - 1) / Pool::MIRROR_PAGE));
+                ++pool_generation;
                 if (!pool.split_runs.empty()) {
                     split_alias_generation.fetch_add(1, std::memory_order_release);
                 }
@@ -514,6 +515,9 @@ void Context::Impl::BackingMain() {
                 pool->released.load(std::memory_order_relaxed)) {
                 return true; // used (and backed) already, or destroyed
             }
+            if (!(pool->flags & PoolFlag::CpuNoAccess) && !HostImportEnabled()) {
+                return true; // wait until a draw, copy, or raw miss uses it
+            }
             // A pool inside a chunk imported since needs no buffer of its own.
             const u8* host = (pool->flags & PoolFlag::CpuNoAccess)
                                  ? nullptr
@@ -523,8 +527,7 @@ void Context::Impl::BackingMain() {
         if (skip()) {
             continue;
         }
-        if (!(pool->flags & PoolFlag::CpuNoAccess) && options.allow_host_import && importer &&
-            importer->Available()) {
+        if (!(pool->flags & PoolFlag::CpuNoAccess) && HostImportEnabled()) {
             // The pages of the chunk the import will cover get their host pages now, without
             // backing_mutex (the replay thread may build the raw global table meanwhile): see
             // HostImporter::MakeResident. The import below then finds them resident.
@@ -594,7 +597,7 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
             pool->host = host;
             std::string import_error = "not attempted";
             VkResult import_result = VK_NOT_READY;
-            if (host && options.allow_host_import && importer && importer->Available()) {
+            if (host && HostImportEnabled()) {
                 t = Clock::now();
                 import_result = ImportPoolBuffer(*pool, host, import_error);
                 ns_import = since(t);
@@ -605,6 +608,13 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                     return;
                 }
                 stats.host_import_failures.fetch_add(1, std::memory_order_relaxed);
+                if (import_result == VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR &&
+                    stats.pools_imported.load(std::memory_order_relaxed) == 0 &&
+                    !host_import_disabled.exchange(true, std::memory_order_acq_rel)) {
+                    LOG_WARNING(Render_Vulkan,
+                                "[nvn] host import failed with VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR; "
+                                "disabling host import and backing remaining CPU pools on demand");
+                }
                 LOG_WARNING(Render_Vulkan,
                             "[nvn] host import of pool {:#x} ({:#x} bytes) failed: {} ({}); using "
                             "a device-local mirror",
@@ -621,7 +631,7 @@ void Context::Impl::BackPoolLocked(Pool& pool_ref) {
                 // succeeds, defer allocating the full DeviceLocal mirror buffer until first buffer
                 // use (texture-only asset pools never need one).
                 if (raw_split_import.load(std::memory_order_relaxed)) {
-                    if (options.allow_host_import && importer && importer->Available()) {
+                    if (HostImportEnabled()) {
                         const auto split_begin = Clock::now();
                         if (ImportSplitRuns(*pool, split_error)) {
                             pool->backing = Pool::Backing::Mirror;
@@ -1408,8 +1418,7 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // The backing thread backs pools (and bumps the generation) only under this lock: the pools,
     // the chunks and the generation the table is built from are one consistent state.
     std::scoped_lock backing_lock{backing_mutex};
-    const bool host_import_available =
-        options.allow_host_import && importer && importer->Available();
+    const bool host_import_available = HostImportEnabled();
     const auto defer = [this, host_import_available](const Pool& pool) {
         return !host_import_available && !try_storage_vram &&
                !(pool.flags & PoolFlag::CpuNoAccess);
@@ -1500,6 +1509,19 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
             ++split_pools;
             continue;
         }
+        if (pool->backing == Pool::Backing::Mirror && pool->raw_mirror_enabled && pool->buffer &&
+            (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+            if (pool->device_address == 0) {
+                pool->device_address = device.GetLogical().GetBufferDeviceAddress(pool->Handle());
+            }
+            sources.push_back({pool->address, pool->device_address, pool->size, 1});
+            table.pool_serials.push_back(pool->serial);
+            table.pools.push_back(pool.get());
+            table.mirror_pools.push_back(pool.get());
+            ++own_pools;
+            own_bytes += pool->size;
+            continue;
+        }
         if (pool->backing == Pool::Backing::Mirror || pool->backing == Pool::Backing::None) {
             // A non-VRAM mirror pool's GPU copy is not the guest memory.
             ++skipped;
@@ -1571,8 +1593,11 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 table.pools.push_back(physical);
                 continue;
             }
+            const bool usable_raw_mirror =
+                physical->backing == Pool::Backing::Mirror && physical->raw_mirror_enabled &&
+                physical->buffer && (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0;
             if (physical->backing != Pool::Backing::Imported &&
-                physical->backing != Pool::Backing::DeviceLocal) {
+                physical->backing != Pool::Backing::DeviceLocal && !usable_raw_mirror) {
                 ++skipped;
                 continue;
             }
@@ -1584,6 +1609,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                                physical->device_address + run.physical_offset, run.size, 1});
             table.pool_serials.push_back(physical->serial);
             table.pools.push_back(physical);
+            if (usable_raw_mirror) {
+                table.mirror_pools.push_back(physical);
+            }
         }
         table.pool_serials.push_back(virtual_pool->serial);
         table.pools.push_back(virtual_pool);
@@ -1618,6 +1646,9 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
         }
     }
 
+    std::ranges::sort(table.mirror_pools);
+    const auto dup = std::ranges::unique(table.mirror_pools);
+    table.mirror_pools.erase(dup.begin(), dup.end());
     table.entries = FlattenRawGlobalRanges(std::move(sources));
     const size_t total_ranges = table.entries.size();
     table.device = UploadRawTable(table.entries);
@@ -1962,6 +1993,154 @@ const char* RawTableGapReason(const Pool& pool) {
 
 } // Anonymous namespace
 
+u32 Context::Impl::PromoteMissedRawPools(const VideoCommon::RawCoverageRing& window) {
+    u32 promoted = 0;
+    std::unordered_set<Pool*> visited;
+    for (const VideoCommon::RawCoverageMiss& miss : window.misses) {
+        if (miss.guest < VideoCommon::RAW_COVERAGE_NULL_LIMIT) {
+            continue;
+        }
+        auto it = pools_by_address.upper_bound(miss.guest);
+        if (it == pools_by_address.begin()) {
+            continue;
+        }
+        Pool& candidate = *std::prev(it)->second;
+        if (miss.guest - candidate.address >= candidate.size) {
+            continue;
+        }
+        Pool* target = &candidate;
+        if (candidate.IsVirtual()) {
+            const u64 offset = miss.guest - candidate.address;
+            const auto run_it = candidate.virtual_runs.upper_bound(offset);
+            if (run_it == candidate.virtual_runs.begin()) {
+                continue;
+            }
+            const auto& [run_offset, run] = *std::prev(run_it);
+            if (offset - run_offset >= run.size) {
+                continue;
+            }
+            const auto phys_it = pools.find(run.physical_serial);
+            if (phys_it == pools.end() || !phys_it->second) {
+                continue;
+            }
+            target = phys_it->second.get();
+        }
+        if (!visited.insert(target).second) {
+            continue;
+        }
+        if ((target->flags & (PoolFlag::CpuNoAccess | PoolFlag::GpuNoAccess)) != 0 ||
+            target->IsVirtual() || target->raw_mirror_enabled || target->raw_mirror_refused) {
+            continue;
+        }
+        if (!target->pending.load(std::memory_order_acquire) &&
+            (target->backing == Pool::Backing::Imported ||
+             target->backing == Pool::Backing::DeviceLocal || !target->split_runs.empty())) {
+            continue;
+        }
+        if (PromoteRawMirrorPool(*target, miss.guest)) {
+            ++promoted;
+        }
+    }
+    return promoted;
+}
+
+bool Context::Impl::PromoteRawMirrorPool(Pool& pool, u64 miss_address) {
+    EnsureBacking(pool);
+    if (pool.backing != Pool::Backing::Mirror || !pool.buffer || pool.mirror_pages.empty()) {
+        pool.raw_mirror_refused = true;
+        return false;
+    }
+    const bool tracked = TakePoolCpuWrites(pool);
+    std::vector<std::pair<u64, u64>> gpu_dirty;
+    {
+        std::scoped_lock lock{pool.dirty_mutex};
+        gpu_dirty.reserve(pool.gpu_dirty.size());
+        for (const Pool::Dirty& d : pool.gpu_dirty) {
+            gpu_dirty.emplace_back(d.begin, d.end);
+        }
+    }
+    const auto overlaps_gpu_dirty = [&](u64 begin, u64 end) {
+        return std::ranges::any_of(
+            gpu_dirty, [&](const auto& range) { return range.first < end && begin < range.second; });
+    };
+    std::vector<std::pair<u64, u64>> page_runs;
+    const u64 page_count = static_cast<u64>(pool.mirror_pages.size());
+    for (u64 p = 0; p < page_count; ++p) {
+        if (pool.mirror_pages[static_cast<size_t>(p)].valid) {
+            continue;
+        }
+        const u64 begin = p * Pool::MIRROR_PAGE;
+        const u64 end = (std::min)(begin + Pool::MIRROR_PAGE, pool.size);
+        if (overlaps_gpu_dirty(begin, end)) {
+            continue;
+        }
+        if (!page_runs.empty() && page_runs.back().second + 1 == p) {
+            page_runs.back().second = p;
+        } else {
+            page_runs.emplace_back(p, p);
+        }
+    }
+    if (!page_runs.empty()) {
+        std::vector<PoolUpload> uploads;
+        uploads.reserve(page_runs.size());
+        for (const auto& [first_p, last_p] : page_runs) {
+            if (tracked) {
+                ArmPoolMirrorPages(pool, first_p, last_p);
+            }
+            const u64 byte_begin = first_p * Pool::MIRROR_PAGE;
+            const u64 byte_end = (std::min)((last_p + 1) * Pool::MIRROR_PAGE, pool.size);
+            uploads.push_back({&pool, byte_begin, byte_end - byte_begin});
+        }
+        if (!UploadPoolRanges(uploads, true)) {
+            pool.raw_mirror_refused = true;
+            return false;
+        }
+        VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);
+        std::array<u8, Pool::MIRROR_PAGE> hash_scratch{};
+        for (const auto& [first_p, last_p] : page_runs) {
+            for (u64 p = first_p; p <= last_p; ++p) {
+                Pool::MirrorPage& mp = pool.mirror_pages[static_cast<size_t>(p)];
+                mp.valid = true;
+                mp.checked = 0;
+                mp.raw_epoch = mirror_raw_write_epoch;
+                if (tracked) {
+                    mp.hash_valid = false;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(p), true);
+                } else {
+                    const u64 page_begin = p * Pool::MIRROR_PAGE;
+                    const u64 page_len = (std::min)(Pool::MIRROR_PAGE, pool.size - page_begin);
+                    const u8* bytes = pool.host ? pool.host + page_begin
+                                                : GuestPointer(pool.address + page_begin, page_len);
+                    if (bytes == nullptr) {
+                        if (!memory || !memory->Read(pool.address + page_begin, hash_scratch.data(),
+                                                     page_len)) {
+                            mp.hash_valid = false;
+                            pool.SetMirrorPageTrusted(static_cast<size_t>(p), false);
+                            continue;
+                        }
+                        bytes = hash_scratch.data();
+                    }
+                    mp.hash = Common::CityHash64(reinterpret_cast<const char*>(bytes),
+                                                 static_cast<size_t>(page_len));
+                    mp.hash_valid = true;
+                    pool.SetMirrorPageTrusted(static_cast<size_t>(p), false);
+                }
+            }
+        }
+    }
+    pool.raw_mirror_enabled = true;
+    ++pool_generation;
+    ++raw_mirror_promoted_pools;
+    raw_mirror_promoted_bytes += pool.size;
+    LOG_INFO(Render_Vulkan,
+             "[nvn] raw global memory: promoted mirror pool {:#x} ({:.2f} MiB, flags {:#x}) on "
+             "raw miss at {:#x} (total promoted: {}, {:.1f} MiB)",
+             pool.address, static_cast<double>(pool.size) / 1048576.0, pool.flags, miss_address,
+             raw_mirror_promoted_pools,
+             static_cast<double>(raw_mirror_promoted_bytes) / 1048576.0);
+    return true;
+}
+
 u64 Context::Impl::RawCoverageRingFor(u64 seq) {
     if (!raw_coverage) {
         raw_coverage.emplace(device, *allocator, "hle");
@@ -1970,21 +2149,41 @@ u64 Context::Impl::RawCoverageRingFor(u64 seq) {
         return 0;
     }
     FlightCoverageQueue flights{completed_seq, seq};
-    if (const auto* const window = raw_coverage->Poll(std::chrono::steady_clock::now(), flights)) {
+    const bool demand_backing = !HostImportEnabled();
+    const auto now = std::chrono::steady_clock::now();
+    const bool force_swap =
+        demand_backing && raw_coverage->HasNonNullMisses() && now >= raw_miss_next_swap;
+    if (const auto* const window = raw_coverage->Poll(now, flights, force_swap)) {
         VideoCommon::ParseRawCoverageRing(window->bytes, raw_coverage_window);
-        // Classified against the table and the pools of now, up to a window after the accesses
-        // (an address the table holds by now is `late`).
-        std::vector<VideoCommon::RawGlobalRange> ranges;
-        ranges.reserve(raw_table.entries.size());
-        for (const RawGlobalRange& entry : raw_table.entries) {
-            ranges.push_back({entry.guest, entry.device, entry.size});
+        if (VideoCommon::RawCoverageEnabled()) {
+            // Classified against the table and the pools of now, up to a window after the
+            // accesses (an address the table holds by now is `late`).
+            std::vector<VideoCommon::RawGlobalRange> ranges;
+            ranges.reserve(raw_table.entries.size());
+            for (const RawGlobalRange& entry : raw_table.entries) {
+                ranges.push_back({entry.guest, entry.device, entry.size});
+            }
+            const auto classify = [&](u64 guest_address) {
+                return ClassifyHleRawMiss(guest_address, ranges, pools_by_address, pools);
+            };
+            for (const std::string& line : raw_coverage_report.AddWindow(
+                     raw_coverage_window, window->dispatches, window->seconds, classify)) {
+                LOG_INFO(HW_GPU, "{}", line);
+            }
         }
-        const auto classify = [&](u64 guest_address) {
-            return ClassifyHleRawMiss(guest_address, ranges, pools_by_address, pools);
-        };
-        for (const std::string& line : raw_coverage_report.AddWindow(
-                 raw_coverage_window, window->dispatches, window->seconds, classify)) {
-            LOG_INFO(HW_GPU, "{}", line);
+        if (demand_backing) {
+            const u32 promoted = PromoteMissedRawPools(raw_coverage_window);
+            if (promoted > 0) {
+                raw_miss_next_swap = std::chrono::steady_clock::time_point::min();
+            } else {
+                const bool had_non_null = std::ranges::any_of(
+                    raw_coverage_window.misses, [](const VideoCommon::RawCoverageMiss& miss) {
+                        return miss.guest >= VideoCommon::RAW_COVERAGE_NULL_LIMIT;
+                    });
+                if (had_non_null) {
+                    raw_miss_next_swap = now + std::chrono::milliseconds(250);
+                }
+            }
         }
         raw_coverage->Recycle();
     }

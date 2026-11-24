@@ -646,7 +646,7 @@ Context::Impl::~Impl() {
     // The raw coverage diagnostic's run summary; the GPU is idle, so the last, unfinished
     // window's misses can be counted. The rings go before the allocator they came from.
     if (raw_coverage) {
-        if (raw_coverage->Valid()) {
+        if (VideoCommon::RawCoverageEnabled() && raw_coverage->Valid()) {
             for (const std::string& line :
                  raw_coverage_report.Summary(raw_coverage->TailMisses(), true)) {
                 LOG_INFO(HW_GPU, "{}", line);
@@ -890,6 +890,19 @@ void Context::Impl::Dispatch(Command& command) {
                                  "MiB device budget; EDEN_NX2_NVN_STORAGE_BUDGET_MIB overrides)",
                                  impl.storage_cache_budget >> 20, device_budget >> 20);
                     }
+                }
+            }
+            if (impl.HostImportEnabled()) {
+                std::string probe_error;
+                VkResult probe_result = VK_SUCCESS;
+                if (!impl.importer->ProbeSharedMapping(impl.pool_usage, probe_error,
+                                                       probe_result) &&
+                    probe_result == VK_ERROR_INVALID_EXTERNAL_HANDLE_KHR) {
+                    impl.host_import_disabled.store(true, std::memory_order_release);
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] host import rejected for shared guest RAM ({}, {}); "
+                             "disabling host import and backing CPU pools on demand",
+                             probe_error, static_cast<int>(probe_result));
                 }
             }
             impl.draw_resources->OpenCache(c.title_id);

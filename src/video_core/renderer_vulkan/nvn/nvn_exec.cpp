@@ -516,6 +516,9 @@ public:
         // A raw pointer reaches any range of the table: no submit-time uniform copy of them.
         impl.uniform_snapshots.NoteRawWrite(impl.raw_table.generation, impl.raw_table.entries,
                                             flight.seq);
+        if (!impl.raw_table.mirror_pools.empty()) {
+            ++impl.mirror_raw_write_epoch;
+        }
     }
     void HostNoteShadowedWrite(const Pool& pool, u64 offset, u64 size) override {
         impl.NoteNonInlinePoolWrite(pool.address + offset, size, flight.seq);
@@ -1691,14 +1694,18 @@ bool Recorder::MirrorNeedsUpload(Pool& pool, u64 offset, u64 size) {
             continue;
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
-        if (page.valid && page.hash_valid) {
+        const bool hash_fresh =
+            page.hash_valid && (!pool.raw_mirror_enabled || !pool.split_runs.empty() || !tracked ||
+                                page.raw_epoch == impl.mirror_raw_write_epoch);
+        if (page.valid && hash_fresh) {
             if (settled) {
                 impl.ArmPoolMirrorPages(pool, index, index);
             }
             ++hashed;
             if (page.hash == GuestPageHash(pool, index)) {
                 page.checked = stamp;
-                page.raw_epoch = pool.split_raw_epoch_seen;
+                page.raw_epoch = pool.split_runs.empty() ? impl.mirror_raw_write_epoch
+                                                         : pool.split_raw_epoch_seen;
                 pool.SetMirrorPageTrusted(static_cast<size_t>(index), settled);
                 continue;
             }
@@ -1799,14 +1806,18 @@ bool Recorder::CollectMirrorUploadParts(Pool& pool, u64 offset, u64 size,
             continue; // UploadRange would discard this whole page while the GPU owns it.
         }
         const bool settled = tracked && coverage == MirrorWriteCoverage::None;
+        const bool hash_fresh =
+            page.hash_valid && (!pool.raw_mirror_enabled || !pool.split_runs.empty() || !tracked ||
+                                page.raw_epoch == impl.mirror_raw_write_epoch);
         ++hashed;
         const u64 hash = GuestPageHash(pool, index);
-        const bool changed = !page.valid || !page.hash_valid || page.hash != hash;
+        const bool changed = !page.valid || !hash_fresh || page.hash != hash;
         page.hash = hash;
         page.hash_valid = true;
         page.valid = true;
         page.checked = stamp;
-        page.raw_epoch = pool.split_raw_epoch_seen;
+        page.raw_epoch =
+            pool.split_runs.empty() ? impl.mirror_raw_write_epoch : pool.split_raw_epoch_seen;
         pool.SetMirrorPageTrusted(static_cast<size_t>(index), settled);
         if (!changed) {
             continue;

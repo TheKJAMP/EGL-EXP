@@ -267,6 +267,10 @@ struct Pool {
     std::unique_ptr<PoolMirror> vram_mirror;
     /// A VRAM mirror was refused (budget, allocation, no CPU write tracking): not tried again.
     bool vram_mirror_refused{false};
+    /// Non-host-import devices: this Mirror pool was promoted into `RawGlobalMemoryTable` after a
+    /// shader dereferenced a guest address inside it.
+    bool raw_mirror_enabled{false};
+    bool raw_mirror_refused{false};
     /// Virtual pools: runs by virtual offset, never overlapping.
     std::map<u64, VirtualRun> virtual_runs;
     /// Mirror pools whose guest storage is several host runs (knob raw_split_import): each run
@@ -804,6 +808,11 @@ struct Context::Impl {
     std::optional<VkExtent2D> upscaler_fsr_extent;
     std::optional<VkExtent2D> final_fsr_extent;
     std::optional<HostImporter> importer;
+    std::atomic<bool> host_import_disabled{false};
+    [[nodiscard]] bool HostImportEnabled() const noexcept {
+        return options.allow_host_import && importer && importer->Available() &&
+               !host_import_disabled.load(std::memory_order_acquire);
+    }
     bool dlss_depth_missing_logged{};
     /// The image DLSS writes for one game network (Streamline viewport) before it is copied into
     /// the game's output rectangle. Replay thread only.
@@ -1128,6 +1137,8 @@ struct Context::Impl {
         /// retains them; chunks live as long as the context).
         std::vector<u64> pool_serials;
         std::vector<Pool*> pools;
+        /// Non-split Mirror pools exposed in `entries`; synced on CPU writes when raw shaders run.
+        std::vector<Pool*> mirror_pools;
         /// An imported pool: GPU writes through the table are host-visible there.
         Pool* imported_pool{nullptr};
     } raw_table;
@@ -1169,9 +1180,21 @@ struct Context::Impl {
     std::optional<::Vulkan::RawCoverageRings> raw_coverage;
     VideoCommon::RawCoverageReport raw_coverage_report{"hle"};
     VideoCommon::RawCoverageRing raw_coverage_window;
+    /// Bumped when raw-writing draws/dispatches record without host import so promoted mirror
+    /// pages whose CPU contents are later rehashed re-upload over stale guest baselines.
+    u64 mirror_raw_write_epoch{0};
+    std::chrono::steady_clock::time_point raw_miss_next_swap{
+        std::chrono::steady_clock::time_point::min()};
+    u64 raw_mirror_promoted_pools{0};
+    u64 raw_mirror_promoted_bytes{0};
+    /// Replay thread: promotes any non-host-imported CPU-accessible pools referenced by a finished
+    /// raw miss window and returns the number of newly promoted pools.
+    [[nodiscard]] u32 PromoteMissedRawPools(const VideoCommon::RawCoverageRing& window);
+    [[nodiscard]] bool PromoteRawMirrorPool(Pool& pool, u64 miss_address);
     /// Replay thread, for a draw or dispatch of the flight `seq` that uses the raw table: logs a
-    /// finished window, returns the device address of the ring the draw reports into (0 when the
-    /// rings are unavailable). Every segment that used a ring must end with a host barrier.
+    /// finished window (or promotes missed pools when host import is disabled), returns the device
+    /// address of the ring the draw reports into (0 when the rings are unavailable). Every segment
+    /// that used a ring must end with a host barrier.
     [[nodiscard]] u64 RawCoverageRingFor(u64 seq);
     std::unordered_map<u64, std::shared_ptr<Texture>> textures;
     std::unordered_map<u64, VC::SamplerDesc> samplers;
