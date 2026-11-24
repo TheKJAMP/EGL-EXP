@@ -1357,6 +1357,7 @@ struct Context::Impl {
     u64 storage_cache_budget{0};
     u64 trim_floor_bytes{0};
     u64 trim_next_present{0};
+    u64 trim_hard_next_present{0};
     /// EDEN_NX2_NVN_TRIM_LEGACY: only the over-budget pass at image creation, without the age and
     /// device budget rules or the passes at presents.
     bool trim_legacy{false};

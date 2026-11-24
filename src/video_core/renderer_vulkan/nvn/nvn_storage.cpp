@@ -1599,6 +1599,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // A pass walks the whole cache: it runs when the cache has grown since the last one or after
     // a few presents, not at every storage created.
     constexpr u64 PASS_INTERVAL_PRESENTS = 120;
+    constexpr u64 HARD_PRESSURE_INTERVAL_PRESENTS = 2;
     // Superseded-storage tests per pass (each scans the storages over the tested one's bytes).
     constexpr size_t MAX_SUPERSEDED_TESTS = 1024;
     const u64 presents = stats.presents.load(std::memory_order_relaxed);
@@ -1613,7 +1614,18 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         // device-local allocations over the budget (EDEN_NX2_TRY_VMA_DEVICE_STRICT) bring it
         // forward: the driver pages until the cache sheds what it can rebuild.
         const u64 strict_over_budget = spills.over_budget_count.load(std::memory_order_relaxed);
-        if (presents < trim_next_present && strict_over_budget == trim_seen_over_budget) {
+        bool hard_pressure_due = false;
+        if (mario_kart_world && presents >= trim_hard_next_present) {
+            const u64 budget = device.GetDeviceMemoryBudget();
+            if (budget != 0 &&
+                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() > budget) {
+                hard_pressure_due = true;
+            } else {
+                trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
+            }
+        }
+        if (presents < trim_next_present && strict_over_budget == trim_seen_over_budget &&
+            !hard_pressure_due) {
             return;
         }
         trim_seen_over_budget = strict_over_budget;
@@ -1870,6 +1882,9 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     trim_next_present =
         presents + (soft_pressure_incomplete ? SOFT_PRESSURE_INTERVAL_PRESENTS
                                              : PASS_INTERVAL_PRESENTS);
+    if (hard_pressure) {
+        trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
+    }
     stats.storage_cache_bytes.store(storage_cache_bytes, std::memory_order_relaxed);
 }
 
