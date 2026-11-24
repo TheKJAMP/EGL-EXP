@@ -2876,6 +2876,9 @@ void Recorder::UploadStorage(Storage& s) {
              track_pool != nullptr);
         if (resolved && (track_pool->flags & PoolFlag::CpuNoAccess) == 0 &&
             impl.TakePoolCpuWrites(*track_pool)) {
+            const u64 first_page = track_offset / Pool::MIRROR_PAGE;
+            const u64 last_page = (track_offset + size - 1) / Pool::MIRROR_PAGE;
+            impl.ArmPoolMirrorPages(*track_pool, first_page, last_page);
             upload_tracked_pool = track_pool->serial;
             upload_tracked_gen = track_pool->cpu_write_gen;
         }
@@ -3126,6 +3129,9 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
                                              SPARSE_TILE_BYTES, phys, phys_offset) &&
                     phys != nullptr && (phys->flags & PoolFlag::CpuNoAccess) == 0 &&
                     impl.TakePoolCpuWrites(*phys)) {
+                    const u64 first_page = phys_offset / Pool::MIRROR_PAGE;
+                    const u64 last_page = (phys_offset + SPARSE_TILE_BYTES - 1) / Pool::MIRROR_PAGE;
+                    impl.ArmPoolMirrorPages(*phys, first_page, last_page);
                     tile_pools[i] = phys->serial;
                     tile_gens[i] = phys->cpu_write_gen;
                 }

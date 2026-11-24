@@ -617,6 +617,101 @@ bool AllTexels(const std::vector<u8>& texels, u8 r, u8 g, u8 b, u8 a) {
     return !texels.empty();
 }
 
+/// GuestMemory with lazy page-tracking callbacks (Arm / DisarmWritten / WriteEpoch), modeling
+/// how PageTracker traps CPU writes only on pages explicitly armed by the replay.
+class TrackedMemory final : public VC::GuestMemory {
+public:
+    explicit TrackedMemory(FakeMemory& inner_) : inner{inner_} {}
+    bool Read(u64 va, void* dst, size_t size) override {
+        return inner.Read(va, dst, size);
+    }
+    bool Write(u64 va, const void* src, size_t size) override {
+        return inner.Write(va, src, size);
+    }
+    u8* Pointer(u64 va) override {
+        return inner.Pointer(va);
+    }
+    u64 Track(u64 va, u64 size) override {
+        static_cast<void>(va);
+        static_cast<void>(size);
+        tracked = true;
+        return 1;
+    }
+    void Arm(u64 id, u64 va, u64 size) override {
+        static_cast<void>(id);
+        ++arm_calls;
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            armed_pages.insert(page);
+            dirty_pages.erase(page);
+        }
+    }
+    void TakeWritten(u64 id, u64 va, u64 size,
+                     std::vector<std::pair<u64, u64>>& runs) override {
+        static_cast<void>(id);
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            if (dirty_pages.erase(page) == 0) {
+                continue;
+            }
+            const u64 page_va = page << 12;
+            if (!runs.empty() && runs.back().second == page_va) {
+                runs.back().second += 4096;
+            } else {
+                runs.emplace_back(page_va, page_va + 4096);
+            }
+        }
+    }
+    bool SupportsDisarmWritten() const override {
+        return true;
+    }
+    void DisarmWritten(u64 id, u64 va, u64 size,
+                       std::vector<std::pair<u64, u64>>& runs) override {
+        static_cast<void>(id);
+        for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
+            if (dirty_pages.erase(page) == 0) {
+                continue;
+            }
+            armed_pages.erase(page);
+            const u64 page_va = page << 12;
+            if (!runs.empty() && runs.back().second == page_va) {
+                runs.back().second += 4096;
+            } else {
+                runs.emplace_back(page_va, page_va + 4096);
+            }
+        }
+    }
+    std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
+        static_cast<void>(id);
+        return epoch;
+    }
+    void CpuWriteBytes(u64 va, const void* src, size_t size) {
+        REQUIRE(inner.Write(va, src, size));
+        if (!tracked || size == 0) {
+            return;
+        }
+        const u64 first_page = va >> 12;
+        const u64 last_page = (va + size - 1) >> 12;
+        bool any_dirty = false;
+        for (u64 page = first_page; page <= last_page; ++page) {
+            if (armed_pages.contains(page) && dirty_pages.insert(page).second) {
+                any_dirty = true;
+            }
+        }
+        if (any_dirty) {
+            epoch->fetch_add(1, std::memory_order_release);
+        }
+    }
+    void CpuWrite(u64 va, u32 value) {
+        CpuWriteBytes(va, &value, sizeof(value));
+    }
+
+    FakeMemory& inner;
+    bool tracked{false};
+    size_t arm_calls{0};
+    std::unordered_set<u64> armed_pages;
+    std::unordered_set<u64> dirty_pages;
+    std::shared_ptr<std::atomic<u64>> epoch{std::make_shared<std::atomic<u64>>(0)};
+};
+
 } // Anonymous namespace
 
 TEST_CASE("nvn memory: CPU writes to a texture's pool reach the image", "[nvn]") {
@@ -2573,86 +2668,6 @@ TEST_CASE("NVN mirror pools retain partial-page GPU writes, trust full-page writ
     }
 
     SECTION("full-page GPU write stays trusted on tracked mirror until guest CPU writes") {
-        class TrackedMemory final : public VC::GuestMemory {
-        public:
-            explicit TrackedMemory(FakeMemory& inner_) : inner{inner_} {}
-            bool Read(u64 va, void* dst, size_t size) override {
-                return inner.Read(va, dst, size);
-            }
-            bool Write(u64 va, const void* src, size_t size) override {
-                return inner.Write(va, src, size);
-            }
-            u8* Pointer(u64 va) override {
-                return inner.Pointer(va);
-            }
-            u64 Track(u64 va, u64 size) override {
-                static_cast<void>(va);
-                static_cast<void>(size);
-                tracked = true;
-                return 1;
-            }
-            void Arm(u64 id, u64 va, u64 size) override {
-                static_cast<void>(id);
-                ++arm_calls;
-                for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
-                    armed_pages.insert(page);
-                    dirty_pages.erase(page);
-                }
-            }
-            void TakeWritten(u64 id, u64 va, u64 size,
-                             std::vector<std::pair<u64, u64>>& runs) override {
-                static_cast<void>(id);
-                for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
-                    if (dirty_pages.erase(page) == 0) {
-                        continue;
-                    }
-                    const u64 page_va = page << 12;
-                    if (!runs.empty() && runs.back().second == page_va) {
-                        runs.back().second += 4096;
-                    } else {
-                        runs.emplace_back(page_va, page_va + 4096);
-                    }
-                }
-            }
-            bool SupportsDisarmWritten() const override {
-                return true;
-            }
-            void DisarmWritten(u64 id, u64 va, u64 size,
-                               std::vector<std::pair<u64, u64>>& runs) override {
-                static_cast<void>(id);
-                for (u64 page = va >> 12; page < (va + size + 0xFFF) >> 12; ++page) {
-                    if (dirty_pages.erase(page) == 0) {
-                        continue;
-                    }
-                    armed_pages.erase(page);
-                    const u64 page_va = page << 12;
-                    if (!runs.empty() && runs.back().second == page_va) {
-                        runs.back().second += 4096;
-                    } else {
-                        runs.emplace_back(page_va, page_va + 4096);
-                    }
-                }
-            }
-            std::shared_ptr<const std::atomic<u64>> WriteEpoch(u64 id) override {
-                static_cast<void>(id);
-                return epoch;
-            }
-            void CpuWrite(u64 va, u32 value) {
-                REQUIRE(inner.Write(va, &value, sizeof(value)));
-                const u64 page = va >> 12;
-                if (tracked && armed_pages.contains(page) && dirty_pages.insert(page).second) {
-                    epoch->fetch_add(1, std::memory_order_release);
-                }
-            }
-
-            FakeMemory& inner;
-            bool tracked{false};
-            size_t arm_calls{0};
-            std::unordered_set<u64> armed_pages;
-            std::unordered_set<u64> dirty_pages;
-            std::shared_ptr<std::atomic<u64>> epoch{std::make_shared<std::atomic<u64>>(0)};
-        };
-
         constexpr u64 POOL_VA = 0x2000'0000;
         FakeMemory backing;
         u8* data = backing.Add(POOL_VA, 16_KiB);
@@ -2806,6 +2821,78 @@ TEST_CASE("NVN mirror pools retain partial-page GPU writes, trust full-page writ
         CHECK(data[0x3000 + 0] == 0);
         CHECK(data[0x3000 + 2] == 0);
     }
+}
+
+TEST_CASE("nvn memory: initial texture upload arms lazy tracked pages for later CPU writes",
+          "[nvn]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    constexpr u64 TEX_POOL_VA = 0x1000'0000;
+    constexpr u64 READ_POOL_VA = 0x2000'0000;
+    constexpr u32 SIZE = 64; // 64x64 RGBA8 = 16 KiB (4 tracked pages)
+
+    FakeMemory backing;
+    u8* tex_mem = backing.Add(TEX_POOL_VA, 64_KiB);
+    u8* read_mem = backing.Add(READ_POOL_VA, 64_KiB);
+    TrackedMemory tracked{backing};
+    Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                         {.allow_host_import = false,
+                          .background_backing = false,
+                          .flush_tracked = true,
+                          .mirror_hash_tracked = true});
+    context.SetGuestMemory(&tracked);
+    context.CreatePool(
+        {.serial = 1, .guest_address = TEX_POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 2, .guest_address = READ_POOL_VA, .size = 64_KiB, .flags = POOL_CPU_CACHED});
+    context.CreateTexture(MakeTexture(10, 1, 0, NVN_FORMAT_RGBA8, SIZE, SIZE));
+
+    Nvn::Storage reference = MakeStorage(NVN_FORMAT_RGBA8, SIZE, SIZE, 1, PixelFormat::A8B8G8R8_UNORM,
+                                         VK_FORMAT_A8B8G8R8_UNORM_PACK32);
+    const std::vector<u8> initial_texels = Gradient(SIZE, SIZE, 1);
+    const std::vector<u8> initial_guest = SwizzleLevel0(reference, initial_texels, 4, SIZE, SIZE);
+    std::memcpy(tex_mem, initial_guest.data(), initial_guest.size());
+
+    u64 seq = 0;
+    const auto read_back = [&](u64 dst_va) {
+        std::memset(read_mem + (dst_va - READ_POOL_VA), 0xCD, SIZE * SIZE * 4);
+        std::vector<u64> list;
+        Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(dst_va, 10, SIZE, SIZE));
+        Run(context, seq, std::move(list));
+        return std::vector<u8>(read_mem + (dst_va - READ_POOL_VA),
+                               read_mem + (dst_va - READ_POOL_VA) + SIZE * SIZE * 4);
+    };
+
+    REQUIRE(read_back(READ_POOL_VA) == initial_texels);
+    for (u64 page = 0; page < 4; ++page) {
+        CHECK(tracked.armed_pages.contains((TEX_POOL_VA >> 12) + page));
+    }
+
+    // Mutate only page 2 directly as the guest CPU would, then issue NotifyCpuWrite without
+    // forcing a full rehash so detection relies on the initial upload having armed page 2.
+    const std::vector<u8> updated_texels = Gradient(SIZE, SIZE, 2);
+    const std::vector<u8> updated_guest = SwizzleLevel0(reference, updated_texels, 4, SIZE, SIZE);
+    constexpr u64 PAGE2_OFFSET = 2 * 4096;
+    constexpr u64 PATCH_SIZE = 256;
+    tracked.CpuWriteBytes(TEX_POOL_VA + PAGE2_OFFSET, updated_guest.data() + PAGE2_OFFSET,
+                          PATCH_SIZE);
+    context.NotifyCpuWrite(TEX_POOL_VA + PAGE2_OFFSET, PATCH_SIZE);
+
+    std::vector<u8> expected_texels(SIZE * SIZE * 4);
+    std::vector<u8> patched_guest = initial_guest;
+    std::memcpy(patched_guest.data() + PAGE2_OFFSET, updated_guest.data() + PAGE2_OFFSET,
+                PATCH_SIZE);
+    u32 tile_h = 0;
+    u32 tile_d = 0;
+    Nvn::TextureLevelTiles(reference.desc, 0, tile_h, tile_d);
+    Tegra::Texture::UnswizzleTexture(expected_texels, patched_guest, 4, SIZE, SIZE, 1, tile_h,
+                                     tile_d, 0, true);
+
+    REQUIRE(read_back(READ_POOL_VA + 16_KiB) == expected_texels);
+    CHECK(context.Stats().cpu_changes >= 1);
+    CHECK(context.Stats().ops_failed == 0);
 }
 
 TEST_CASE("Pool::MirrorRangeAllTrusted tracks trusted bitset across word boundaries",

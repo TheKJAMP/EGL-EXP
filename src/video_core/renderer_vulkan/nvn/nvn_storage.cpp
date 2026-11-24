@@ -1216,6 +1216,9 @@ void Context::Impl::VerifySparse(Storage& s) {
                 sparse.SetTileVerifiedGen(id, phys->serial, before_gen);
                 continue;
             }
+            const u64 first_page = phys_offset / Pool::MIRROR_PAGE;
+            const u64 last_page = (phys_offset + SPARSE_TILE_BYTES - 1) / Pool::MIRROR_PAGE;
+            ArmPoolMirrorPages(*phys, first_page, last_page);
         }
         ++hashed;
         ++sparse_verify_count;
