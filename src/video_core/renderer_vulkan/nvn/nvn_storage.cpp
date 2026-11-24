@@ -1650,8 +1650,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     }
     constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
     constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
-    const bool soft_pressure_capped =
-        mario_kart_world && trim_device_excess != 0 && !hard_pressure;
+    const bool soft_pressure_capped = trim_device_excess != 0 && !hard_pressure;
     size_t pressure_ops = 0;
     const u64 budget_target = storage_cache_budget / 10 * 9;
     u64 target = over_budget ? budget_target : storage_cache_bytes;
@@ -1792,7 +1791,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         std::vector<Candidate> demotable;
         for (const auto& [key, storage] : storage_cache) {
             if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
-                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq) {
+                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq ||
+                storage->bindless_tracked_count != 0) {
                 continue;
             }
             if (presents >= storage->last_used_present &&
