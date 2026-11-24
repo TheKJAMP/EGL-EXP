@@ -848,47 +848,64 @@ bool Context::Impl::MkwBc3AtlasSupported() {
     if (mkw_bc3_atlas_supported) {
         return *mkw_bc3_atlas_supported;
     }
-    bool supported = astc_standin != AstcStandin::Rgba8 &&
-                     device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
-                     device.CanUseUnbackedSparseImages();
-    for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
-        if (!supported) {
-            break;
+    const bool sparse_device = device.IsSparseResidencyImageSupported(VK_IMAGE_TYPE_2D) &&
+                               device.CanUseUnbackedSparseImages();
+    bool supported = astc_standin != AstcStandin::Rgba8;
+    if (supported && sparse_device) {
+        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+            if (!supported) {
+                break;
+            }
+            auto image = allocator->CreateUnbackedImage({
+                .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+                .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
+                .imageType = VK_IMAGE_TYPE_2D,
+                .format = format,
+                .extent = {8192, 8192, 1},
+                .mipLevels = 14,
+                .arrayLayers = 68,
+                .samples = VK_SAMPLE_COUNT_1_BIT,
+                .tiling = VK_IMAGE_TILING_OPTIMAL,
+                .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
+                         VK_IMAGE_USAGE_SAMPLED_BIT,
+                .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+                .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
+            });
+            supported = static_cast<bool>(image);
+            if (image) {
+                const auto requirements =
+                    device.GetLogical().GetImageSparseMemoryRequirements(*image);
+                const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
+                supported =
+                    memory.alignment == SPARSE_TILE_BYTES &&
+                    std::ranges::any_of(requirements, [](const auto& requirement) {
+                        const auto& props = requirement.formatProperties;
+                        return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
+                               props.imageGranularity.width == 256 &&
+                               props.imageGranularity.height == 256 &&
+                               props.imageGranularity.depth == 1 &&
+                               !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
+                    });
+            }
         }
-        auto image = allocator->CreateUnbackedImage({
-            .sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
-            .flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT,
-            .imageType = VK_IMAGE_TYPE_2D,
-            .format = format,
-            .extent = {8192, 8192, 1},
-            .mipLevels = 14,
-            .arrayLayers = 68,
-            .samples = VK_SAMPLE_COUNT_1_BIT,
-            .tiling = VK_IMAGE_TILING_OPTIMAL,
-            .usage = VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT |
-                     VK_IMAGE_USAGE_SAMPLED_BIT,
-            .sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-            .initialLayout = VK_IMAGE_LAYOUT_UNDEFINED,
-        });
-        supported = static_cast<bool>(image);
-        if (image) {
-            const auto requirements = device.GetLogical().GetImageSparseMemoryRequirements(*image);
-            const auto memory = device.GetLogical().GetImageMemoryRequirements(*image);
-            supported = memory.alignment == SPARSE_TILE_BYTES &&
-                        std::ranges::any_of(requirements, [](const auto& requirement) {
-                            const auto& props = requirement.formatProperties;
-                            return props.aspectMask == VK_IMAGE_ASPECT_COLOR_BIT &&
-                                   props.imageGranularity.width == 256 &&
-                                   props.imageGranularity.height == 256 &&
-                                   props.imageGranularity.depth == 1 &&
-                                   !(props.flags & VK_SPARSE_IMAGE_FORMAT_SINGLE_MIPTAIL_BIT);
-                        });
+    } else if (supported) {
+        constexpr VkFormatFeatureFlags FEATURES = VK_FORMAT_FEATURE_SAMPLED_IMAGE_BIT |
+                                                  VK_FORMAT_FEATURE_TRANSFER_SRC_BIT |
+                                                  VK_FORMAT_FEATURE_TRANSFER_DST_BIT;
+        for (VkFormat format : {VK_FORMAT_BC3_UNORM_BLOCK, VK_FORMAT_BC3_SRGB_BLOCK}) {
+            if (!device.IsFormatSupported(format, FEATURES, FormatType::Optimal)) {
+                supported = false;
+                break;
+            }
         }
     }
     mkw_bc3_atlas_supported = supported;
-    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: sparse ASTC 8x8 atlas backing {}",
-             supported ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
-                       : "RGBA8 (BC3 sparse format/usage unavailable or recompression disabled)");
+    LOG_INFO(Render_Vulkan, "[nvn] Mario Kart World: ASTC 8x8 {} backing {}",
+             sparse_device ? "sparse atlas" : "non-sparse",
+             supported ? (sparse_device
+                              ? "BC3 (one quarter of RGBA8 backing, full guest dimensions)"
+                              : "BC3 (one quarter of RGBA8 backing, optimal tiling)")
+                       : "RGBA8 (BC3 format/usage unavailable or recompression disabled)");
     return supported;
 }
 

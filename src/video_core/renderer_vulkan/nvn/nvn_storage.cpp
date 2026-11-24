@@ -873,6 +873,9 @@ bool Context::Impl::EnsureImage(Storage& s) {
     NoteBindlessStorageChanged(s);
     s.last_used_present = stats.presents.load(std::memory_order_relaxed);
     stats.storages_created.fetch_add(1, std::memory_order_relaxed);
+    if (!s.sparse && s.image && s.image.IsUnbacked()) {
+        s.vram_bytes = 0;
+    }
     if (s.cached) {
         storage_cache_bytes += s.vram_bytes;
         TrimStorageCache();
@@ -1786,8 +1789,9 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         const u64 done_seq = completed_seq.load(std::memory_order_acquire);
         constexpr u64 DEMOTE_KEEP_PRESENTS_PRESSURE = 60;
         constexpr u64 DEMOTE_KEEP_PRESENTS_BUDGET = 180;
-        const u64 demote_keep =
-            trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE : DEMOTE_KEEP_PRESENTS_BUDGET;
+        const u64 demote_keep = hard_pressure           ? PRESSURE_KEEP_PRESENTS
+                              : trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE
+                                                        : DEMOTE_KEEP_PRESENTS_BUDGET;
         std::vector<Candidate> demotable;
         for (const auto& [key, storage] : storage_cache) {
             if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
