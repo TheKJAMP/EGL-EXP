@@ -881,7 +881,8 @@ void Context::Impl::Dispatch(Command& command) {
                 Debug::Get().storage_budget_bytes == 0) {
                 if (const u64 device_budget = impl.device.GetDeviceMemoryBudget();
                     device_budget != 0) {
-                    const u64 scaled = (std::max)(device_budget / 10 * 6, u64{1024} << 20);
+                    const u64 scaled =
+                        (std::max)(device_budget / 10 * 6, (std::min)(device_budget, u64{4096} << 20));
                     if (scaled != impl.storage_cache_budget) {
                         impl.storage_cache_budget = scaled;
                         LOG_INFO(Render_Vulkan,

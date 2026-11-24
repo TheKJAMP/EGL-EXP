@@ -1618,7 +1618,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         if (mario_kart_world && presents >= trim_hard_next_present) {
             const u64 budget = device.GetDeviceMemoryBudget();
             if (budget != 0 &&
-                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() > budget) {
+                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() >
+                    budget + budget / 4) {
                 hard_pressure_due = true;
             } else {
                 trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
@@ -1648,7 +1649,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         const u64 pressure_threshold = mario_kart_world
                                            ? device_budget - (device_budget * 15) / 100
                                            : device_budget - device_budget / 10;
-        hard_pressure = mario_kart_world && device_used > device_budget;
+        hard_pressure = mario_kart_world && device_used > device_budget + device_budget / 4;
         if (device_used > pressure_threshold) {
             trim_device_excess = device_used - pressure_threshold;
             if (count_pass &&
@@ -1673,13 +1674,22 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         }
         refresh_pressure(false);
     }
+    const bool emergency_pressure =
+        hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 2;
     constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
     constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
     const bool soft_pressure_capped = trim_device_excess != 0 && !hard_pressure;
     size_t pressure_ops = 0;
     const u64 budget_target = storage_cache_budget / 10 * 9;
     u64 target = over_budget ? budget_target : storage_cache_bytes;
-    if (trim_device_excess != 0) {
+    if (hard_pressure) {
+        const u64 hard_target_device = device_budget + device_budget / 4;
+        const u64 hard_excess = device_used > hard_target_device ? device_used - hard_target_device : 0;
+        const u64 shed = hard_excess + device_budget / 16;
+        const u64 min_target = emergency_pressure ? device_budget / 4 : device_budget / 2;
+        target = (std::min)(
+            target, (std::max)(min_target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed)));
+    } else if (trim_device_excess != 0) {
         // The excess and a margin, so that the next pass does not find the device over at once.
         const u64 shed = trim_device_excess + device_budget / 32;
         target = (std::min)(target, storage_cache_bytes - (std::min)(storage_cache_bytes, shed));
@@ -1806,15 +1816,15 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // If live CPU-sourced (guest memory) textures keep the cache over target (e.g., MKW keeping
     // thousands of Texture objects registered), demote the oldest idle images at present boundaries
     // while keeping the Storage entry intact so EnsureImage can rebuild them on future use.
-    if ((at_present || hard_pressure) && storage_cache_bytes > target &&
+    if ((at_present || emergency_pressure) && storage_cache_bytes > target &&
         !(soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
         const u64 done_seq = completed_seq.load(std::memory_order_acquire);
         constexpr u64 DEMOTE_KEEP_PRESENTS_PRESSURE = 60;
         constexpr u64 DEMOTE_KEEP_PRESENTS_BUDGET = 180;
-        const bool extreme_pressure =
-            hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 4;
-        const u64 demote_keep = extreme_pressure        ? u64{1}
-                              : hard_pressure           ? PRESSURE_KEEP_PRESENTS
+        constexpr size_t MAX_MIDFRAME_DEMOTE_OPS = 32;
+        const bool midframe_demote = !at_present && emergency_pressure;
+        size_t demote_ops = 0;
+        const u64 demote_keep = hard_pressure           ? PRESSURE_KEEP_PRESENTS
                               : trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE
                                                         : DEMOTE_KEEP_PRESENTS_BUDGET;
         std::vector<Candidate> demotable;
@@ -1832,7 +1842,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         std::sort(demotable.begin(), demotable.end(), by_age);
         for (const Candidate& candidate : demotable) {
             if (storage_cache_bytes <= target ||
-                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) ||
+                (midframe_demote && demote_ops >= MAX_MIDFRAME_DEMOTE_OPS)) {
                 break;
             }
             const auto it = storage_cache.find(candidate.key);
@@ -1871,6 +1882,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             storage_cache_bytes -= (std::min)(storage_cache_bytes, s.vram_bytes);
             stats.storages_evicted.fetch_add(1, std::memory_order_relaxed);
             ++pressure_ops;
+            ++demote_ops;
         }
     }
     // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing

@@ -38,11 +38,32 @@ constexpr u32 TEXTURE_BINDINGS = Shader::BINDLESS_BINDING_COUNT - 1;
                : VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
 }
 
-[[nodiscard]] bool NeedsBindlessPrime(const Storage& s) noexcept {
+[[nodiscard]] bool NeedsBindlessPrime(const Context::Impl& impl, const Storage& s) noexcept {
+    if (s.image || s.image_failed || s.samples != VK_SAMPLE_COUNT_1_BIT ||
+        s.scale_owner != nullptr) {
+        return false;
+    }
     constexpr VkImageUsageFlags attachment = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
                                              VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
-    return !s.image && !s.image_failed && (s.usage & attachment) == 0 &&
-           s.samples == VK_SAMPLE_COUNT_1_BIT && s.scale_owner == nullptr;
+    if ((s.usage & attachment) == 0) {
+        return true;
+    }
+    // Every uncompressed format gets COLOR_ATTACHMENT_BIT in BuildTexture. Prime small
+    // CPU-authored uncompressed bindless textures (LUTs, 3D light grids, irradiance cubemaps) when
+    // their storage lacks explicit display/compressible/linear render-target flags and lives in a
+    // CPU-readable non-virtual pool.
+    constexpr s32 RT_HINT_FLAGS =
+        0x01 /* Display */ | TexFlag::Compressible | TexFlag::LinearRenderTarget;
+    if ((s.usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0 ||
+        (s.desc.flags & RT_HINT_FLAGS) != 0 || s.vram_bytes > (u64{16} << 20)) {
+        return false;
+    }
+    const auto pool_it = impl.pools.find(s.pool_serial);
+    if (pool_it == impl.pools.end() || !pool_it->second) {
+        return false;
+    }
+    const Pool& pool = *pool_it->second;
+    return !pool.IsVirtual() && (pool.flags & PoolFlag::CpuNoAccess) == 0;
 }
 
 template <typename Key, typename SlotListT>
@@ -475,7 +496,7 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         }
         BindlessAttachEntry(state, id, serial, texture_node, storage_sp, image_gen, format, layout,
                             ready, any);
-        if (storage_sp && NeedsBindlessPrime(*storage_sp) && !state.unprimed_queued[id]) {
+        if (storage_sp && NeedsBindlessPrime(impl, *storage_sp) && !state.unprimed_queued[id]) {
             state.unprimed_queued[id] = 1;
             state.unprimed_slots.push_back(id);
         }
@@ -541,16 +562,49 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         }
         u32 cube = 0;
         u32 d2 = 0;
+        u32 d3 = 0;
+        u32 d2_array = 0;
+        u32 cube_array = 0;
+        u32 unprimed_cpu_no_access = 0;
+        u32 unprimed_rt_flag = 0;
+        u32 unprimed_other = 0;
+        const u32 cube_binding = Shader::BindlessTextureBinding(Shader::TextureType::ColorCube, 0);
+        const u32 d2_binding = Shader::BindlessTextureBinding(Shader::TextureType::Color2D, 0);
+        const u32 d3_binding = Shader::BindlessTextureBinding(Shader::TextureType::Color3D, 0);
+        const u32 d2a_binding =
+            Shader::BindlessTextureBinding(Shader::TextureType::ColorArray2D, 0);
+        const u32 ca_binding =
+            Shader::BindlessTextureBinding(Shader::TextureType::ColorArrayCube, 0);
+        constexpr s32 RT_HINT_FLAGS =
+            0x01 /* Display */ | TexFlag::Compressible | TexFlag::LinearRenderTarget;
         for (u32 id = 0; id < state.synced_count; ++id) {
-            const u32 cube_binding = Shader::BindlessTextureBinding(Shader::TextureType::ColorCube, 0);
-            const u32 d2_binding = Shader::BindlessTextureBinding(Shader::TextureType::Color2D, 0);
             cube += state.written[cube_binding][id].view != state.dummy[cube_binding];
             d2 += state.written[d2_binding][id].view != state.dummy[d2_binding];
+            d3 += state.written[d3_binding][id].view != state.dummy[d3_binding];
+            d2_array += state.written[d2a_binding][id].view != state.dummy[d2a_binding];
+            cube_array += state.written[ca_binding][id].view != state.dummy[ca_binding];
+            if (const Storage* const st = state.entries[id].storage; st && !st->image) {
+                const auto pool_it = impl.pools.find(st->pool_serial);
+                const Pool* const pool =
+                    (pool_it != impl.pools.end() && pool_it->second) ? pool_it->second.get()
+                                                                     : nullptr;
+                if (pool && (pool->flags & PoolFlag::CpuNoAccess) != 0) {
+                    ++unprimed_cpu_no_access;
+                } else if ((st->desc.flags & RT_HINT_FLAGS) != 0 ||
+                           (st->usage & VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) != 0) {
+                    ++unprimed_rt_flag;
+                } else {
+                    ++unprimed_other;
+                }
+            }
         }
         LOG_INFO(Render_Vulkan,
-                 "[nvn] bindless table: {} textures registered, {} 2D and {} cube entries hold an "
-                 "image ({} created for it so far), {} samplers registered, {} writes",
-                 registered, d2, cube, state.primed_total,
+                 "[nvn] bindless table: {} textures registered, {} 2D / {} 2DArray / {} 3D / {} "
+                 "cube / {} cubeArray entries hold an image ({} created for it so far), "
+                 "unprimed(cpu_no_access={}, rt_flag={}, other={}), {} samplers registered, "
+                 "{} writes",
+                 registered, d2, d2_array, d3, cube, cube_array, state.primed_total,
+                 unprimed_cpu_no_access, unprimed_rt_flag, unprimed_other,
                  static_cast<u32>(std::count_if(sampler_ids.begin(), sampler_ids.end(),
                                                 [](u64 serial) { return serial != 0; })),
                  writes.size());
