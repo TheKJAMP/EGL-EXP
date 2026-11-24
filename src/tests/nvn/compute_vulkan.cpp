@@ -5452,12 +5452,15 @@ TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without h
     constexpr u64 INPUT_VA = POOL_VA;
     constexpr u64 MID_VA = POOL_VA + 2 * POOL_SIZE;
     constexpr u64 OUT_VA = POOL_VA + 4 * POOL_SIZE;
+    constexpr u64 UNUSED_VA = POOL_VA + 6 * POOL_SIZE;
     u8* const input = memory.Add(INPUT_VA, POOL_SIZE);
     u8* const mid = memory.Add(MID_VA, POOL_SIZE);
     u8* const out = memory.Add(OUT_VA, POOL_SIZE);
+    u8* const unused = memory.Add(UNUSED_VA, POOL_SIZE);
     std::memset(input, 0, POOL_SIZE);
     std::memset(mid, 0, POOL_SIZE);
     std::memset(out, 0, POOL_SIZE);
+    std::memset(unused, 0, POOL_SIZE);
 
     constexpr u32 INITIAL_INPUT = 0x13572468;
     std::memcpy(input, &INITIAL_INPUT, sizeof(INITIAL_INPUT));
@@ -5467,7 +5470,7 @@ TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without h
         {.allow_host_import = false,
          .background_backing = false,
          .early_submit = false,
-         .try_storage_vram = false,
+         .try_storage_vram = true,
          .mirror_hash_tracked = true});
     context.SetGuestMemory(&memory);
     context.CreatePool(
@@ -5476,6 +5479,8 @@ TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without h
         {.serial = 2, .guest_address = MID_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
     context.CreatePool(
         {.serial = 3, .guest_address = OUT_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
+    context.CreatePool(
+        {.serial = 4, .guest_address = UNUSED_VA, .size = POOL_SIZE, .flags = POOL_CPU_CACHED});
 
     const std::array<Inst, 5> pure_raw_write{MovC0(2, 0x10), MovC0(3, 0x14),
                                              AddImm(6, 255, 0x1234), Stg(2, 6), Exit};
@@ -5546,6 +5551,7 @@ TEST_CASE("nvn compute: raw global memory demand-promotes mirror pools without h
 
     const Vulkan::Nvn::ContextStats stats = context.Stats();
     CHECK(stats.pools_imported == 0);
+    CHECK(stats.pools_mirrored == 3u);
     CHECK(stats.ops_failed == 0);
     CHECK(stats.ops_unsupported == 0);
 }

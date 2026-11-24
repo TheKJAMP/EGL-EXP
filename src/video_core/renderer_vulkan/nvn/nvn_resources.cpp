@@ -1419,9 +1419,11 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     // the chunks and the generation the table is built from are one consistent state.
     std::scoped_lock backing_lock{backing_mutex};
     const bool host_import_available = HostImportEnabled();
-    const auto defer = [this, host_import_available](const Pool& pool) {
-        return !host_import_available && !try_storage_vram &&
-               !(pool.flags & PoolFlag::CpuNoAccess);
+    // Without host import, backing a CPU-accessible pool creates a Mirror that the raw table
+    // skips anyway (unless demand-promoted via PromoteRawMirrorPool); never eagerly back all
+    // pending CPU pools during a raw table rebuild, even when try_storage_vram is enabled.
+    const auto defer = [host_import_available](const Pool& pool) {
+        return !host_import_available && !(pool.flags & PoolFlag::CpuNoAccess);
     };
     const auto has_own_buffer = [](const Pool& pool) {
         return (pool.backing == Pool::Backing::Imported && !pool.chunk) ||
