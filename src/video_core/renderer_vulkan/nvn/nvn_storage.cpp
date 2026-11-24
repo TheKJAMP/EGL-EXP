@@ -1637,31 +1637,41 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // VK_EXT_memory_budget, the allocator's empty block space counts and the driver counts it too)
     // sheds rebuildable storages before spills begin.
     u64 device_budget = 0;
+    u64 device_used = 0;
     trim_device_excess = 0;
     bool hard_pressure = false;
+    const auto refresh_pressure = [&](bool count_pass) {
+        if (trim_legacy || device_budget == 0) {
+            return;
+        }
+        device_used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
+        const u64 pressure_threshold = mario_kart_world
+                                           ? device_budget - (device_budget * 15) / 100
+                                           : device_budget - device_budget / 10;
+        hard_pressure = mario_kart_world && device_used > device_budget;
+        if (device_used > pressure_threshold) {
+            trim_device_excess = device_used - pressure_threshold;
+            if (count_pass &&
+                !(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
+                stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
+            }
+        } else {
+            trim_device_excess = 0;
+        }
+    };
     if (!trim_legacy) {
         device_budget = device.GetDeviceMemoryBudget();
-        if (device_budget != 0) {
-            const u64 used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
-            const u64 pressure_threshold = mario_kart_world
-                                               ? device_budget - (device_budget * 15) / 100
-                                               : device_budget - device_budget / 10;
-            hard_pressure = mario_kart_world && used > device_budget;
-            if (used > pressure_threshold) {
-                trim_device_excess = used - pressure_threshold;
-                if (!(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
-                    stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
-                }
-            }
-        }
+        refresh_pressure(true);
     }
     if (!at_present && mario_kart_world && !over_budget && !hard_pressure) {
         return;
     }
-    if (trim_device_excess != 0 && image_recycle_count != 0) {
-        const u64 freed = image_recycle_bytes;
-        ClearRecycledImages();
-        trim_device_excess -= (std::min)(trim_device_excess, freed);
+    if (trim_device_excess != 0) {
+        RetireCompleted();
+        if (image_recycle_count != 0) {
+            ClearRecycledImages();
+        }
+        refresh_pressure(false);
     }
     constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
     constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
@@ -1796,19 +1806,22 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     // If live CPU-sourced (guest memory) textures keep the cache over target (e.g., MKW keeping
     // thousands of Texture objects registered), demote the oldest idle images at present boundaries
     // while keeping the Storage entry intact so EnsureImage can rebuild them on future use.
-    if (at_present && storage_cache_bytes > target && retire_seq != 0 &&
+    if ((at_present || hard_pressure) && storage_cache_bytes > target &&
         !(soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS)) {
         const u64 done_seq = completed_seq.load(std::memory_order_acquire);
         constexpr u64 DEMOTE_KEEP_PRESENTS_PRESSURE = 60;
         constexpr u64 DEMOTE_KEEP_PRESENTS_BUDGET = 180;
-        const u64 demote_keep = hard_pressure           ? PRESSURE_KEEP_PRESENTS
+        const bool extreme_pressure =
+            hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 4;
+        const u64 demote_keep = extreme_pressure        ? u64{1}
+                              : hard_pressure           ? PRESSURE_KEEP_PRESENTS
                               : trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE
                                                         : DEMOTE_KEEP_PRESENTS_BUDGET;
         std::vector<Candidate> demotable;
         for (const auto& [key, storage] : storage_cache) {
             if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
                 storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq ||
-                storage->bindless_tracked_count != 0) {
+                storage->touched_seq > done_seq || storage->bindless_tracked_count != 0) {
                 continue;
             }
             if (presents >= storage->last_used_present &&
@@ -1827,14 +1840,26 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                 continue;
             }
             Storage& s = *it->second;
-            auto old_image = std::make_shared<vk::Image>(std::move(s.image));
-            auto old_views = std::make_shared<std::vector<vk::ImageView>>(
-                draw_resources ? draw_resources->TakeStorageViews(s)
-                               : std::vector<vk::ImageView>{});
-            retired.push_back({retire_seq, [old_image, old_views]() mutable {
-                                   old_views->clear();
-                                   *old_image = vk::Image{};
-                               }});
+            const u64 fb_epoch_before =
+                draw_resources ? draw_resources->framebuffer_views_epoch : 0;
+            std::vector<vk::ImageView> views = draw_resources
+                                                   ? draw_resources->TakeStorageViews(s)
+                                                   : std::vector<vk::ImageView>{};
+            const bool had_fb_view =
+                draw_resources && draw_resources->framebuffer_views_epoch != fb_epoch_before;
+            if (had_fb_view) {
+                auto old_image = std::make_shared<vk::Image>(std::move(s.image));
+                auto old_views = std::make_shared<std::vector<vk::ImageView>>(std::move(views));
+                const u64 after_seq = retire_seq != 0 ? retire_seq : s.last_used_seq;
+                retired.push_back({after_seq, [old_image, old_views]() mutable {
+                                       old_views->clear();
+                                       *old_image = vk::Image{};
+                                   }});
+            } else {
+                // GPU already completed every submission touching `s` and no framebuffer holds it:
+                // drop views before the image right now to release device memory immediately.
+                views.clear();
+            }
             s.image = vk::Image{};
             s.current_layout = VK_IMAGE_LAYOUT_UNDEFINED;
             s.contents_valid = false;
@@ -1884,6 +1909,10 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                                              : PASS_INTERVAL_PRESENTS);
     if (hard_pressure) {
         trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
+        if (Debug::Get().storage_census && presents >= census_next_present) {
+            LogStorageCensus();
+            census_next_present = presents + 20;
+        }
     }
     stats.storage_cache_bytes.store(storage_cache_bytes, std::memory_order_relaxed);
 }
