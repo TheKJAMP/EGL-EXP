@@ -1555,6 +1555,9 @@ void Context::Impl::CompleteMain() {
         if (!flight->shadow.empty()) {
             draw_resources->ReleaseShadows(flight->shadow);
         }
+        if (!flight->scratch_shadows.empty()) {
+            draw_resources->ReleaseShadows(flight->scratch_shadows);
+        }
         if (!flight->descriptor_pools.empty()) {
             if ((gpu_complete || flight->semaphore == VK_NULL_HANDLE) &&
                 !device_lost.load(std::memory_order_acquire)) {

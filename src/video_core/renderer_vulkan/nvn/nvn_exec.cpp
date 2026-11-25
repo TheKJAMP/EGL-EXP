@@ -3109,7 +3109,7 @@ void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
     constexpr u64 CHUNK_BYTES = u64{32} << 20;
     const u64 est_bytes = static_cast<u64>(uploads.tiles.size()) * align(tile_bytes) +
                           static_cast<u64>(uploads.tails.size()) * align(tail_plan.staging_size);
-    const bool bulk_upload = est_bytes > CHUNK_BYTES;
+    const bool bulk_upload = est_bytes > CHUNK_BYTES && !draw.PassOpen() && !condition_open;
     vk::Buffer local_staging;
     u64 local_staging_size = 0;
     size_t next_tile = 0;
@@ -4496,8 +4496,9 @@ VkBuffer Recorder::AcquireAliasScratch(u64 total, bool& needs_reuse_barrier) {
         if (!chunk) {
             return VK_NULL_HANDLE;
         }
+        chunk->used = chunk->size;
         alias_scratch = std::move(chunk);
-        flight.shadow.push_back(alias_scratch);
+        flight.scratch_shadows.push_back(alias_scratch);
         alias_scratch_used = false;
     } else if (alias_scratch_used) {
         needs_reuse_barrier = true;
@@ -4516,8 +4517,9 @@ VkBuffer Recorder::AcquireUntileScratch(u64 total, bool& needs_reuse_barrier) {
         if (!chunk) {
             return VK_NULL_HANDLE;
         }
+        chunk->used = chunk->size;
         untile_scratch = std::move(chunk);
-        flight.shadow.push_back(untile_scratch);
+        flight.scratch_shadows.push_back(untile_scratch);
         untile_scratch_used = false;
     } else if (untile_scratch_used) {
         needs_reuse_barrier = true;

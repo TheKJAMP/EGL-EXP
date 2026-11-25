@@ -576,6 +576,10 @@ struct InFlight {
     /// Device-local chunks the storage shadows of this submission live in (returned to the free
     /// list by the completion thread).
     std::vector<std::shared_ptr<ShadowChunk>> shadow;
+    /// Full-chunk device-local scratch buffers (GPU untile / alias transfers) borrowed from the
+    /// shadow pool; kept out of `shadow` so DrawContext::AllocShadow never bump-allocates into
+    /// them.
+    std::vector<std::shared_ptr<ShadowChunk>> scratch_shadows;
     /// Descriptor pools recycled once the submission finishes (reset via vkResetDescriptorPool).
     std::vector<std::shared_ptr<vk::DescriptorPool>> descriptor_pools;
     /// Query slots and timestamp reports (NvnIndirect); null until the submission reports a counter.
