@@ -275,6 +275,8 @@ struct DeviceDispatch : InstanceDispatch {
     PFN_vkCmdSetEvent vkCmdSetEvent{};
     PFN_vkCmdSetFrontFaceEXT vkCmdSetFrontFaceEXT{};
     PFN_vkCmdSetPatchControlPointsEXT vkCmdSetPatchControlPointsEXT{};
+    PFN_vkCmdSetPolygonModeEXT vkCmdSetPolygonModeEXT{};
+    PFN_vkCmdSetProvokingVertexModeEXT vkCmdSetProvokingVertexModeEXT{};
     PFN_vkCmdSetLogicOpEXT vkCmdSetLogicOpEXT{};
     PFN_vkCmdSetLineWidth vkCmdSetLineWidth{};
     PFN_vkCmdSetPrimitiveTopologyEXT vkCmdSetPrimitiveTopologyEXT{};
@@ -1746,6 +1748,14 @@ public:
 
     void SetPatchControlPointsEXT(uint32_t patch_control_points) const noexcept {
         dld->vkCmdSetPatchControlPointsEXT(handle, patch_control_points);
+    }
+
+    void SetPolygonModeEXT(VkPolygonMode polygon_mode) const noexcept {
+        dld->vkCmdSetPolygonModeEXT(handle, polygon_mode);
+    }
+
+    void SetProvokingVertexModeEXT(VkProvokingVertexModeEXT mode) const noexcept {
+        dld->vkCmdSetProvokingVertexModeEXT(handle, mode);
     }
 
     void SetColorWriteMaskEXT(u32 first, Span<VkColorComponentFlags> masks) const noexcept {

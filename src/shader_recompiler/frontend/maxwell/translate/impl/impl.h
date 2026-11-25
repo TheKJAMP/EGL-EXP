@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <span>
+
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
@@ -58,12 +60,9 @@ enum class FPCompareOp : u64 {
 
 struct TranslatorVisitor {
     explicit TranslatorVisitor(Environment& env_, IR::Block& block)
-        : env{env_}, ir(block), remaps{env_.NativeRegisterRemaps()} {}
+        : env{env_}, ir(block) {}
     Environment& env;
     IR::IREmitter ir;
-
-    /// Selects the register remaps of the instruction at `address` (lowered native programs).
-    void SetAddress(u32 address);
 
 #define INST(name, cute, encode) void name(u64 insn);
 #include "shader_recompiler/frontend/maxwell/maxwell.inc"
@@ -110,12 +109,6 @@ struct TranslatorVisitor {
     void ResetSFlag();
     void ResetCFlag();
     void ResetOFlag();
-
-private:
-    [[nodiscard]] IR::Reg Remapped(IR::Reg reg) const;
-
-    std::span<const Ampere::NativeRegisterRemap> remaps;
-    std::span<const Ampere::NativeRegisterRemap> active;
 };
 
 } // namespace Shader::Maxwell

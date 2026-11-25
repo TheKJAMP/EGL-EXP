@@ -143,6 +143,8 @@ struct DescriptorLayout {
     /// A stage samples through the replay's bindless table (set Shader::BINDLESS_SET): the
     /// pipeline layout carries that set and the draw binds it.
     bool uses_bindless_table{};
+    /// Bitmask of `Shader::TextureType` values sampled through the bindless table.
+    u32 bindless_types_mask{};
     u32 unsupported_count{};
 
     /// True when the pipeline needs push constants (rescaling or render area).

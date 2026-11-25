@@ -7,17 +7,26 @@
 #include <cstring>
 #include <map>
 #include <string>
+#include <cstdint>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <optional>
 #include <thread>
+#include <vector>
 
 #include <fmt/format.h>
 
 #include "common/boot_counter.h"
 #include "common/frame_stats.h"
 #include "common/game_presets.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/settings.h"
+#include "common/thread_worker.h"
 #include "core/core.h"
 #include "core/core_timing.h"
+#include "core/device_memory.h"
 #include "core/hle/kernel/k_hardware_timer.h"
 #include "core/hle/kernel/k_scheduler.h"
 #include "core/hle/kernel/k_scoped_scheduler_lock_and_sleep.h"
@@ -69,8 +78,16 @@ bool TimelineOn() {
 /// cache flushing: the HLE has no legacy GPU state on this memory.
 class Runtime::ProcessMemory final : public VideoCommon::Nvn::GuestMemory {
 public:
-    ProcessMemory(Core::Memory::Memory& memory_, const std::atomic<bool>& stopped_)
-        : memory{memory_}, stopped{stopped_} {}
+    ProcessMemory(Core::Memory::Memory& memory_, Common::HostMemory& host_memory_,
+                  const std::atomic<bool>& stopped_)
+        : memory{memory_}, host_memory{host_memory_}, stopped{stopped_} {}
+
+    ~ProcessMemory() override {
+        if (cold_worker) {
+            cold_worker->ClearRequests();
+            cold_worker.reset();
+        }
+    }
 
     bool Read(u64 va, void* dst, size_t size) override {
         return !stopped.load(std::memory_order_relaxed) && memory.ReadBlockUnsafe(va, dst, size);
@@ -124,9 +141,99 @@ public:
         memory.PageTracker().DisarmAccessTrap(id, va, size);
     }
 
+    void HintCold(u64 va, u64 size) override {
+        constexpr u64 kPageSize = 4096;
+        if (size < kPageSize || stopped.load(std::memory_order_acquire) ||
+            Common::ColdHintModeInEffect() == Settings::ColdHintMode::Off) {
+            return;
+        }
+        const u8* const backing_base = host_memory.BackingBasePointer();
+        const size_t backing_size = host_memory.BackingSize();
+        if (!backing_base || backing_size < kPageSize) {
+            return;
+        }
+        if (va > (std::numeric_limits<u64>::max)() - (kPageSize - 1)) {
+            return;
+        }
+        const u64 va_end = (size <= (std::numeric_limits<u64>::max)() - va)
+                               ? (va + size)
+                               : (std::numeric_limits<u64>::max)();
+        const u64 start = (va + kPageSize - 1) & ~(kPageSize - 1);
+        const u64 end = va_end & ~(kPageSize - 1);
+        if (end <= start) {
+            return;
+        }
+
+        struct PhysicalRun {
+            size_t offset;
+            size_t length;
+        };
+        std::vector<PhysicalRun> runs;
+        const uintptr_t base_addr = reinterpret_cast<uintptr_t>(backing_base);
+        for (u64 cur = start; cur < end; cur += kPageSize) {
+            if (stopped.load(std::memory_order_relaxed)) {
+                return;
+            }
+            const u8* const ptr = memory.GetPointerSilent(cur);
+            if (!ptr) {
+                continue;
+            }
+            const uintptr_t ptr_addr = reinterpret_cast<uintptr_t>(ptr);
+            if (ptr_addr < base_addr) {
+                continue;
+            }
+            const size_t phys_off = static_cast<size_t>(ptr_addr - base_addr);
+            if (phys_off >= backing_size || backing_size - phys_off < kPageSize) {
+                continue;
+            }
+            if (!runs.empty() && runs.back().offset + runs.back().length == phys_off) {
+                runs.back().length += kPageSize;
+            } else {
+                runs.push_back({phys_off, kPageSize});
+            }
+        }
+        if (runs.empty()) {
+            return;
+        }
+
+        const u32 prev = pending_cold_jobs.fetch_add(1, std::memory_order_relaxed);
+        if (prev >= 128) {
+            pending_cold_jobs.fetch_sub(1, std::memory_order_relaxed);
+            return;
+        }
+        struct JobGuard {
+            std::atomic<u32>& count;
+            ~JobGuard() {
+                count.fetch_sub(1, std::memory_order_relaxed);
+            }
+        };
+        EnsureColdWorker().QueueWork(
+            [this, runs = std::move(runs)]() mutable {
+                JobGuard guard{pending_cold_jobs};
+                for (const PhysicalRun& run : runs) {
+                    if (stopped.load(std::memory_order_acquire)) {
+                        return;
+                    }
+                    host_memory.HintCold(run.offset, run.length, std::nullopt);
+                }
+            });
+    }
+
 private:
+    Common::ThreadWorker& EnsureColdWorker() {
+        std::call_once(cold_worker_once, [this] {
+            cold_worker.reset(
+                new Common::ThreadWorker(1, "NvnColdHint", {}, Common::ThreadPlacement::Background));
+        });
+        return *cold_worker;
+    }
+
     Core::Memory::Memory& memory;
+    Common::HostMemory& host_memory;
     const std::atomic<bool>& stopped;
+    std::atomic<u32> pending_cold_jobs{0};
+    std::once_flag cold_worker_once;
+    std::unique_ptr<Common::ThreadWorker> cold_worker;
 };
 
 Call::Call(Runtime& runtime_, Core::System* system_, Kernel::Svc::ThreadContext& ctx_,
@@ -223,7 +330,9 @@ bool Runtime::EnsureRecorder(Core::System& system) {
         return false;
     }
     sink->SetTitleId(system.GetApplicationProcessProgramID());
-    if (!Start(*sink, std::make_unique<ProcessMemory>(system.ApplicationMemory(), stopped),
+    if (!Start(*sink,
+               std::make_unique<ProcessMemory>(system.ApplicationMemory(),
+                                               system.DeviceMemory().buffer, stopped),
                &system.Kernel())) {
         created.store(true, std::memory_order_release);
         return false;

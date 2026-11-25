@@ -381,7 +381,7 @@ struct Values {
     // workers (the draw waits), else on the replay thread. Read when the Vulkan device and the
     // NVN pipeline cache are created.
     SwitchableSetting<bool> nvn_pipeline_library{linkage,
-                                                 false,
+                                                 true,
                                                  "nvn_pipeline_library",
                                                  Category::Renderer,
                                                  Specialization::Default,
@@ -721,7 +721,7 @@ struct Values {
     // GPU threads (Mario Kart World: 60-700 ms every 600 frames); WhenRamIsLow only marks it to be
     // reclaimed first, and pages it out while the system is short of memory.
     Setting<ColdHintMode> cold_hint_mode{linkage,
-                                         ColdHintMode::Off,
+                                         ColdHintMode::WhenRamIsLow,
                                          "cold_hint_mode",
                                          Category::RendererMemory,
                                          Specialization::Default,

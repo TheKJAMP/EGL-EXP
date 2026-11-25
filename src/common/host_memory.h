@@ -32,15 +32,15 @@ DECLARE_ENUM_FLAG_OPERATORS(MemoryPermission)
  */
 /// Whether HostMemory::HintCold pages memory out. Its passes stall the GPU threads for as long as
 /// they run (Mario Kart World: 60-700 ms every 600 frames, the longer the session the longer).
-/// The cold hint mode in effect: the cold_hint_mode setting (off by default), unless
+/// The cold hint mode in effect: the cold_hint_mode setting (when RAM is low by default), unless
 /// EDEN_NX2_COLD_HINT (off, low, always) or the MCP cold_hints tool overrides it.
 [[nodiscard]] Settings::ColdHintMode ColdHintModeInEffect();
 /// Overrides the setting until the process ends.
 void OverrideColdHintMode(Settings::ColdHintMode mode);
 
 /// Whether the system is short of memory: memory pressure stalls over 5% of the last 10 s (Linux
-/// PSI, this process's cgroup or the whole system), or less than a tenth of RAM (at least 1 GiB)
-/// available. Re-read at most once a second.
+/// PSI, this process's cgroup or the whole system), or less than a fifth of RAM (clamped to
+/// [2 GiB, 4 GiB]) available. Re-read at most once a second.
 [[nodiscard]] bool MemoryIsLow();
 
 enum class ColdHintAction { None, MarkedCold, PagedOut };
@@ -109,6 +109,10 @@ public:
     }
     [[nodiscard]] const u8* BackingBasePointer() const noexcept {
         return backing_base;
+    }
+
+    [[nodiscard]] size_t BackingSize() const noexcept {
+        return backing_size;
     }
 
     [[nodiscard]] u8* VirtualBasePointer() noexcept {

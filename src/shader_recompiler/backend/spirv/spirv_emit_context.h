@@ -178,11 +178,39 @@ struct CooperativeHmmaTypes {
     Id matrix_c{};
 };
 
+struct BindlessBlockCache {
+    ::Common::unordered_map<u64, Id> images;
+    ::Common::unordered_map<u32, Id> samplers;
+    ::Common::unordered_map<u64, Id> sampled_images;
+
+    void Clear() {
+        if (!images.empty()) {
+            images.clear();
+        }
+        if (!samplers.empty()) {
+            samplers.clear();
+        }
+        if (!sampled_images.empty()) {
+            sampled_images.clear();
+        }
+    }
+};
+
 class EmitContext final : public Sirit::Module {
 public:
     explicit EmitContext(const Profile& profile, const RuntimeInfo& runtime_info,
                          IR::Program& program, Bindings& binding);
     ~EmitContext();
+
+    Id AddLabel(Id label) {
+        bindless_block_cache.Clear();
+        return Sirit::Module::AddLabel(label);
+    }
+
+    Id AddLabel() {
+        bindless_block_cache.Clear();
+        return Sirit::Module::AddLabel();
+    }
 
     [[nodiscard]] Id Def(const IR::Value& value);
 
@@ -473,6 +501,7 @@ public:
     Id bindless_samplers{};
     Id bindless_sampler_type{};
     Id bindless_sampler_pointer_type{};
+    BindlessBlockCache bindless_block_cache;
 
     bool uses_nonuniform_sampled_image{};
     bool uses_nonuniform_storage_image{};

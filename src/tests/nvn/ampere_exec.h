@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 // Executes Ampere (Switch 2) instruction sequences on a real GPU through the same pipeline the
-// games use: LowerToMaxwell -> Maxwell translation -> SPIR-V -> Vulkan compute. Tests compare the
+// games use: native Ampere frontend -> SPIR-V -> Vulkan compute. Tests compare the
 // outputs with a CPU reference of the instruction's hardware semantics.
 //
 // Every dispatched group is one case: it loads eight input words (R8..R15) from its slot of storage

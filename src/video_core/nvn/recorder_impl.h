@@ -226,6 +226,7 @@ struct SinkObject : Object {
     std::atomic<u32> list_refs{0};
     std::atomic<u32> pool_refs{0};
     bool finalized = false;
+    bool in_retire_list = false;
     u64 destroy_after = 0;
 };
 
@@ -513,6 +514,7 @@ struct Recorder::Impl {
     // Object retirement
     std::mutex retire_mutex;
     std::vector<u64> retire_list;
+    std::atomic<u32> retire_pending{0};
     /// Textures whose guest object was initialized again while they were alive (under
     /// retire_mutex). Nothing finalizes them, so they are never destroyed; the ones finalized
     /// through a copy of the object, or gone, are pruned.
@@ -571,8 +573,8 @@ struct Recorder::Impl {
     [[nodiscard]] SinkObject* StateOf(u64 serial);
     [[nodiscard]] SinkObject* PoolRefOwner(u64 serial);
     void AddPoolRef(u64 serial, u32 count = 1);
-    void ReleasePoolRef(u64 serial, u32 count = 1);
-    void ReleasePoolRefs(const std::vector<u64>& serials);
+    bool ReleasePoolRef(u64 serial, u32 count = 1);
+    bool ReleasePoolRefs(const std::vector<u64>& serials);
     void MarkFinalized(u64 serial);
     void ReleaseRefs(const std::vector<u64>& refs);
     void RunRetire();

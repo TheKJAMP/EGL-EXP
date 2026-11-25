@@ -793,6 +793,16 @@ TEST_CASE("nvn hle program: NVN2 builder in place and InitializeFromBuilder", "[
     // A shader the game cannot supply fails the initialization.
     rig.Call("nvnProgramBuilderSetShaders", {Rig::I(BUILDER), Rig::I(9), Rig::I(data)});
     CHECK(rig.Call("nvnProgramInitializeFromBuilder", {Rig::I(PROGRAM_2), Rig::I(BUILDER)}) == 0);
+
+    // Ray-tracing shader group handle writes 32 zero bytes when non-null and tolerates null.
+    std::array<u8, 32> nonzero;
+    nonzero.fill(0xFF);
+    rig.memory.Put(SCRATCH + 0x2000, nonzero);
+    rig.Call("nvnProgramGetShaderGroupHandle",
+             {Rig::I(PROGRAM), Rig::I(0), Rig::I(0), Rig::I(SCRATCH + 0x2000)});
+    const std::array<u8, 32> zero_expected{};
+    CHECK(rig.memory.Get<std::array<u8, 32>>(SCRATCH + 0x2000) == zero_expected);
+    rig.Call("nvnProgramGetShaderGroupHandle", {Rig::I(PROGRAM), Rig::I(0), Rig::I(0), Rig::I(0)});
 }
 
 // ---- Syncs -----------------------------------------------------------------------------------------------
@@ -951,6 +961,10 @@ TEST_CASE("nvn hle event: builder in place layout (nxnative ev_builder_t)", "[nv
     CHECK(rig.memory.Get<s64>(BUILDER + 0x08) == 0x40);
     CHECK(rig.Call("nvnEventBuilderGetMemoryPool", {Rig::I(BUILDER)}) == POOL);
     CHECK(rig.Call("nvnEventBuilderGetMemoryOffset", {Rig::I(BUILDER)}) == 0x40);
+    rig.memory.Put<s64>(SCRATCH + 0x100, -1);
+    CHECK(rig.Call("nvnEventBuilderGetStorage", {Rig::I(BUILDER), Rig::I(SCRATCH + 0x100)}) == POOL);
+    CHECK(rig.memory.Get<s64>(SCRATCH + 0x100) == 0x40);
+    CHECK(rig.Call("nvnEventBuilderGetStorage", {Rig::I(BUILDER), Rig::I(0)}) == POOL);
 }
 
 TEST_CASE("nvn hle event: initialize, signal modes and value", "[nvn]") {

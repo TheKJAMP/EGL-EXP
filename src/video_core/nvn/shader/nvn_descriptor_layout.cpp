@@ -307,6 +307,7 @@ DescriptorLayout BuildDescriptorLayout(std::span<const StageInfo> stages,
             if (desc.bindless) {
                 // In the table's set, not numbered with the draw's descriptors (as EmitSPIRV).
                 layout.uses_bindless_table = true;
+                layout.bindless_types_mask |= 1u << static_cast<u32>(desc.type);
                 continue;
             }
             auto entry = Make(binding, DescriptorKind::CombinedImageSampler,

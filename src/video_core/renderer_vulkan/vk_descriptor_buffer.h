@@ -60,15 +60,19 @@ public:
     }
 
     [[nodiscard]] bool IsValid() const noexcept {
-        return !chunks.empty();
+        return supported && !allocation_failed;
     }
 
 private:
+    bool EnsureAllocated();
+
     const Device& device;
+    MemoryAllocator& memory_allocator;
     std::vector<vk::Buffer> chunks;
     std::vector<VkDeviceAddress> chunk_addresses;
     std::vector<u8*> chunk_hosts;
     VkDeviceSize alignment{1};
+    VkDeviceSize chunk_size{};
     VkDeviceSize chunk_capacity{};
     size_t chunks_per_frame{};
     size_t frame_index{};
@@ -77,6 +81,8 @@ private:
     u64 generation{1};
     std::array<u64, FRAMES_IN_FLIGHT> frame_ticks{};
     bool frame_reused{};
+    bool supported{};
+    bool allocation_failed{};
 };
 
 } // namespace Vulkan

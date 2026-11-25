@@ -185,6 +185,8 @@ void Load(VkDevice device, DeviceDispatch& dld) noexcept {
     X(vkCmdSetFrontFaceEXT);
     X(vkCmdSetLogicOpEXT);
     X(vkCmdSetPatchControlPointsEXT);
+    X(vkCmdSetPolygonModeEXT);
+    X(vkCmdSetProvokingVertexModeEXT);
     X(vkCmdSetLineWidth);
     X(vkCmdSetPrimitiveTopologyEXT);
     X(vkCmdSetStencilOpEXT);

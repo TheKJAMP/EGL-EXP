@@ -22,6 +22,9 @@ struct HostTranslateInfo;
 
 namespace Shader::Maxwell {
 
+[[nodiscard]] IR::Program FinalizeProgram(IR::AbstractSyntaxList&& syntax_list, Environment& env,
+                                          const HostTranslateInfo& host_info);
+
 [[nodiscard]] IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool,
                                            ObjectPool<IR::Block>& block_pool, Environment& env,
                                            Flow::CFG& cfg, const HostTranslateInfo& host_info);

@@ -330,9 +330,10 @@ bool NeedsLift(Node goto_stmt, Node label_stmt) noexcept {
 
 class GotoPass {
 public:
-    explicit GotoPass(Flow::CFG& cfg, ObjectPool<Statement>& stmt_pool, bool converge_exits_)
-        : pool{stmt_pool}, converge_exits{converge_exits_} {
-        std::vector gotos{BuildTree(cfg)};
+    explicit GotoPass(std::span<Flow::Function> functions_, ObjectPool<Statement>& stmt_pool,
+                      bool converge_exits_)
+        : functions{functions_}, pool{stmt_pool}, converge_exits{converge_exits_} {
+        std::vector gotos{BuildTree()};
         const auto end{gotos.rend()};
         for (auto goto_stmt = gotos.rbegin(); goto_stmt != end; ++goto_stmt) {
             RemoveGoto(*goto_stmt);
@@ -394,10 +395,10 @@ private:
         }
     }
 
-    std::vector<Node> BuildTree(Flow::CFG& cfg) {
+    std::vector<Node> BuildTree() {
         u32 label_id{0};
         std::vector<Node> gotos;
-        Flow::Function& first_function{cfg.Functions().front()};
+        Flow::Function& first_function{functions.front()};
         Node insert_point{root_stmt.children.end()};
         if (converge_exits) {
             // Every EXIT jumps to one return at the end, so all invocations reach the same
@@ -408,13 +409,12 @@ private:
             root.insert(root.end(), *pool.Create(Return{}, &root_stmt));
             insert_point = *exit_label;
         }
-        BuildTree(cfg, first_function, label_id, gotos, insert_point, std::nullopt);
+        BuildTree(first_function, label_id, gotos, insert_point, std::nullopt);
         return gotos;
     }
 
-    void BuildTree(Flow::CFG& cfg, Flow::Function& function, u32& label_id,
-                   std::vector<Node>& gotos, Node function_insert_point,
-                   std::optional<Node> return_label) {
+    void BuildTree(Flow::Function& function, u32& label_id, std::vector<Node>& gotos,
+                   Node function_insert_point, std::optional<Node> return_label) {
         Statement* const false_stmt{pool.Create(Identity{}, IR::Condition{false}, &root_stmt)};
         Tree& root{root_stmt.children};
         ::Common::unordered_map<Flow::Block*, Node> local_labels;
@@ -475,9 +475,9 @@ private:
                 root.insert(ip, *pool.Create(Unreachable{}, &root_stmt));
                 break;
             case Flow::EndClass::Call: {
-                Flow::Function& call{cfg.Functions()[block.function_call]};
+                Flow::Function& call{functions[block.function_call]};
                 const Node call_return_label{local_labels.at(block.return_block)};
-                BuildTree(cfg, call, label_id, gotos, ip, call_return_label);
+                BuildTree(call, label_id, gotos, ip, call_return_label);
                 break;
             }
             case Flow::EndClass::Exit:
@@ -650,6 +650,7 @@ private:
         return parent_tree.insert(std::next(loop), *new_goto);
     }
 
+    std::span<Flow::Function> functions;
     ObjectPool<Statement>& pool;
     Statement root_stmt{FunctionTag{}};
     bool converge_exits{};
@@ -689,10 +690,11 @@ private:
 class TranslatePass {
 public:
     TranslatePass(ObjectPool<IR::Inst>& inst_pool_, ObjectPool<IR::Block>& block_pool_,
-                  ObjectPool<Statement>& stmt_pool_, Environment& env_, Statement& root_stmt,
-                  IR::AbstractSyntaxList& syntax_list_, const HostTranslateInfo& host_info)
-        : stmt_pool{stmt_pool_}, inst_pool{inst_pool_}, block_pool{block_pool_}, env{env_},
-          syntax_list{syntax_list_} {
+                  ObjectPool<Statement>& stmt_pool_, const BlockTranslator& translate_block_,
+                  Statement& root_stmt, IR::AbstractSyntaxList& syntax_list_,
+                  const HostTranslateInfo& host_info)
+        : stmt_pool{stmt_pool_}, inst_pool{inst_pool_}, block_pool{block_pool_},
+          translate_block{translate_block_}, syntax_list{syntax_list_} {
         Visit(root_stmt, nullptr, nullptr);
 
         IR::Block& first_block{*syntax_list.front().data.block};
@@ -724,7 +726,7 @@ private:
                 break;
             case StatementType::Code: {
                 ensure_block();
-                Translate(env, current_block, stmt.block->begin.Offset(), stmt.block->end.Offset());
+                translate_block(current_block, stmt.block->begin.Offset(), stmt.block->end.Offset());
                 break;
             }
             case StatementType::SetVariable: {
@@ -1014,7 +1016,7 @@ private:
     ObjectPool<Statement>& stmt_pool;
     ObjectPool<IR::Inst>& inst_pool;
     ObjectPool<IR::Block>& block_pool;
-    Environment& env;
+    const BlockTranslator& translate_block;
     IR::AbstractSyntaxList& syntax_list;
     bool uses_demote_to_helper{};
     const Flow::Block dummy_flow_block{};
@@ -1022,16 +1024,26 @@ private:
 } // Anonymous namespace
 
 IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-                                Environment& env, Flow::CFG& cfg,
-                                const HostTranslateInfo& host_info) {
+                                Environment& env, std::span<Flow::Function> functions,
+                                const HostTranslateInfo& host_info,
+                                const BlockTranslator& translate_block) {
     ObjectPool<Statement> stmt_pool{64};
     const Stage stage{env.ShaderStage()};
-    GotoPass goto_pass{cfg, stmt_pool, stage == Stage::Task || stage == Stage::Mesh};
+    GotoPass goto_pass{functions, stmt_pool, stage == Stage::Task || stage == Stage::Mesh};
     Statement& root{goto_pass.RootStatement()};
     IR::AbstractSyntaxList syntax_list;
-    TranslatePass{inst_pool, block_pool, stmt_pool, env, root, syntax_list, host_info};
+    TranslatePass{inst_pool, block_pool, stmt_pool, translate_block, root, syntax_list, host_info};
     stmt_pool.ReleaseContents();
     return syntax_list;
+}
+
+IR::AbstractSyntaxList BuildASL(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
+                                Environment& env, Flow::CFG& cfg,
+                                const HostTranslateInfo& host_info) {
+    return BuildASL(inst_pool, block_pool, env, cfg.Functions(), host_info,
+                    [&env](IR::Block* block, u32 begin, u32 end) {
+                        Translate(env, block, begin, end);
+                    });
 }
 
 } // namespace Shader::Maxwell

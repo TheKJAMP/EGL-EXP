@@ -7,6 +7,7 @@
 // SPDX-FileCopyrightText: Copyright 2018 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include <algorithm>
 #include <atomic>
 #include <cstdlib>
 #include <mutex>
@@ -314,7 +315,18 @@ void ArmDynarmic64::MakeJit(Common::PageTable* page_table, std::size_t address_s
 #if defined(ARCHITECTURE_arm64) || defined(__sun__) || defined(__NetBSD__) || defined(__DragonFly__) || defined(__OpenBSD__)
     config.code_cache_size = std::uint32_t(128_MiB);
 #else
-    config.code_cache_size = std::uint32_t(512_MiB);
+    config.code_cache_size = [] {
+        constexpr u64 default_mb = 128;
+        if (const char* env = std::getenv("EDEN_JIT_CODE_CACHE_MB"); env && *env != '\0') {
+            char* end = nullptr;
+            const unsigned long parsed = std::strtoul(env, &end, 10);
+            if (end != env && *end == '\0') {
+                return static_cast<std::uint32_t>(
+                    std::clamp<u64>(parsed, 32, 512) * 1024ULL * 1024ULL);
+            }
+        }
+        return static_cast<std::uint32_t>(default_mb * 1024ULL * 1024ULL);
+    }();
 #endif
 
     // Allow memory fault handling to work

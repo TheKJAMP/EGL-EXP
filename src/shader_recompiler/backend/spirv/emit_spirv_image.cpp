@@ -257,27 +257,52 @@ Id BindlessIndex(EmitContext& ctx, Id handle, bool sampler) {
     return clamped;
 }
 
-Id BindlessImage(EmitContext& ctx, const TextureDefinition& def, const IR::Value& handle_value) {
-    const Id handle{ctx.Def(handle_value)};
+u64 BindlessCacheKey(Id def_id, Id handle) noexcept {
+    return (static_cast<u64>(def_id.value) << 32) | static_cast<u64>(handle.value);
+}
+
+Id BindlessImage(EmitContext& ctx, const TextureDefinition& def, Id handle) {
+    const u64 key{BindlessCacheKey(def.id, handle)};
+    if (const auto it = ctx.bindless_block_cache.images.find(key);
+        it != ctx.bindless_block_cache.images.end()) {
+        return it->second;
+    }
     const Id pointer{
         ctx.OpAccessChain(def.pointer_type, def.id, BindlessIndex(ctx, handle, false))};
     const Id image{ctx.OpLoad(def.image_type, pointer)};
     DecorateNonUniform(ctx, pointer);
     DecorateNonUniform(ctx, image);
+    ctx.bindless_block_cache.images.emplace(key, image);
     return image;
 }
 
-Id BindlessSampled(EmitContext& ctx, const TextureDefinition& def, const IR::Value& handle_value) {
-    const Id handle{ctx.Def(handle_value)};
-    const Id image{BindlessImage(ctx, def, handle_value)};
+Id BindlessSampler(EmitContext& ctx, Id handle) {
+    if (const auto it = ctx.bindless_block_cache.samplers.find(handle.value);
+        it != ctx.bindless_block_cache.samplers.end()) {
+        return it->second;
+    }
     const Id sampler_pointer{ctx.OpAccessChain(ctx.bindless_sampler_pointer_type,
                                                ctx.bindless_samplers,
                                                BindlessIndex(ctx, handle, true))};
     const Id sampler{ctx.OpLoad(ctx.bindless_sampler_type, sampler_pointer)};
     DecorateNonUniform(ctx, sampler_pointer);
     DecorateNonUniform(ctx, sampler);
+    ctx.bindless_block_cache.samplers.emplace(handle.value, sampler);
+    return sampler;
+}
+
+Id BindlessSampled(EmitContext& ctx, const TextureDefinition& def, const IR::Value& handle_value) {
+    const Id handle{ctx.Def(handle_value)};
+    const u64 key{BindlessCacheKey(def.id, handle)};
+    if (const auto it = ctx.bindless_block_cache.sampled_images.find(key);
+        it != ctx.bindless_block_cache.sampled_images.end()) {
+        return it->second;
+    }
+    const Id image{BindlessImage(ctx, def, handle)};
+    const Id sampler{BindlessSampler(ctx, handle)};
     const Id combined{ctx.OpSampledImage(def.sampled_type, image, sampler)};
     DecorateNonUniform(ctx, combined);
+    ctx.bindless_block_cache.sampled_images.emplace(key, combined);
     return combined;
 }
 
@@ -320,7 +345,7 @@ Id TextureImage(EmitContext& ctx, IR::TextureInstInfo info, const IR::Value& ind
     } else {
         const TextureDefinition& def{ctx.textures.at(info.descriptor_index)};
         if (def.bindless) {
-            return BindlessImage(ctx, def, index);
+            return BindlessImage(ctx, def, ctx.Def(index));
         }
         if (def.count > 1) {
             auto const idx = index.IsImmediate() ? ctx.Const(index.U32()) : ctx.Def(index);

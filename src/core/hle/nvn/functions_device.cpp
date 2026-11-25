@@ -263,6 +263,46 @@ void nvnDeviceRegisterFastClear(Call& c) {
     c.ret.SetBool(true);
 }
 
+void nvnDeviceRegisterFastClearIndex(Call& c) {
+    c.ret.SetU32(0);
+}
+
+/// Ray tracing is not implemented on VTX-HLE, so report a minimal 256-byte aligned size for every
+/// non-null output pointer instead of leaving caller stack bytes untouched.
+void nvnDeviceCalculateAccelerationStructureMemoryRequirements(Call& c) {
+    static_cast<void>(c.args.NextPointer()); // device
+    static_cast<void>(c.args.NextPointer()); // inputs
+    const u64 out_as_size = c.args.NextPointer();
+    const u64 out_build_scratch = c.args.NextPointer();
+    const u64 out_update_scratch = c.args.NextPointer();
+    constexpr u64 MinAccelSize = 256;
+    if (out_as_size != 0) {
+        c.Store<u64>(out_as_size, MinAccelSize);
+    }
+    if (out_build_scratch != 0) {
+        c.Store<u64>(out_build_scratch, MinAccelSize);
+    }
+    if (out_update_scratch != 0) {
+        c.Store<u64>(out_update_scratch, MinAccelSize);
+    }
+    static Common::BootCounter logged;
+    if (logged.First()) {
+        LOG_WARNING(Core,
+                    "[nvn] CalculateAccelerationStructureMemoryRequirements: ray tracing is not "
+                    "implemented on VTX-HLE; reporting placeholder {}-byte sizes",
+                    MinAccelSize);
+    }
+}
+
+/// Switch 2 SDK (sdk+0x674650): packs a UBO GPU address and size into a descriptor handle.
+void nvnDeviceGetUniformBufferHandle(Call& c) {
+    static_cast<void>(c.args.NextPointer()); // device
+    const u64 gpu_address = c.args.NextU64();
+    const u64 size = c.args.NextU64();
+    c.ret.SetU64(((u64{0x1e0000000000} + (size << 41)) & u64{0xffffe00000000000}) |
+                 (gpu_address >> 4));
+}
+
 void nvnDeviceSetIntermediateShaderCache(Call& c) {
     static_cast<void>(c);
 }
@@ -447,6 +487,14 @@ void RegisterDeviceFunctions(Registry& registry) {
     registry.Add<&nvnDeviceRegisterFastClear>("nvnDeviceRegisterFastClearColori");
     registry.Add<&nvnDeviceRegisterFastClear>("nvnDeviceRegisterFastClearColorui");
     registry.Add<&nvnDeviceRegisterFastClear>("nvnDeviceRegisterFastClearDepth");
+    registry.Add<&nvnDeviceRegisterFastClear>("nvnDeviceRegisterFastClearStencil");
+    registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearColorIndex");
+    registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearColoriIndex");
+    registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearColoruiIndex");
+    registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearDepthIndex");
+    registry.Add<&nvnDeviceRegisterFastClearIndex>("nvnDeviceRegisterFastClearStencilIndex");
+    NVN_HLE(registry, nvnDeviceCalculateAccelerationStructureMemoryRequirements);
+    NVN_HLE(registry, nvnDeviceGetUniformBufferHandle);
     NVN_HLE(registry, nvnDeviceGetWindowOriginMode);
     NVN_HLE(registry, nvnDeviceGetDepthMode);
     NVN_HLE(registry, nvnDeviceGetTimestampInNanoseconds);

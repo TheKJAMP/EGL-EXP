@@ -680,6 +680,11 @@ Context::Impl::~Impl() {
         sparse_pages.reset();
     }
     import_chunks.clear(); // after the pool buffers bound into them
+    {
+        std::scoped_lock lock{imported_ranges_mutex};
+        imported_guest_ranges.clear();
+        has_imported_guest_ranges.store(false, std::memory_order_release);
+    }
     clear_render_passes.clear();
     counters_published.store(nullptr);
     counters_engine.reset();
@@ -868,27 +873,28 @@ void Context::Impl::Dispatch(Command& command) {
                 std::getenv("EDEN_NX2_TRY_DISPATCH_ORDER") == nullptr) {
                 impl.dispatch_order_by_barriers = impl.mario_kart_world;
             }
-            if (impl.mario_kart_world && !impl.options.storage_trim_age_presents.has_value() &&
+            if (c.title_id != 0 && !impl.options.storage_trim_age_presents.has_value() &&
                 std::getenv("EDEN_NX2_NVN_TRIM_AGE_PRESENTS") == nullptr &&
                 impl.trim_age_presents == 0) {
                 impl.trim_age_presents = 300;
                 LOG_INFO(Render_Vulkan,
-                         "[nvn] Mario Kart World: aging idle render targets after {} presents "
+                         "[nvn] title {:#018x}: aging idle render targets after {} presents "
                          "(EDEN_NX2_NVN_TRIM_AGE_PRESENTS)",
-                         impl.trim_age_presents);
+                         c.title_id, impl.trim_age_presents);
             }
-            if (impl.mario_kart_world && !impl.options.storage_cache_budget_bytes.has_value() &&
+            if (c.title_id != 0 && !impl.options.storage_cache_budget_bytes.has_value() &&
                 Debug::Get().storage_budget_bytes == 0) {
                 if (const u64 device_budget = impl.device.GetDeviceMemoryBudget();
                     device_budget != 0) {
-                    const u64 scaled =
-                        (std::max)(device_budget / 10 * 6, (std::min)(device_budget, u64{4096} << 20));
+                    const u64 pct = device_budget <= (u64{6144} << 20) ? 45 : 60;
+                    const u64 scaled = (std::min)(device_budget * pct / 100, u64{4096} << 20);
                     if (scaled != impl.storage_cache_budget) {
                         impl.storage_cache_budget = scaled;
                         LOG_INFO(Render_Vulkan,
-                                 "[nvn] Mario Kart World: storage cache budget {} MiB (60% of {} "
+                                 "[nvn] title {:#018x}: storage cache budget {} MiB ({}% of {} "
                                  "MiB device budget; EDEN_NX2_NVN_STORAGE_BUDGET_MIB overrides)",
-                                 impl.storage_cache_budget >> 20, device_budget >> 20);
+                                 c.title_id, impl.storage_cache_budget >> 20, pct,
+                                 device_budget >> 20);
                     }
                 }
             }
@@ -2091,6 +2097,27 @@ std::string Context::DescribeMemory() const {
                                      sizeof(older))) {
                 private_bytes = older.PrivateUsage;
             }
+        }
+#elif defined(__linux__)
+        if (std::FILE* const status_file = std::fopen("/proc/self/status", "r")) {
+            char line[256];
+            u64 rss_anon = 0;
+            u64 rss_shmem = 0;
+            u64 vm_swap = 0;
+            while (std::fgets(line, sizeof(line), status_file)) {
+                unsigned long long kib = 0;
+                if (std::sscanf(line, "RssAnon: %llu kB", &kib) == 1) {
+                    rss_anon = static_cast<u64>(kib) << 10;
+                } else if (std::sscanf(line, "RssShmem: %llu kB", &kib) == 1) {
+                    rss_shmem = static_cast<u64>(kib) << 10;
+                } else if (std::sscanf(line, "VmSwap: %llu kB", &kib) == 1) {
+                    vm_swap = static_cast<u64>(kib) << 10;
+                }
+            }
+            std::fclose(status_file);
+            private_ws = rss_anon;
+            private_bytes = rss_anon + vm_swap;
+            shared_commit = rss_shmem;
         }
 #endif
         text += fmt::format("process private {} MiB, private working set {} MiB, shared commit "

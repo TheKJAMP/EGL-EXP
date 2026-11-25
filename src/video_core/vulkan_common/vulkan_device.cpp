@@ -685,6 +685,19 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
         properties.properties.limits.maxVertexInputBindings = 32;
     }
 
+    const auto clear_ds3_flags = [&] {
+        dynamic_state3_blending = false;
+        dynamic_state3_enables = false;
+        dynamic_state3_depth_clamp_enable = false;
+        dynamic_state3_polygon_mode = false;
+        dynamic_state3_provoking_vertex_mode = false;
+        dynamic_state3_logic_op_enable = false;
+        dynamic_state3_line_raster_mode = false;
+        dynamic_state3_conservative_raster_mode = false;
+        dynamic_state3_line_stipple_enable = false;
+        dynamic_state3_alpha_to_coverage = false;
+        dynamic_state3_alpha_to_one = false;
+    };
     const auto dyna_state = Settings::values.dyna_state.GetValue();
     switch (dyna_state) {
     case Settings::ExtendedDynamicState::Disabled:
@@ -695,8 +708,8 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                               VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
         RemoveExtensionFeature(extensions.extended_dynamic_state3, features.extended_dynamic_state3,
                               VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
-        dynamic_state3_blending = false;
-        dynamic_state3_enables = false;
+        dynamic_state2_patch_control_points = false;
+        clear_ds3_flags();
         break;
     case Settings::ExtendedDynamicState::EDS1:
         // Level 1: Enable EDS1, disable EDS2 and EDS3
@@ -704,15 +717,18 @@ Device::Device(VkInstance instance_, vk::PhysicalDevice physical_, VkSurfaceKHR 
                               VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
         RemoveExtensionFeature(extensions.extended_dynamic_state3, features.extended_dynamic_state3,
                               VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
-        dynamic_state3_blending = false;
-        dynamic_state3_enables = false;
+        dynamic_state2_patch_control_points = false;
+        clear_ds3_flags();
         break;
     case Settings::ExtendedDynamicState::EDS2:
-        // Level 2: Enable EDS1 + EDS2, disable EDS3
-        RemoveExtensionFeature(extensions.extended_dynamic_state3, features.extended_dynamic_state3,
-                              VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
-        dynamic_state3_blending = false;
-        dynamic_state3_enables = false;
+        // Level 2: Enable EDS1 + EDS2; keep EDS3 when VTX-HLE + GPL runs so PreRasterization parts
+        // stay shared across polygon mode / depth clamp / provoking vertex changes.
+        if (!(Settings::ResolveNvnHle().hle && Settings::values.nvn_pipeline_library.GetValue())) {
+            RemoveExtensionFeature(extensions.extended_dynamic_state3,
+                                   features.extended_dynamic_state3,
+                                   VK_EXT_EXTENDED_DYNAMIC_STATE_3_EXTENSION_NAME);
+            clear_ds3_flags();
+        }
         break;
     case Settings::ExtendedDynamicState::EDS3:
     default:
@@ -1493,10 +1509,13 @@ bool Device::GetSuitability(bool requires_swapchain) {
         LOG_INFO(Render_Vulkan, "Extended Dynamic State disabled by user setting, clearing all EDS features");
         features.extended_dynamic_state.extendedDynamicState = false;
         features.extended_dynamic_state2.extendedDynamicState2 = false;
+        features.extended_dynamic_state2.extendedDynamicState2PatchControlPoints = false;
         features.extended_dynamic_state3.extendedDynamicState3ColorBlendEnable = false;
         features.extended_dynamic_state3.extendedDynamicState3ColorBlendEquation = false;
         features.extended_dynamic_state3.extendedDynamicState3ColorWriteMask = false;
         features.extended_dynamic_state3.extendedDynamicState3DepthClampEnable = false;
+        features.extended_dynamic_state3.extendedDynamicState3PolygonMode = false;
+        features.extended_dynamic_state3.extendedDynamicState3ProvokingVertexMode = false;
         features.extended_dynamic_state3.extendedDynamicState3LogicOpEnable = false;
     }
 
@@ -1558,6 +1577,9 @@ void Device::RemoveUnsuitableExtensions() {
     RemoveExtensionFeatureIfUnsuitable(extensions.extended_dynamic_state2,
                                        features.extended_dynamic_state2,
                                        VK_EXT_EXTENDED_DYNAMIC_STATE_2_EXTENSION_NAME);
+    dynamic_state2_patch_control_points =
+        extensions.extended_dynamic_state2 &&
+        features.extended_dynamic_state2.extendedDynamicState2PatchControlPoints;
 
     // VK_EXT_extended_dynamic_state3
     const bool supports_color_blend_enable =
@@ -1571,6 +1593,11 @@ void Device::RemoveUnsuitableExtensions() {
 
     const bool supports_depth_clamp_enable =
         features.extended_dynamic_state3.extendedDynamicState3DepthClampEnable;
+    const bool supports_polygon_mode =
+        features.extended_dynamic_state3.extendedDynamicState3PolygonMode;
+    const bool supports_provoking_vertex_mode =
+        features.extended_dynamic_state3.extendedDynamicState3ProvokingVertexMode &&
+        extensions.provoking_vertex && features.provoking_vertex.provokingVertexLast;
     const bool supports_logic_op_enable =
         features.extended_dynamic_state3.extendedDynamicState3LogicOpEnable;
     const bool supports_line_raster_mode =
@@ -1589,6 +1616,8 @@ void Device::RemoveUnsuitableExtensions() {
         features.features.alphaToOne;
 
     dynamic_state3_depth_clamp_enable = supports_depth_clamp_enable;
+    dynamic_state3_polygon_mode = supports_polygon_mode;
+    dynamic_state3_provoking_vertex_mode = supports_provoking_vertex_mode;
     dynamic_state3_logic_op_enable = supports_logic_op_enable;
     dynamic_state3_line_raster_mode = supports_line_raster_mode;
     dynamic_state3_conservative_raster_mode = supports_conservative_raster_mode;
@@ -1596,8 +1625,9 @@ void Device::RemoveUnsuitableExtensions() {
     dynamic_state3_alpha_to_coverage = supports_alpha_to_coverage;
     dynamic_state3_alpha_to_one = supports_alpha_to_one;
 
-    dynamic_state3_enables = dynamic_state3_depth_clamp_enable || dynamic_state3_logic_op_enable ||
-                             dynamic_state3_line_raster_mode ||
+    dynamic_state3_enables = dynamic_state3_depth_clamp_enable || dynamic_state3_polygon_mode ||
+                             dynamic_state3_provoking_vertex_mode ||
+                             dynamic_state3_logic_op_enable || dynamic_state3_line_raster_mode ||
                              dynamic_state3_conservative_raster_mode ||
                              dynamic_state3_line_stipple_enable ||
                              dynamic_state3_alpha_to_coverage || dynamic_state3_alpha_to_one;
@@ -1607,6 +1637,8 @@ void Device::RemoveUnsuitableExtensions() {
         dynamic_state3_blending = false;
         dynamic_state3_enables = false;
         dynamic_state3_depth_clamp_enable = false;
+        dynamic_state3_polygon_mode = false;
+        dynamic_state3_provoking_vertex_mode = false;
         dynamic_state3_logic_op_enable = false;
         dynamic_state3_line_raster_mode = false;
         dynamic_state3_conservative_raster_mode = false;

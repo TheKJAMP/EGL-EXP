@@ -234,10 +234,11 @@ void Recorder::Impl::AddPoolRef(u64 serial, u32 count) {
     }
 }
 
-void Recorder::Impl::ReleasePoolRef(u64 serial, u32 count) {
+bool Recorder::Impl::ReleasePoolRef(u64 serial, u32 count) {
     if (serial == 0 || count == 0) {
-        return;
+        return false;
     }
+    bool queued = false;
     if (SinkObject* owner = PoolRefOwner(serial)) {
         const u32 prev = owner->pool_refs.fetch_sub(count, std::memory_order_acq_rel);
         if (prev <= count) {
@@ -245,15 +246,26 @@ void Recorder::Impl::ReleasePoolRef(u64 serial, u32 count) {
             if (owner->finalized) {
                 // Any submission whose snapshot still carries this serial must complete first.
                 owner->destroy_after = (std::max)(owner->destroy_after, next_seq.load());
+                if (!owner->in_retire_list &&
+                    owner->pool_refs.load(std::memory_order_acquire) == 0) {
+                    owner->in_retire_list = true;
+                    retire_list.push_back(owner->serial);
+                    retire_pending.store(static_cast<u32>(retire_list.size()),
+                                         std::memory_order_release);
+                    queued = true;
+                }
             }
         }
     }
+    return queued;
 }
 
-void Recorder::Impl::ReleasePoolRefs(const std::vector<u64>& serials) {
+bool Recorder::Impl::ReleasePoolRefs(const std::vector<u64>& serials) {
+    bool queued = false;
     for (const u64 serial : serials) {
-        ReleasePoolRef(serial);
+        queued |= ReleasePoolRef(serial);
     }
+    return queued;
 }
 
 void Recorder::Impl::MarkFinalized(u64 serial) {
@@ -261,6 +273,7 @@ void Recorder::Impl::MarkFinalized(u64 serial) {
     if (!state) {
         return;
     }
+    bool queued = false;
     {
         std::lock_guard lock{retire_mutex};
         if (state->finalized) {
@@ -268,9 +281,17 @@ void Recorder::Impl::MarkFinalized(u64 serial) {
         }
         state->finalized = true;
         state->destroy_after = next_seq.load();
-        retire_list.push_back(serial);
+        if (!state->in_retire_list && state->pool_refs.load(std::memory_order_acquire) == 0) {
+            state->in_retire_list = true;
+            retire_list.push_back(serial);
+            retire_pending.store(static_cast<u32>(retire_list.size()),
+                                 std::memory_order_release);
+            queued = true;
+        }
     }
-    RunRetire();
+    if (queued) {
+        RunRetire();
+    }
 }
 
 void Recorder::Impl::AbandonRecording(CommandBufferObject& cb) {
@@ -296,20 +317,29 @@ void Recorder::Impl::ReleaseRefs(const std::vector<u64>& refs) {
 }
 
 void Recorder::Impl::RunRetire() {
+    if (retire_pending.load(std::memory_order_acquire) == 0) {
+        return;
+    }
     std::vector<u64> ready;
     {
         std::lock_guard lock{retire_mutex};
         const u64 completed = completed_seq.load();
         for (size_t i = 0; i < retire_list.size();) {
             const u64 serial = retire_list[i];
-            const SinkObject* state = StateOf(serial);
+            SinkObject* const state = StateOf(serial);
             if (!state) {
                 retire_list[i] = retire_list.back();
                 retire_list.pop_back();
                 continue;
             }
-            if (completed >= state->destroy_after && state->list_refs.load() == 0 &&
-                state->pool_refs.load() == 0) {
+            if (state->pool_refs.load(std::memory_order_acquire) != 0) {
+                state->in_retire_list = false;
+                retire_list[i] = retire_list.back();
+                retire_list.pop_back();
+                continue;
+            }
+            if (completed >= state->destroy_after && state->list_refs.load() == 0) {
+                state->in_retire_list = false;
                 ready.push_back(serial);
                 retire_list[i] = retire_list.back();
                 retire_list.pop_back();
@@ -317,6 +347,7 @@ void Recorder::Impl::RunRetire() {
             }
             ++i;
         }
+        retire_pending.store(static_cast<u32>(retire_list.size()), std::memory_order_release);
     }
     if (ready.empty()) {
         return;
@@ -391,6 +422,10 @@ bool Recorder::Impl::EnsureProgramLocked(ProgramObject& program, bool force) {
     FlushDestroysLocked();
     sink.CreateProgram(program.desc);
     program.created.store(true);
+    for (u32 stage = 0; stage < PROGRAM_STAGES; ++stage) {
+        std::vector<u8>{}.swap(program.desc.control[stage]);
+        std::vector<u8>{}.swap(program.desc.code[stage]);
+    }
     return true;
 }
 
@@ -1381,9 +1416,11 @@ void Recorder::MemoryPoolFinalize(u64 pool_va) {
         const TextureObject* texture = impl->textures.Get(tex_serial);
         return texture == nullptr || texture->desc.pool_serial == serial;
     });
-    impl->ReleasePoolRefs(removed_textures);
+    const bool queued = impl->ReleasePoolRefs(removed_textures);
     impl->Release(ObjectKind::MemoryPool, pool_va, serial);
-    impl->RunRetire();
+    if (queued) {
+        impl->RunRetire();
+    }
 }
 
 std::optional<PoolInfo> Recorder::GetMemoryPool(u64 pool_va) {
@@ -1429,9 +1466,9 @@ void Recorder::TexturePoolFinalize(u64 texture_pool_va) {
     if (const DescriptorPoolObject* object = impl->Lookup(
             impl->texture_pools, ObjectKind::TexturePool, texture_pool_va, __func__)) {
         const std::vector<u64> removed = impl->texture_table.Release(object->base);
-        impl->ReleasePoolRefs(removed);
+        const bool queued = impl->ReleasePoolRefs(removed);
         impl->Release(ObjectKind::TexturePool, texture_pool_va, object->serial);
-        if (!removed.empty()) {
+        if (queued) {
             impl->RunRetire();
         }
     }
@@ -1458,12 +1495,11 @@ void SetDescriptorSlot(Recorder::Impl& impl, DescriptorTable& table, u32 base, u
     impl.AddPoolRef(serial);
     u64 previous = 0;
     if (table.Set(base, id, serial, previous)) {
-        if (previous != 0) {
-            impl.ReleasePoolRef(previous);
+        if (previous != 0 && impl.ReleasePoolRef(previous)) {
             impl.RunRetire();
         }
     } else {
-        impl.ReleasePoolRef(serial);
+        static_cast<void>(impl.ReleasePoolRef(serial));
     }
 }
 } // namespace
@@ -1558,9 +1594,9 @@ void Recorder::SamplerPoolFinalize(u64 sampler_pool_va) {
     if (const DescriptorPoolObject* object = impl->Lookup(
             impl->sampler_pools, ObjectKind::SamplerPool, sampler_pool_va, __func__)) {
         const std::vector<u64> removed = impl->sampler_table.Release(object->base);
-        impl->ReleasePoolRefs(removed);
+        const bool queued = impl->ReleasePoolRefs(removed);
         impl->Release(ObjectKind::SamplerPool, sampler_pool_va, object->serial);
-        if (!removed.empty()) {
+        if (queued) {
             impl->RunRetire();
         }
     }
@@ -1652,18 +1688,17 @@ bool Recorder::TextureInitialize(u64 texture_va, const TextureDesc& desc, u64 me
             const u32 replaced = impl->texture_table.ReplaceSerial(old_serial, new_serial);
             if (replaced != 0) {
                 impl->AddPoolRef(new_serial, replaced);
-                impl->ReleasePoolRef(old_serial, replaced);
-                return true;
+                return impl->ReleasePoolRef(old_serial, replaced);
             }
             return false;
         };
-        bool changed = replace_pool_serial(previous_serial, texture->serial);
+        bool queued = replace_pool_serial(previous_serial, texture->serial);
         for (const auto& [view, old_view_serial] : previous_views) {
             if (replace_pool_serial(old_view_serial, impl->ViewSerialFor(*texture, view))) {
-                changed = true;
+                queued = true;
             }
         }
-        if (changed) {
+        if (queued) {
             impl->RunRetire();
         }
     }

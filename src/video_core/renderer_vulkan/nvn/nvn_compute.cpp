@@ -85,6 +85,42 @@ void DrawContext::FillComputeBank(const VC::ComputeDriverLayout& layout, u8* out
     VC::FillComputeDriverBank(layout, inputs, std::span<u8>{out, DRIVER_BANK_SIZE});
 }
 
+void DrawContext::PrefetchBoundCompute(u64 skip_hash) {
+    const StageBindings& bound = stages[STAGE_COMPUTE];
+    const auto program_it = impl.programs.find(bound.program_serial);
+    const auto hash_it = resources.program_hashes.find(bound.program_serial);
+    if (bound.program_serial == 0 || program_it == impl.programs.end() ||
+        hash_it == resources.program_hashes.end()) {
+        return;
+    }
+    const u64 program_hash = hash_it->second[STAGE_COMPUTE];
+    if (program_hash == 0 || program_hash == skip_hash) {
+        return;
+    }
+    const VC::ProgramDesc& program = *program_it->second;
+    auto ctrl_it = resources.compute_controls.find(bound.program_serial);
+    if (ctrl_it == resources.compute_controls.end()) {
+        DrawResources::ParsedComputeControl parsed;
+        parsed.control = VC::ParseControl(program.control[STAGE_COMPUTE], parsed.error);
+        ctrl_it = resources.compute_controls.emplace(bound.program_serial, std::move(parsed)).first;
+    }
+    const std::optional<VC::NvnControl>& control = ctrl_it->second.control;
+    if (!control || !control->has_compute_counts) {
+        return;
+    }
+    if (movie_network_skip > 0 ||
+        ComputeProgramUsesTensorMath(program_hash, program.code[STAGE_COMPUTE],
+                                     control->inst_bytes)) {
+        return;
+    }
+    const ComputeOracle oracle{*this, control->compute.HandleTables()};
+    ComputeRequest request;
+    request.program = {program_hash, &program.control[STAGE_COMPUTE], &program.code[STAGE_COMPUTE]};
+    request.oracle = &oracle;
+    request.inputs = &oracle;
+    resources.Cache().PrefetchCompute(request, skip_hash);
+}
+
 void DrawContext::Dispatch(const VC::DispatchPayload& p) {
     ++counters.dispatches;
     const bool indirect = p.indirect != 0;
@@ -475,7 +511,8 @@ void DrawContext::Dispatch(const VC::DispatchPayload& p) {
         // lookup waits for a compile in flight, as the emulated path's ComputePipeline::Configure
         // waits for its build. A skipped dispatch leaves the buffers and images it writes stale for
         // every later draw (one-time setup, GPU-driven culling), not one frame of geometry.
-        compute = resources.Cache().GetCompute(request);
+        compute = resources.Cache().GetCompute(
+            request, nullptr, [this](u64 hash) { PrefetchUpcomingGraphics(last_mode, 0, hash); });
         if (first_dispatch) {
             const auto compile_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                                         std::chrono::steady_clock::now() - compile_start)

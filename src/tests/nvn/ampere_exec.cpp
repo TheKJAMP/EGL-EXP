@@ -3,7 +3,7 @@
 
 // GPU execution tests of Ampere instruction forms: the instruction words are what ptxas (CUDA 13.3,
 // -arch=sm_87) emits for the PTX instruction named in each test, the expected values are a CPU
-// implementation of the PTX/SASS semantics. The words run through LowerToMaxwell, the Maxwell
+// implementation of the PTX/SASS semantics. The words run through the native Ampere
 // front end, the SPIR-V backend and a real Vulkan device (skipped without one); see ampere_exec.h.
 
 #include <algorithm>

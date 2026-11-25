@@ -210,13 +210,18 @@ PipelineCache& DrawResources::Cache() {
     if (!cache_instance) {
         std::scoped_lock lock{cache_mutex};
         PipelineCacheOptions options;
+        options.prefetch_graphics = !shader_refresh;
         options.async_compile =
             !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
         options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
+        options.gpl_optimize_after_presents = 30;
+        options.dedup_dynamic_state = true;
         options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
         options.shader_notify = impl.options.shader_notify;
         options.load_progress = impl.options.load_progress;
-        options.raw_miss_reporting = !impl.HostImportEnabled();
+        // DeferDirectPoolBacking defers >= 16 MiB pools even with host import; keep miss reporting on
+        // so raw-global shaders demand-back only the large pools they actually touch.
+        options.raw_miss_reporting = true;
         cache_instance = std::make_unique<PipelineCache>(impl.device, std::move(options));
     }
     return *cache_instance;
@@ -236,13 +241,17 @@ void DrawResources::OpenCache(u64 title_id) {
     PipelineCacheOptions options;
     options.title_id = title_id;
     options.revision = Common::g_scm_rev;
-    options.prefetch_graphics = title_id == Settings::MarioKartWorldProgramId && !shader_refresh;
+    options.prefetch_graphics = !shader_refresh;
     options.async_compile = !shader_refresh && Settings::values.use_asynchronous_shaders.GetValue();
     options.graphics_pipeline_library = Settings::values.nvn_pipeline_library.GetValue();
+    options.gpl_optimize_after_presents = 30;
+    options.dedup_dynamic_state = true;
     options.sync_diet = Settings::values.nvn_sync_diet.GetValue();
     options.shader_notify = impl.options.shader_notify;
     options.load_progress = impl.options.load_progress;
-    options.raw_miss_reporting = !impl.HostImportEnabled();
+    // DeferDirectPoolBacking defers >= 16 MiB pools even with host import; keep miss reporting on
+    // so raw-global shaders demand-back only the large pools they actually touch.
+    options.raw_miss_reporting = true;
     if (options.async_compile) {
         LOG_INFO(Render_Vulkan,
                  "[nvn] asynchronous shaders on: run-time pipeline compiles run on workers; the "
@@ -309,6 +318,13 @@ void DrawResources::OpenCache(u64 title_id) {
     cache_instance = std::move(cache);
 }
 DrawResources::~DrawResources() = default;
+
+void DrawResources::OnPresent() {
+    std::scoped_lock lock{cache_mutex};
+    if (cache_instance) {
+        cache_instance->OnPresent();
+    }
+}
 
 void DrawResources::MaybeRefreshShaders() {
     if (!shader_refresh || !cache_instance) {
@@ -401,11 +417,9 @@ void DrawResources::NoteAsyncSkips(u64 present) {
 void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc>& program) {
     const VC::ProgramDesc& desc = *program;
     std::array<u64, STAGE_COUNT> hashes{};
-    std::array<StageProgram, STAGE_COUNT> stages{};
     for (u32 stage = 0; stage < STAGE_COUNT; ++stage) {
         if (!desc.control[stage].empty() && !desc.code[stage].empty()) {
             hashes[stage] = HashProgramStage(desc.control[stage], desc.code[stage]);
-            stages[stage] = {hashes[stage], &desc.control[stage], &desc.code[stage]};
         }
     }
     program_hashes[desc.serial] = hashes;
@@ -414,15 +428,11 @@ void DrawResources::OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc
         parsed.control = VC::ParseControl(desc.control[STAGE_COMPUTE], parsed.error);
         compute_controls[desc.serial] = std::move(parsed);
     }
-    PipelineCache* cache{};
-    {
-        std::scoped_lock lock{cache_mutex};
-        cache = cache_instance.get();
-    }
-    if (cache != nullptr && cache->UsesGraphicsPipelineLibrary()) {
-        // The stage pointers stay valid: the cache keeps `program` until it is done.
-        cache->PrepareProgram(stages, program);
-    }
+}
+
+void DrawResources::ReleaseProgram(u64 serial) {
+    program_hashes.erase(serial);
+    compute_controls.erase(serial);
 }
 
 void DrawResources::RefreshSamplerSetting() {

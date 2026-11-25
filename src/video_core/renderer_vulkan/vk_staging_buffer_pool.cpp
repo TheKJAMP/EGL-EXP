@@ -92,7 +92,14 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
                                      Scheduler& scheduler_)
     : device{device_}, memory_allocator{memory_allocator_}, scheduler{scheduler_},
       stream_buffer_size{GetStreamBufferSize(device)}, region_size{stream_buffer_size /
-                                                                   StagingBufferPool::NUM_SYNCS} {
+                                                                   StagingBufferPool::NUM_SYNCS} {}
+
+StagingBufferPool::~StagingBufferPool() = default;
+
+void StagingBufferPool::EnsureStreamBuffer() {
+    if (stream_buffer) {
+        return;
+    }
     VkBufferCreateInfo stream_ci = {
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -120,8 +127,6 @@ StagingBufferPool::StagingBufferPool(const Device& device_, MemoryAllocator& mem
     stream_pointer = stream_buffer.Mapped();
     ASSERT_MSG(!stream_pointer.empty(), "Stream buffer must be host visible!");
 }
-
-StagingBufferPool::~StagingBufferPool() = default;
 
 StagingBufferRef StagingBufferPool::Request(size_t size, MemoryUsage usage, bool deferred) {
     if (!deferred && usage == MemoryUsage::Upload && size <= region_size) {
@@ -154,6 +159,7 @@ void StagingBufferPool::TickFrame() {
 }
 
 StagingBufferRef StagingBufferPool::GetStreamBuffer(size_t size) {
+    EnsureStreamBuffer();
     if (AreRegionsActive(Region(free_iterator) + 1,
                          (std::min)(Region(iterator + size) + 1, NUM_SYNCS))) {
         // Avoid waiting for the previous usages to be free

@@ -1256,3 +1256,77 @@ TEST_CASE("nvn recorder: finalized textures and samplers stay alive while regist
     const IdSnapshot& cleared_snap = f.sink.submissions.back().texture_pool_snapshot;
     CHECK((cleared_snap.size() <= 3 || cleared_snap[3] == 0));
 }
+
+TEST_CASE("nvn recorder: drops duplicate program bytecode after sink creation",
+          "[nvn][recorder]") {
+    Fixture f;
+    std::array<u8, 0x100> control{};
+    const u32 magic = NVN2_CONTROL_MAGIC;
+    const u32 version = NVN2_CONTROL_VERSION;
+    const u32 code_size = 32;
+    const u16 stage = 1;
+    std::memcpy(control.data(), &magic, 4);
+    std::memcpy(control.data() + 4, &version, 4);
+    std::memcpy(control.data() + 0x44, &code_size, 4);
+    std::memcpy(control.data() + 0x56, &stage, 2);
+    f.memory.Put(SCRATCH, control);
+    std::array<u8, 32> code{};
+    for (u8 i = 0; i < 32; ++i) {
+        code[i] = static_cast<u8>(i + 1);
+    }
+    f.memory.Put(STORAGE + 0x8000, code);
+
+    REQUIRE(f.recorder.ProgramInitialize(Obj(11)));
+    const std::array<ShaderStageInput, 1> stages{ShaderStageInput{STORAGE + 0x8000, SCRATCH, -1}};
+    REQUIRE(f.recorder.ProgramSetShaders(Obj(11), stages));
+    REQUIRE(f.sink.programs.size() == 1);
+    CHECK(f.sink.programs[0].control[1].size() == 0x100);
+    CHECK(f.sink.programs[0].code[1] == std::vector<u8>(code.begin(), code.end()));
+
+    const u64 draw1 = f.Record(0, [&] {
+        f.recorder.BindProgram(Fixture::CMD, Obj(11), 1U << 1);
+        f.recorder.DrawArrays(Fixture::CMD, 4, 0, 3, 1, 0);
+    });
+    const u64 draw2 = f.Record(0x2000, [&] {
+        f.recorder.BindProgram(Fixture::CMD, Obj(11), 1U << 1);
+        f.recorder.DrawArrays(Fixture::CMD, 4, 0, 6, 1, 0);
+    });
+    REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{draw1}) == 1);
+    REQUIRE(f.recorder.QueueSubmitCommands(Fixture::QUEUE, std::array{draw2}) == 2);
+    REQUIRE(f.sink.programs.size() == 1);
+    REQUIRE(f.sink.submissions.size() == 2);
+    const auto* bind1 =
+        RequiredPayload<BindProgramPayload>(f.sink.submissions[0].lists[0], Op::BindProgram);
+    const auto* bind2 =
+        RequiredPayload<BindProgramPayload>(f.sink.submissions[1].lists[0], Op::BindProgram);
+    CHECK(bind1->program_serial == f.sink.programs[0].serial);
+    CHECK(bind2->program_serial == f.sink.programs[0].serial);
+    f.sink.Complete(2);
+    f.recorder.FlushDestroys();
+}
+
+TEST_CASE("nvn recorder: pool-pinned finalized textures do not block unpinned retirement",
+          "[nvn][recorder]") {
+    Fixture f;
+    REQUIRE(f.recorder.TexturePoolInitialize(Obj(20), Fixture::POOL, 0x20000, 64));
+    REQUIRE(f.recorder.TextureInitialize(Obj(10), MakeTextureDesc(), Fixture::POOL, 0));
+    REQUIRE(f.recorder.TextureInitialize(Obj(11), MakeTextureDesc(), Fixture::POOL, 0x10000));
+    const u64 pinned_serial = f.sink.textures.at(0).serial;
+    const u64 unpinned_serial = f.sink.textures.at(1).serial;
+
+    f.recorder.RegisterTexture(Obj(20), 1, Obj(10), 0);
+    f.recorder.TextureFinalize(Obj(10));
+    f.recorder.TextureFinalize(Obj(11));
+
+    // The unpinned finalized texture retires once completed while the pool-pinned one stays alive.
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, unpinned_serial));
+    CHECK_FALSE(Destroyed(f, pinned_serial));
+
+    // Unregistering and completing destroys the pinned texture cleanly.
+    f.recorder.RegisterTexture(Obj(20), 1, 0, 0);
+    f.sink.Complete(f.recorder.LastSeq());
+    f.recorder.FlushDestroys();
+    CHECK(Destroyed(f, pinned_serial));
+}

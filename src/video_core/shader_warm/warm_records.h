@@ -25,8 +25,8 @@ constexpr u32 WarmCacheVersion = 36;
 
 /// What the builder finds in the game files, recorded in the precache's count file. A file built by
 /// an older builder is rebuilt at boot (RefreshWarmFiles). 2: Mario Kart World's .esetb effects.
-/// 3: .ptcl particle effects (Fire Emblem). 4: lowered code with register remaps (other hashes).
-constexpr u32 WarmBuilderVersion = 4;
+/// 3: .ptcl particle effects (Fire Emblem). 4: lowered code with register remaps. 5: native Ampere.
+constexpr u32 WarmBuilderVersion = 5;
 
 using ComputeKey = std::array<u8, 24>;
 
@@ -37,10 +37,9 @@ struct LoweredCode {
     u32 texture_buffer{~0U};
 };
 
-/// Captures and lowers one extracted compute program as the runtime does for a dispatch and lays
-/// it out with LayOutLoweredNativeCode (a zero shader header). Matrix multiply programs, lowered
-/// per title at runtime, are not converted. Returns the error text when the program cannot be
-/// lowered.
+/// Captures and validates one extracted compute program as the runtime does for a dispatch and
+/// packs it with PackNativeAmpereCode (a zero shader header). Matrix multiply programs, configured
+/// per title at runtime, are not converted. Returns the error text when the program fails validation.
 std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode& out);
 
 /// The pipeline cache key hash of laid out code (NativeShaderHash).

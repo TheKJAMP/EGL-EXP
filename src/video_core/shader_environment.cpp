@@ -32,16 +32,14 @@
 #include <ranges>
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
-#include "shader_recompiler/frontend/ampere/program_override.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
-#include "shader_recompiler/frontend/ampere/program_address_map.h"
 #include "video_core/engines/kepler_compute.h"
 #include "video_core/memory_manager.h"
 #include "video_core/pipeline_cache_backups.h"
 #include "video_core/nx2_debug_control.h"
 #include "video_core/nx2_diag.h"
-#include "video_core/mkw_wave_workaround.h"
 #include "video_core/shader_environment.h"
 #include "video_core/texture_cache/format_lookup_table.h"
 #include "video_core/textures/texture.h"
@@ -59,25 +57,6 @@ u64 NativeShaderHash(std::span<const u64> code) {
     return Common::CityHash64(reinterpret_cast<const char*>(code.data()),
                               code.size() * sizeof(u64)) ^
            0x4f554e4345000002ULL;
-}
-
-std::vector<u64> LayOutLoweredNativeCode(std::span<const u64> header,
-                                         std::span<const Shader::Ampere::Instruction> native,
-                                         Shader::Ampere::LoweredProgram& lowered) {
-    VideoCommon::ApplyMkwZeroDepthFallback(native, lowered);
-    std::vector<u64> code(header.begin(), header.end());
-    for (const u64 instruction : lowered.instructions) {
-        if ((code.size() * sizeof(u64)) % 32 == 0) {
-            code.push_back(0); // Maxwell scheduling word, absent from native instructions.
-        }
-        code.push_back(instruction);
-    }
-    // Keep the original padding ABI, then retain the native address map as
-    // unreachable data. Existing disk-cache serialization carries it with code.
-    code.push_back(0);
-    Shader::Ampere::AppendNativeRegisterRemaps(code, lowered.register_remaps);
-    Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
-    return code;
 }
 
 static u64 MakeCbufKey(u32 index, u32 offset) {
@@ -253,23 +232,22 @@ u64 GenericEnvironment::ReadInstruction(u32 address) {
     return gpu_memory->Read<u64>(program_base + address);
 }
 
-u32 GenericEnvironment::TranslateProgramAddress(u32 address) const {
-    if (const auto translated = Shader::Ampere::NativeProgramAddress(code, address)) return *translated;
-    if (native_source_size || Shader::Ampere::HasNativeAddressMap(code))
-        throw Shader::RuntimeError("Invalid native indirect branch address {:#x}", address);
-    return address;
-}
-
 bool GenericEnvironment::IsNativeProgram() const {
-    return native_source_size != 0 || Shader::Ampere::HasNativeAddressMap(code);
+    return native_source_size != 0 || Shader::Ampere::HasNativeAmpereCode(code);
 }
 
-std::span<const Shader::Ampere::NativeRegisterRemap> GenericEnvironment::NativeRegisterRemaps()
-    const {
-    if (!register_remaps) {
-        register_remaps = Shader::Ampere::NativeRegisterRemaps(code);
+std::optional<Shader::Ampere::NativeAmpereView> GenericEnvironment::NativeAmpereProgram() const {
+    if (!lowered_native || lowered_native->native.empty()) {
+        return std::nullopt;
     }
-    return *register_remaps;
+    return Shader::Ampere::NativeAmpereView{
+        .code = lowered_native->native,
+        .options = lowered_native->options,
+        .uses_async_copy = lowered_native->uses_async_copy,
+        .branch_targets = lowered_native->branch_targets.empty()
+                              ? nullptr
+                              : &lowered_native->branch_targets,
+    };
 }
 
 bool GenericEnvironment::IsCbufStorageBufferPointer(u32 index, u32 offset) {
@@ -597,13 +575,15 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
         }
         if (status == Shader::Ampere::ProgramCaptureState::Result::Complete) break;
     }
-    auto lowered = Shader::Ampere::LowerToMaxwell(
-        native, {.geometry = geometry,
-                 .tensor = native_tensor,
-                 .compact_tensor = native_compact_tensor,
-                 .native_code_address = program_base + native_header_size});
+    const Shader::Ampere::LoweringOptions opts{
+        .geometry = geometry,
+        .tensor = native_tensor,
+        .compact_tensor = native_compact_tensor,
+        .native_code_address = program_base + native_header_size,
+    };
+    auto analysis = Shader::Ampere::AnalyzeProgram(native, opts);
     // EDEN_NX2_REJECT=<hex address>,...: treat these programs as rejected (to find which newly
-    // lowered program changes a game's behaviour without rebuilding).
+    // added program changes a game's behaviour without rebuilding).
     if (static const std::string reject_list = [] {
             const char* text = std::getenv("EDEN_NX2_REJECT");
             return text ? "," + std::string{text} + "," : std::string{};
@@ -617,7 +597,7 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             program_base, Shader::Ampere::NativeProgramKey(native));
     }
     // EDEN_NX2_SHADER_DUMP=<dir>: keep every captured native program (named by its key) so the
-    // lowering can be tested offline against all of a game's shaders.
+    // compiler can be tested offline against all of a game's shaders.
     if (static const char* const dump_directory = std::getenv("EDEN_NX2_SHADER_DUMP");
         dump_directory != nullptr) {
         const auto folder = std::filesystem::path{dump_directory};
@@ -630,65 +610,16 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
                        native.size() * sizeof(Shader::Ampere::Instruction));
         }
     }
-    if (!lowered) {
-        if (const char* directory = std::getenv("EDEN_NATIVE_SHADER_OVERRIDE_DIR")) {
-            const auto key = fmt::format("{:016x}", Shader::Ampere::NativeProgramKey(native));
-            const auto folder = std::filesystem::path{directory};
-            std::filesystem::create_directories(folder);
-            const auto source_path = folder / (key + ".source.bin");
-            const auto override_path = folder / (key + ".override.bin");
-            {
-                std::ofstream dump(source_path, std::ios::binary);
-                dump.write(reinterpret_cast<const char*>(native.data()), native.size() * sizeof(Shader::Ampere::Instruction));
-            }
-            {
-                // Retain mapped bytes beyond the first EXIT for investigating
-                // native CALL targets in compiler library subroutines.
-                std::ofstream mapped(folder / (key + ".mapped.bin"), std::ios::binary);
-                std::array<u8, 0x1000> block{};
-                for (u32 offset = 0; offset < 0x10000; offset += 0x1000) {
-                    if (!gpu_memory->IsFullyMappedRange(program_base + offset, block.size())) break;
-                    gpu_memory->ReadBlock(program_base + offset, block.data(), block.size());
-                    mapped.write(reinterpret_cast<const char*>(block.data()), block.size());
-                }
-            }
-            LOG_WARNING(Shader, "Native shader paused: key={}, offset={:#x}, reason={}, source={}",
-                        key, lowered.error_offset, lowered.error, source_path.string());
-            const auto deadline = std::chrono::steady_clock::now() + std::chrono::minutes{30};
-            while (!gpu_memory->IsShuttingDown() && std::chrono::steady_clock::now() < deadline) {
-                if (std::filesystem::exists(override_path)) {
-                    std::ifstream file(override_path, std::ios::binary | std::ios::ate);
-                    const auto length = file.tellg();
-                    if (length <= 0 || length > 16 * 1024 * 1024) {
-                        throw Shader::RuntimeError("Invalid native shader override size");
-                    }
-                    std::vector<u8> bytes(static_cast<size_t>(length));
-                    file.seekg(0);
-                    file.read(reinterpret_cast<char*>(bytes.data()), bytes.size());
-                    if (!file) throw Shader::RuntimeError("Native shader override read failed");
-                    const u32 source_bytes = Shader::Ampere::ProgramOverrideSourceSize(bytes);
-                    if (source_bytes > native.size() * sizeof(Shader::Ampere::Instruction)) {
-                        if (!gpu_memory->IsFullyMappedRange(program_base + native_header_size, source_bytes))
-                            throw Shader::RuntimeError("Unmapped extended native shader source");
-                        native.resize(source_bytes / sizeof(Shader::Ampere::Instruction));
-                        gpu_memory->ReadBlock(program_base + native_header_size, native.data(), source_bytes);
-                    }
-                    lowered = Shader::Ampere::DecodeProgramOverride(bytes, native);
-                    if (!lowered) throw Shader::RuntimeError("Native shader override rejected: {}", lowered.error);
-                    LOG_WARNING(Shader, "Native shader resumed: key={}, instructions={}", key, lowered.instructions.size());
-                    break;
-                }
-                std::this_thread::sleep_for(std::chrono::milliseconds{100});
-            }
-        }
-    }
-    if (!lowered) {
-        const size_t failed = lowered.error_offset / sizeof(Shader::Ampere::Instruction);
+    if (!analysis) {
+        const size_t failed = analysis.error_offset / sizeof(Shader::Ampere::Instruction);
         const auto words = failed < native.size() ? native[failed].words : std::array<u32, 4>{};
         throw Shader::RuntimeError(
             "Native shader at {:#x}, instruction {:#x}: {} [op {:03x} {:08x} {:08x} {:08x} {:08x}]",
-            program_base, lowered.error_offset, lowered.error, words[0] & 0xfff, words[0],
+            program_base, analysis.error_offset, analysis.error, words[0] & 0xfff, words[0],
             words[1], words[2], words[3]);
+    }
+    if (analysis.instruction_count < native.size()) {
+        native.resize(analysis.instruction_count);
     }
     auto result = std::make_shared<LoweredNativeCode>();
     result->native_program_key = Shader::Ampere::NativeProgramKey(native);
@@ -699,12 +630,17 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
     if (hash_for_indirect_reset) {
         result->diagnostic_key = result->native_program_key;
     }
-    result->texture_bound = lowered.required_texture_buffer;
-    result->source_size = native_header_size + lowered.source_size;
+    result->texture_bound = analysis.required_texture_buffer;
+    result->source_size = native_header_size + analysis.source_size;
+    result->options = opts;
+    result->uses_async_copy = analysis.uses_async_copy;
+    result->branch_targets = std::move(analysis.branch_targets);
     std::array<u64, sizeof(sph) / sizeof(u64)> header;
     std::memcpy(header.data(), &sph, sizeof(sph));
-    result->code = LayOutLoweredNativeCode(header, native, lowered);
-    // What Analyze returns for this program once the environment holds the lowered code.
+    result->code =
+        Shader::Ampere::PackNativeAmpereCode(header, native, opts, result->uses_async_copy);
+    result->native = std::move(native);
+    // What Analyze returns for this program once the environment holds the code.
     const u64 shader_hash = NativeShaderHash(result->code);
     if (VideoCommon::Nx2Diag::Active()) {
         VideoCommon::Nx2Diag::Diagnostics::Get().RegisterProgram(
@@ -740,8 +676,8 @@ std::shared_ptr<const LoweredNativeCode> GenericEnvironment::LowerNativeCode(u32
             }
         }
     }
-    LOG_DEBUG(Shader, "Lowered native shader at {:#x}: {} source bytes, {} instructions",
-              program_base, result->source_size, lowered.instructions.size());
+    LOG_DEBUG(Shader, "Prepared native shader at {:#x}: {} source bytes, {} instructions",
+              program_base, result->source_size, result->native.size());
     return result;
 }
 
@@ -1147,6 +1083,7 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state, u64
     take(num_cbuf_replacement_values, sizeof(u64) + sizeof(Shader::ReplaceConstant));
     code.resize(Common::DivCeil(code_size, sizeof(u64)));
     file.read(reinterpret_cast<char*>(code.data()), code_size);
+    unpacked_native = Shader::Ampere::UnpackNativeAmpereCode(code);
     for (size_t i = 0; i < num_texture_types; ++i) {
         u32 key;
         Shader::TextureType type;
@@ -1185,7 +1122,7 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state, u64
     if (stage == Shader::Stage::Compute) {
         file.read(reinterpret_cast<char*>(&workgroup_size), sizeof(workgroup_size))
             .read(reinterpret_cast<char*>(&shared_memory_size), sizeof(shared_memory_size));
-        initial_offset = Shader::Ampere::HasNativeAddressMap(code) ? sizeof(sph) : 0;
+        initial_offset = unpacked_native.has_value() ? sizeof(sph) : 0;
     } else {
         file.read(reinterpret_cast<char*>(&sph), sizeof(sph));
         initial_offset = sizeof(sph);
@@ -1199,29 +1136,27 @@ void FileEnvironment::Deserialize(std::ifstream& file, bool with_mesh_state, u64
         }
     }
     // Native programs fold bank 1 reads as they did when they were built.
-    is_proprietary_driver = texture_bound == 2 || Shader::Ampere::HasNativeAddressMap(code);
+    is_proprietary_driver = texture_bound == 2 || unpacked_native.has_value();
 }
 
 void FileEnvironment::Dump(u64 pipeline_hash, u64 shader_hash) {
     DumpImpl(pipeline_hash, shader_hash, code, read_highest, read_lowest, initial_offset, stage);
 }
 
-u32 FileEnvironment::TranslateProgramAddress(u32 address) const {
-    if (const auto translated = Shader::Ampere::NativeProgramAddress(code, address)) return *translated;
-    if (Shader::Ampere::HasNativeAddressMap(code))
-        throw Shader::RuntimeError("Invalid cached native indirect branch address {:#x}", address);
-    return address;
-}
-
 bool FileEnvironment::IsNativeProgram() const {
-    return Shader::Ampere::HasNativeAddressMap(code);
+    return unpacked_native.has_value();
 }
 
-std::span<const Shader::Ampere::NativeRegisterRemap> FileEnvironment::NativeRegisterRemaps() const {
-    if (!register_remaps) {
-        register_remaps = Shader::Ampere::NativeRegisterRemaps(code);
+std::optional<Shader::Ampere::NativeAmpereView> FileEnvironment::NativeAmpereProgram() const {
+    if (!unpacked_native) {
+        return std::nullopt;
     }
-    return *register_remaps;
+    return Shader::Ampere::NativeAmpereView{
+        .code = unpacked_native->instructions,
+        .options = unpacked_native->options,
+        .uses_async_copy = unpacked_native->uses_async_copy,
+        .branch_targets = nullptr,
+    };
 }
 
 std::vector<std::pair<u32, u32>> FileEnvironment::NullStoragePointerSlots() const {

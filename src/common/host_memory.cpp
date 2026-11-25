@@ -54,6 +54,7 @@
 
 #endif // ^^^ POSIX ^^^
 
+#include <algorithm>
 #include <cstdlib>
 #include <mutex>
 #include <random>
@@ -949,7 +950,8 @@ bool ReadMemoryIsLow() {
     if (total == 0 || available == 0) {
         return false;
     }
-    return available < std::max<u64>(u64{1} << 30, total / 10);
+    const u64 low_floor = std::clamp<u64>(total / 5, u64{2} << 30, u64{4} << 30);
+    return available < low_floor;
 #else
     return false;
 #endif

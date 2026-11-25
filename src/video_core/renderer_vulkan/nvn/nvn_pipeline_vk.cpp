@@ -354,6 +354,7 @@ VC::DescriptorLayout PipelineCache::Impl::MergeLayouts(
         merged.stores_raw_global_memory |= slice.stores_raw_global_memory;
         merged.requires_guest_warp |= slice.requires_guest_warp;
         merged.uses_bindless_table |= slice.uses_bindless_table;
+        merged.bindless_types_mask |= slice.bindless_types_mask;
         raw_stores_not_through |=
             slice.stores_raw_global_memory && !slice.raw_stores_written_through;
         merged.unsupported_count += slice.unsupported_count;
@@ -492,9 +493,36 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
             fragment != nullptr ? fragment->record->outputs_written : 0;
         pipeline->dynamic_vertex_input = !mesh && vertex_input_mode == VertexInputMode::Dynamic;
         pipeline->mesh = mesh;
-        pipeline->dynamic_fixed = gpl_set && gpl_dynamic_fixed;
-        if (pipeline->dynamic_fixed) {
+        u32 color_attachment_count = 0;
+        for (u32 slot = 0; slot < MAX_COLOR_TARGETS; ++slot) {
+            if (targets.color[slot] != VK_FORMAT_UNDEFINED) {
+                color_attachment_count = slot + 1;
+            }
+        }
+        pipeline->color_attachment_count = color_attachment_count;
+        if (options.dedup_dynamic_state) {
+            pipeline->dynamic_fixed = dynamic_caps.fixed;
+            pipeline->dynamic_polygon_mode = dynamic_caps.fixed && dynamic_caps.polygon_mode;
+            pipeline->dynamic_depth_clamp = dynamic_caps.fixed && dynamic_caps.depth_clamp;
+            pipeline->dynamic_provoking_vertex =
+                dynamic_caps.fixed && dynamic_caps.provoking_vertex;
+            pipeline->dynamic_patch_control_points =
+                dynamic_caps.fixed && has_tessellation && dynamic_caps.patch_control_points;
+            pipeline->dynamic_blend = dynamic_caps.blend && color_attachment_count > 0;
+            pipeline->dynamic_alpha_to_coverage = dynamic_caps.alpha_to_coverage;
             pipeline->fixed_values = MakeDynamicFixedState(state);
+        } else {
+            pipeline->dynamic_fixed = gpl_set && gpl_dynamic_fixed;
+            if (pipeline->dynamic_fixed) {
+                pipeline->dynamic_polygon_mode = device.SupportsDynamicState3PolygonMode();
+                pipeline->dynamic_depth_clamp = device.SupportsDynamicState3DepthClampEnable();
+                pipeline->dynamic_provoking_vertex =
+                    device.SupportsDynamicState3ProvokingVertexMode() &&
+                    device.SupportsProvokingVertexLastMode();
+                pipeline->dynamic_patch_control_points =
+                    has_tessellation && device.SupportsDynamicState2PatchControlPoints();
+                pipeline->fixed_values = MakeDynamicFixedState(state);
+            }
         }
 
         std::vector<std::string> issues;
@@ -516,6 +544,8 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::AssembleGraphics(
                 .mesh = mesh,
                 .vertex_input = vertex_input_mode,
                 .dynamic_fixed = pipeline->dynamic_fixed,
+                .dynamic_blend = pipeline->dynamic_blend,
+                .dynamic_alpha_to_coverage = pipeline->dynamic_alpha_to_coverage,
             },
             description, issues);
         for (const std::string& issue : issues) {

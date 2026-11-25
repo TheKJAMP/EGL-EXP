@@ -924,7 +924,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     const VC::DescriptorLayout& layout = pipe.descriptors;
     static const bool read_only_depth_probe = [] {
         const char* value = std::getenv("EDEN_NX2_NVN_READ_ONLY_DEPTH");
-        return value != nullptr && value[0] == '1';
+        return value == nullptr || value[0] != '0';
     }();
     const Storage* depth_attachment =
         depth_target.texture ? depth_target.texture->storage.get() : nullptr;
@@ -993,11 +993,9 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
     }
     if (layout.uses_raw_global_memory) {
         InFlight& raw_flight = host->HostFlight();
-        if (VideoCommon::RawCoverageEnabled() || !impl.HostImportEnabled()) {
-            coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
-            if (coverage_ring != 0) {
-                host->HostNeedHostReadBarrier();
-            }
+        coverage_ring = impl.RawCoverageRingFor(raw_flight.seq);
+        if (coverage_ring != 0) {
+            host->HostNeedHostReadBarrier();
         }
         raw_table = &impl.RawGlobalMemoryTable();
         impl.stats.raw_global_draws.fetch_add(1, std::memory_order_relaxed);

@@ -132,7 +132,7 @@ TEST_CASE("NVN compute shader census", "[.compute-census]") {
         out << fmt::format("B\t{}\n", index);
         out.flush();
         const auto lowered =
-            LowerNvnProgram(NvnProgramBinary{ShaderStage::Compute, shader.control, shader.code});
+            PrepareNvnProgram(NvnProgramBinary{ShaderStage::Compute, shader.control, shader.code});
         if (!lowered->error.empty()) {
             out << row << "lower: " << Clean(lowered->error) << "\n";
             continue;

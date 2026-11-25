@@ -3038,6 +3038,12 @@ void Recorder::UploadStorage(Storage& s) {
         s.scale_state =
             Rescale::AfterNativeWrite(); // the guest bytes changed the guest-sized image
     }
+    if (size >= (u64{64} << 10) &&
+        (!cpu_visible || s.host.needs_transcode || s.host.bc_standin ||
+         (pool.flags & PoolFlag::Compressible) != 0 ||
+         (!s.dynamic && size >= (u64{256} << 10)))) {
+        impl.HintColdGuestSpan(pool, s.pool_offset, size);
+    }
 }
 
 void Recorder::SyncSparse(Storage& s, bool will_overwrite) {
@@ -8835,6 +8841,7 @@ void Context::Impl::ExecutePresent(const VC::PresentRequest& request, InFlight& 
             draw_resources->NoteAsyncSkips(presents_recorded);
             draw_resources->CheckSink(presents_recorded);
             draw_resources->MaybeRefreshShaders();
+            draw_resources->OnPresent();
             if (VideoCommon::Nvn::TimestampTraceEnabled()) {
                 draw_resources->TracePresent(presents_recorded);
             }

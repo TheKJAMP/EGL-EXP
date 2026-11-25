@@ -26,6 +26,7 @@
 // background too (QueueWarmShaderParts), so the first run-time pipeline of a known set links.
 
 #include <chrono>
+#include <optional>
 #include <string>
 #include <unordered_set>
 
@@ -136,6 +137,10 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
     }
     optimize_workers->QueueWork([this, pipeline = std::move(pipeline), set = std::move(set),
                                  state, targets] {
+        {
+            std::unique_lock lock{async_mutex};
+            async_cv.wait(lock, [this] { return async_outstanding == 0 || stopping.load(); });
+        }
         if (!stopping.load()) {
             const auto start = std::chrono::steady_clock::now();
             try {
@@ -176,6 +181,8 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
                         .mesh = pipeline->mesh,
                         .vertex_input = vertex_input_mode,
                         .dynamic_fixed = pipeline->dynamic_fixed,
+                        .dynamic_blend = pipeline->dynamic_blend,
+                        .dynamic_alpha_to_coverage = pipeline->dynamic_alpha_to_coverage,
                     },
                     description, issues);
                 pipeline->optimized =
@@ -206,6 +213,60 @@ void PipelineCache::Impl::QueueOptimize(std::shared_ptr<GraphicsPipeline> pipeli
         }
         gpl_cv.notify_all();
     });
+}
+
+void PipelineCache::Impl::OnPresent() {
+    present_counter.fetch_add(1, std::memory_order_relaxed);
+}
+
+void PipelineCache::Impl::DeferOptimize(std::shared_ptr<GraphicsPipeline> pipeline,
+                                        std::shared_ptr<ShaderSet> set,
+                                        const GraphicsFixedState& state,
+                                        const RenderPassKey& targets) {
+    if (!optimize_workers || !pipeline) {
+        return;
+    }
+    std::scoped_lock lock{gpl_mutex};
+    if (stopping.load()) {
+        return;
+    }
+    pipeline->optimize_last_present.store(0, std::memory_order_relaxed);
+    pipeline->optimize_present_count = 0;
+    GraphicsPipeline* const key = pipeline.get();
+    deferred_optimizes.emplace(
+        key, DeferredOptimize{std::move(pipeline), std::move(set), state, targets});
+    key->optimize_deferred.store(true, std::memory_order_release);
+}
+
+void PipelineCache::Impl::NoteGraphicsUsed(GraphicsPipeline& pipeline) {
+    if (!pipeline.optimize_deferred.load(std::memory_order_acquire)) {
+        return;
+    }
+    const u64 cur = present_counter.load(std::memory_order_relaxed);
+    if (pipeline.optimize_last_present.load(std::memory_order_relaxed) == cur) {
+        return;
+    }
+    std::optional<DeferredOptimize> ready;
+    {
+        std::scoped_lock lock{gpl_mutex};
+        if (!pipeline.optimize_deferred.load(std::memory_order_relaxed) ||
+            pipeline.optimize_last_present.load(std::memory_order_relaxed) == cur) {
+            return;
+        }
+        pipeline.optimize_last_present.store(cur, std::memory_order_relaxed);
+        if (++pipeline.optimize_present_count < options.gpl_optimize_after_presents) {
+            return;
+        }
+        pipeline.optimize_deferred.store(false, std::memory_order_release);
+        if (const auto it = deferred_optimizes.find(&pipeline); it != deferred_optimizes.end()) {
+            ready = std::move(it->second);
+            deferred_optimizes.erase(it);
+        }
+    }
+    if (ready && !stopping.load()) {
+        QueueOptimize(std::move(ready->pipeline), std::move(ready->set), ready->state,
+                      ready->targets);
+    }
 }
 
 void PipelineCache::Impl::PrepareProgram(const std::array<StageProgram, STAGE_COUNT>& stages,

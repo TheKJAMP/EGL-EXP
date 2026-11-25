@@ -92,6 +92,7 @@ constexpr u32 CpuUncached = 1u << 1;
 constexpr u32 CpuCached = 1u << 2;
 constexpr u32 GpuNoAccess = 1u << 3;
 constexpr u32 ShaderCode = 1u << 6;
+constexpr u32 Compressible = 1u << 7;
 constexpr u32 Physical = 1u << 8;
 constexpr u32 Virtual = 1u << 9;
 } // namespace PoolFlag
@@ -448,6 +449,12 @@ struct Storage : std::enable_shared_from_this<Storage> {
     u64 last_used_seq{0};
     /// Context::Impl::stats.presents at the last use (the trim's age clock).
     u64 last_used_present{0};
+    /// Present frame index (`stats.presents + 1`, 0 = never) when last bound as a render target.
+    u64 last_rt_frame{0};
+    /// Distinct recent presents (`delta <= 4`) this storage was consecutively bound as an RT.
+    u32 consecutive_rt_frames{0};
+    /// Present frame index (`stats.presents + 1`, 0 = never) of the last full-target clear.
+    u64 last_full_clear_frame{0};
     /// PoolIndex::write_gen at which TrimStorageCache found this (GPU-written) storage not
     /// superseded: it is not tested again before another GPU write in its pool (the test scans
     /// every storage over its bytes).
@@ -1034,6 +1041,11 @@ struct Context::Impl {
     std::atomic<u64> pool_slow_logged{0};
     /// Large host-memory chunks pools are bound into and their cost. Guarded by backing_mutex.
     std::vector<std::shared_ptr<ImportedChunk>> import_chunks;
+    std::atomic<bool> has_imported_guest_ranges{false};
+    mutable std::mutex imported_ranges_mutex;
+    std::vector<std::pair<u64, u64>> imported_guest_ranges;
+    void NoteImportedGuestRange(u64 begin, u64 size);
+    [[nodiscard]] bool OverlapsImportedGuestRange(u64 begin, u64 size) const;
     /// Serializes everything that backs pools: the replay thread (EnsureBacking, the raw global
     /// table) and the backing thread. Held while a chunk is imported (up to ~250 ms).
     std::mutex backing_mutex;
@@ -1991,6 +2003,14 @@ struct Context::Impl {
     void RecordScaleBlit(vk::CommandBuffer cmd, Storage& native, bool to_scaled) const;
     /// Replay thread: reads the texture's image back into guest memory (CmdFlushTexture).
     void FlushTextureNow(CmdFlushTexture& command);
+    /// Hints to the host OS that guest memory backing `[offset, offset + size)` of `pool` has
+    /// already been uploaded/copied to device storage and may be cold-paged.
+    void HintColdGuestSpan(const Pool& pool, u64 offset, u64 size) const;
+    /// Periodically re-hints uploaded device-backed guest spans when cold hinting is enabled.
+    void HintColdUploadedGuestRanges(u64 presents);
+    u64 cold_hint_next_present{0};
+    u64 cold_hint_va_cursor{0};
+
     /// Drops cached storages nobody uses once the cache is over budget (least recently used first)
     /// or the device over its memory budget, and idle render targets past the age limit.
     /// `at_present`: the periodic pass of a present (the cache need not have grown).

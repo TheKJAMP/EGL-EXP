@@ -1942,9 +1942,8 @@ std::optional<IR::U32> AddendOfBufferLowWord(const IR::U32& value, StorageBuffer
             continue;
         }
         const IR::Inst* const low{candidate.InstRecursive()};
-        if (low->GetOpcode() == IR::Opcode::GetCbufU32 && low->Arg(0).IsImmediate() &&
-            low->Arg(1).IsImmediate() && low->Arg(0).U32() == buffer.index &&
-            low->Arg(1).U32() == buffer.offset) {
+        if (const auto word{CbufWord(low)};
+            word && word->index == buffer.index && word->offset == buffer.offset) {
             return IR::U32{add->Arg(1 - arg)};
         }
     }

@@ -202,6 +202,10 @@ void DrawContext::OnSegmentBegin(bool keep_shadows) {
     bound_pipeline = VK_NULL_HANDLE;
     bound_state.Reset();
     vertex_input_set = false;
+    fixed_state_set = false;
+    patch_control_points_set = false;
+    blend_state_set = false;
+    alpha_to_coverage_set = false;
 }
 
 void DrawContext::OnSegmentEnd() {
@@ -935,6 +939,16 @@ AttachmentFormat FormatOf(const Device& device, const Texture& texture,
     return result;
 }
 
+[[nodiscard]] Storage* CanonicalTargetStorage(const std::shared_ptr<Texture>& texture,
+                                              const std::shared_ptr<Texture>& native) noexcept {
+    const Texture* const tex = native ? native.get() : texture.get();
+    if (!tex || !tex->storage) {
+        return nullptr;
+    }
+    Storage* const st = tex->storage.get();
+    return st->scale_owner != nullptr ? st->scale_owner : st;
+}
+
 } // namespace
 
 bool DrawContext::NamesNoTarget() const {
@@ -1395,11 +1409,21 @@ bool DrawContext::BeginPass(bool read_only_depth) {
     pass_read_only_depth = read_only_depth;
     pass_has_color = false;
     pass_has_depth = false;
+    const u64 rt_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
     for (u32 i = 0; i < attachment_count; ++i) {
-        const Storage& storage = *attachments[i].storage;
-        const bool is_depth = storage.host.depth || storage.host.stencil;
+        Storage& raw_storage = *attachments[i].storage;
+        Storage& storage = raw_storage.scale_owner != nullptr ? *raw_storage.scale_owner
+                                                              : raw_storage;
+        if (storage.last_rt_frame != rt_frame) {
+            const u64 delta = storage.last_rt_frame != 0 && rt_frame >= storage.last_rt_frame
+                                  ? (rt_frame - storage.last_rt_frame)
+                                  : ~u64{0};
+            storage.consecutive_rt_frames = delta <= 4 ? (storage.consecutive_rt_frames + 1) : 1u;
+            storage.last_rt_frame = rt_frame;
+        }
+        const bool is_depth = raw_storage.host.depth || raw_storage.host.stencil;
         if (is_depth) {
-            pass_has_depth = pass_has_depth || !read_only_depth || storage.host.stencil;
+            pass_has_depth = pass_has_depth || !read_only_depth || raw_storage.host.stencil;
         } else {
             pass_has_color = true;
         }
@@ -2088,6 +2112,11 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
     if (!pass_open && !host->HostConditional() && (p.mask & 0xF) == 0xF && TargetsUsable()) {
         VkExtent2D native_extent{};
         if (TargetNativeExtent(native_extent) && ScissorCoversFullTarget(native_extent)) {
+            if (Storage* const st = CanonicalTargetStorage(color_targets[p.index].texture,
+                                                           color_targets[p.index].native)) {
+                st->last_full_clear_frame =
+                    impl.stats.presents.load(std::memory_order_relaxed) + 1;
+            }
             pending_clears.color_mask |= static_cast<u8>(1u << p.index);
             std::memcpy(pending_clears.color[p.index].uint32, p.color, sizeof(p.color));
             return finish();
@@ -2133,6 +2162,13 @@ void DrawContext::ClearColor(const VC::ClearColorPayload& p) {
         .layerCount = framebuffer_layers,
     };
     host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
+    if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
+        rect.extent.height == host_extent.height) {
+        if (Storage* const st = CanonicalTargetStorage(color_targets[p.index].texture,
+                                                       color_targets[p.index].native)) {
+            st->last_full_clear_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
+        }
+    }
     finish();
 }
 
@@ -2151,6 +2187,13 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
         TargetsUsable() && !(stencil_bits != 0 && stencil_bits != 0xFF && st->host.stencil)) {
         VkExtent2D native_extent{};
         if (TargetNativeExtent(native_extent) && ScissorCoversFullTarget(native_extent)) {
+            if ((p.depth_mask && st->host.depth) || (stencil_bits == 0xFF && st->host.stencil)) {
+                if (Storage* const canon =
+                        CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
+                    canon->last_full_clear_frame =
+                        impl.stats.presents.load(std::memory_order_relaxed) + 1;
+                }
+            }
             if (p.depth_mask && st->host.depth) {
                 pending_clears.clear_depth = true;
                 pending_clears.depth = p.depth;
@@ -2195,6 +2238,14 @@ void DrawContext::ClearDepthStencil(const VC::ClearDepthStencilPayload& p) {
             .layerCount = framebuffer_layers,
         };
         host->HostCmd().ClearAttachments(std::span{&clear, 1}, std::span{&clear_rect, 1});
+        if (rect.offset.x == 0 && rect.offset.y == 0 && rect.extent.width == host_extent.width &&
+            rect.extent.height == host_extent.height) {
+            if (Storage* const canon =
+                    CanonicalTargetStorage(depth_target.texture, depth_target.native)) {
+                canon->last_full_clear_frame =
+                    impl.stats.presents.load(std::memory_order_relaxed) + 1;
+            }
+        }
     }
     if (stencil_bits != 0 && stencil_bits != 0xFF && storage.host.stencil) {
         const bool gated = host->HostSuspendCondition();
@@ -2466,8 +2517,32 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
         resources.Cache().PrefetchGraphics(request, lookahead->skip_key);
         return nullptr;
     }
+    bool targets_per_frame = false;
+    {
+        bool has_target = false;
+        const u64 rt_frame = impl.stats.presents.load(std::memory_order_relaxed) + 1;
+        const auto check_target = [&](const TargetBinding& target) {
+            Storage* const st = CanonicalTargetStorage(target.texture, target.native);
+            if (!st) {
+                return true;
+            }
+            has_target = true;
+            if (st->last_rt_frame == 0 || rt_frame < st->last_rt_frame ||
+                (rt_frame - st->last_rt_frame) > 4) {
+                return false;
+            }
+            const bool cleared_this_frame = st->last_full_clear_frame == rt_frame;
+            const u32 min_consecutive = cleared_this_frame ? 4u : 8u;
+            return st->consecutive_rt_frames >= min_consecutive;
+        };
+        bool all_ok = check_target(depth_target);
+        for (u32 i = 0; i < color_target_count && all_ok; ++i) {
+            all_ok = check_target(color_targets[i]);
+        }
+        targets_per_frame = all_ok && has_target;
+    }
     // Only a draw that may be skipped asks without waiting for a compile on a worker.
-    const bool may_skip = !impl.mario_kart_world &&
+    const bool may_skip = !impl.mario_kart_world && targets_per_frame &&
                           MaySkipUnbuiltDraw(StoresGlobalMemory(request),
                                              depth_target.texture != nullptr, element_count);
     std::shared_ptr<GraphicsPipeline> result =
@@ -2493,7 +2568,8 @@ std::shared_ptr<GraphicsPipeline> DrawContext::ResolvePipeline(u32 mode, u32 ele
     return result;
 }
 
-void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
+void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key,
+                                           u64 skip_compute_hash) {
     auto records = host->HostRecordsAhead();
     if (records.empty() || VideoCommon::ShaderLog::Enabled()) {
         return;
@@ -2516,8 +2592,8 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
         vertex_layout_dirty = saved_layout_dirty;
     };
 
-    constexpr size_t MAX_COMMANDS = 192;
-    constexpr size_t MAX_DRAWS = 8;
+    constexpr size_t MAX_COMMANDS = 512;
+    constexpr size_t MAX_DRAWS = 24;
     size_t draws = 0;
     u32 previous_mode = current_mode;
     bool changed = false;
@@ -2603,6 +2679,13 @@ void DrawContext::PrefetchUpcomingGraphics(u32 current_mode, u64 current_key) {
             }
             mode = MESH_DRAW_MODE;
             break;
+        case Op::Dispatch:
+            if (bytes < sizeof(VC::DispatchPayload)) {
+                return;
+            }
+            PrefetchBoundCompute(skip_compute_hash);
+            ++draws;
+            continue;
         default:
             return;
         }
@@ -2887,6 +2970,9 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         }
         return false;
     }
+    if (active->optimize_deferred.load(std::memory_order_relaxed)) {
+        resources.Cache().NoteGraphicsUsed(*active);
+    }
     out = {};
     out.pipeline = active.get();
     out.host_topology = mode;
@@ -2917,7 +3003,10 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
         ++counters.draws_skipped;
         return false;
     }
-    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan)) {
+    const u32 bindless_mask = active->descriptors.bindless_types_mask != 0
+                                  ? active->descriptors.bindless_types_mask
+                                  : ~u32{0};
+    if (active->descriptors.uses_bindless_table && !BindlessPrepare(plan, bindless_mask)) {
         ++counters.draws_skipped;
         host->HostUnsupported("Draw", "the bindless texture table cannot be created");
         return false;
@@ -3125,51 +3214,131 @@ bool DrawContext::PrepareDraw(u32 mode, u32 element_count, const IndexRange* ind
             // Unknown predecessor, or static cull/depth/stencil state replaced the dynamic one.
             fixed_state_set = false;
         }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_patch_control_points) {
+            patch_control_points_set = false;
+        }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_blend) {
+            blend_state_set = false;
+        }
+        if (bound_pipeline == VK_NULL_HANDLE || !active->dynamic_alpha_to_coverage) {
+            alpha_to_coverage_set = false;
+        }
         bound_pipeline = handle;
         vertex_dirty = true;
         bound_state.OnPipelineBind(active->layout, active->descriptors.UsesPushConstants());
     }
-    if (active->dynamic_fixed && (!fixed_state_set || fixed_state != active->fixed_values)) {
-        const DynamicFixedState& v = active->fixed_values;
-        const bool all = !fixed_state_set;
-        if (all || fixed_state.cull_mode != v.cull_mode) {
-            cmd.SetCullModeEXT(v.cull_mode);
-        }
-        if (all || fixed_state.front_face != v.front_face) {
-            cmd.SetFrontFaceEXT(v.front_face);
-        }
-        if (all || fixed_state.depth_bias_enable != v.depth_bias_enable) {
-            cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
-        }
-        if (all || fixed_state.depth_test_enable != v.depth_test_enable) {
-            cmd.SetDepthTestEnableEXT(v.depth_test_enable);
-        }
-        if (all || fixed_state.depth_write_enable != v.depth_write_enable) {
-            cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
-        }
-        if (all || fixed_state.depth_compare_op != v.depth_compare_op) {
-            cmd.SetDepthCompareOpEXT(v.depth_compare_op);
-        }
-        if (all || fixed_state.stencil_test_enable != v.stencil_test_enable) {
-            cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
-        }
-        const bool front_changed = all || fixed_state.front != v.front;
-        const bool back_changed = all || fixed_state.back != v.back;
-        if (front_changed && back_changed && v.front == v.back) {
-            cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, v.front.fail, v.front.pass,
-                                v.front.depth_fail, v.front.compare);
-        } else {
-            if (front_changed) {
-                cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
+    if (active->dynamic_fixed) {
+        const DynamicFixedState v = MakeDynamicFixedState(fixed);
+        if (!fixed_state_set || fixed_state != v) {
+            const bool all = !fixed_state_set;
+            if (all || fixed_state.cull_mode != v.cull_mode) {
+                cmd.SetCullModeEXT(v.cull_mode);
+            }
+            if (all || fixed_state.front_face != v.front_face) {
+                cmd.SetFrontFaceEXT(v.front_face);
+            }
+            if (all || fixed_state.depth_bias_enable != v.depth_bias_enable) {
+                cmd.SetDepthBiasEnableEXT(v.depth_bias_enable);
+            }
+            if (all || fixed_state.depth_test_enable != v.depth_test_enable) {
+                cmd.SetDepthTestEnableEXT(v.depth_test_enable);
+            }
+            if (all || fixed_state.depth_write_enable != v.depth_write_enable) {
+                cmd.SetDepthWriteEnableEXT(v.depth_write_enable);
+            }
+            if (all || fixed_state.depth_compare_op != v.depth_compare_op) {
+                cmd.SetDepthCompareOpEXT(v.depth_compare_op);
+            }
+            if (all || fixed_state.stencil_test_enable != v.stencil_test_enable) {
+                cmd.SetStencilTestEnableEXT(v.stencil_test_enable);
+            }
+            if (active->dynamic_polygon_mode &&
+                (all || fixed_state.polygon_mode != v.polygon_mode)) {
+                cmd.SetPolygonModeEXT(v.polygon_mode);
+            }
+            if (active->dynamic_depth_clamp &&
+                (all || fixed_state.depth_clamp_enable != v.depth_clamp_enable)) {
+                cmd.SetDepthClampEnableEXT(v.depth_clamp_enable);
+            }
+            if (active->dynamic_provoking_vertex &&
+                (all || fixed_state.provoking_vertex_mode != v.provoking_vertex_mode)) {
+                cmd.SetProvokingVertexModeEXT(v.provoking_vertex_mode);
+            }
+            const bool front_changed = all || fixed_state.front != v.front;
+            const bool back_changed = all || fixed_state.back != v.back;
+            if (front_changed && back_changed && v.front == v.back) {
+                cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_AND_BACK, v.front.fail, v.front.pass,
                                     v.front.depth_fail, v.front.compare);
+            } else {
+                if (front_changed) {
+                    cmd.SetStencilOpEXT(VK_STENCIL_FACE_FRONT_BIT, v.front.fail, v.front.pass,
+                                        v.front.depth_fail, v.front.compare);
+                }
+                if (back_changed) {
+                    cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass,
+                                        v.back.depth_fail, v.back.compare);
+                }
             }
-            if (back_changed) {
-                cmd.SetStencilOpEXT(VK_STENCIL_FACE_BACK_BIT, v.back.fail, v.back.pass,
-                                    v.back.depth_fail, v.back.compare);
-            }
+            fixed_state = v;
+            fixed_state_set = true;
         }
-        fixed_state = v;
-        fixed_state_set = true;
+    }
+    if (active->dynamic_patch_control_points) {
+        const u32 patch_points = fixed.patch_vertices != 0 ? fixed.patch_vertices : 1u;
+        if (!patch_control_points_set || bound_patch_control_points != patch_points) {
+            cmd.SetPatchControlPointsEXT(patch_points);
+            bound_patch_control_points = patch_points;
+            patch_control_points_set = true;
+        }
+    }
+    if (active->dynamic_alpha_to_coverage) {
+        const bool a2c = (active->color_outputs_written & 1u) != 0 &&
+                         VC::MultisampleState::AlphaToCoverage(fixed.multisample.data());
+        if (!alpha_to_coverage_set || bound_alpha_to_coverage != a2c) {
+            cmd.SetAlphaToCoverageEnableEXT(a2c);
+            bound_alpha_to_coverage = a2c;
+            alpha_to_coverage_set = true;
+        }
+    }
+    if (active->dynamic_blend && active->color_attachment_count > 0) {
+        DynamicBlendState live_blend = MakeDynamicBlendState(fixed, MakePassKey());
+        if (live_blend.attachment_count > 0 && (!blend_state_set || blend_state != live_blend)) {
+            const bool all =
+                !blend_state_set || blend_state.attachment_count != live_blend.attachment_count;
+            if (all || blend_state.logic_op_enable != live_blend.logic_op_enable) {
+                cmd.SetLogicOpEnableEXT(live_blend.logic_op_enable);
+            }
+            if (all || blend_state.logic_op != live_blend.logic_op) {
+                cmd.SetLogicOpEXT(live_blend.logic_op);
+            }
+            bool enable_changed = all;
+            bool eq_changed = all;
+            bool mask_changed = all;
+            for (u32 i = 0;
+                 i < live_blend.attachment_count && !(enable_changed && eq_changed && mask_changed);
+                 ++i) {
+                enable_changed |= blend_state.blend_enable[i] != live_blend.blend_enable[i];
+                mask_changed |= blend_state.write_masks[i] != live_blend.write_masks[i];
+                eq_changed |= std::memcmp(&blend_state.equations[i], &live_blend.equations[i],
+                                          sizeof(VkColorBlendEquationEXT)) != 0;
+            }
+            if (enable_changed) {
+                cmd.SetColorBlendEnableEXT(0, vk::Span<VkBool32>{live_blend.blend_enable.data(),
+                                                                 live_blend.attachment_count});
+            }
+            if (eq_changed) {
+                cmd.SetColorBlendEquationEXT(
+                    0, vk::Span<VkColorBlendEquationEXT>{live_blend.equations.data(),
+                                                         live_blend.attachment_count});
+            }
+            if (mask_changed) {
+                cmd.SetColorWriteMaskEXT(
+                    0, vk::Span<VkColorComponentFlags>{live_blend.write_masks.data(),
+                                                       live_blend.attachment_count});
+            }
+            blend_state = live_blend;
+            blend_state_set = true;
+        }
     }
     if (active->dynamic_vertex_input && !vertex_input_set) {
         // Strides and divisors are in the binding descriptions (no vkCmdBindVertexBuffers2).

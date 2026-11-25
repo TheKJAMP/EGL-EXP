@@ -18,8 +18,8 @@
 #include "common/fs/fs_paths.h"
 #include "common/fs/path_util.h"
 #include "common/logging.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
-#include "shader_recompiler/frontend/ampere/program_override.h"
 
 namespace VideoCommon::PathDiff {
 

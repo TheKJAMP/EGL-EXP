@@ -178,9 +178,13 @@ void WriteLayout(Writer& w, const VC::DescriptorLayout& layout) {
     w.U8(layout.uses_render_area ? 1 : 0);
     // 4: raw_stores_written_through (records from before it read 0: the stores are not).
     // 8: requires_guest_warp (records from before it read 0).
+    // 32: bindless_types_mask word follows.
     w.U8((layout.uses_raw_global_memory ? 1 : 0) | (layout.stores_raw_global_memory ? 2 : 0) |
          (layout.raw_stores_written_through ? 4 : 0) | (layout.requires_guest_warp ? 8 : 0) |
-         (layout.uses_bindless_table ? 16 : 0));
+         (layout.uses_bindless_table ? 16 : 0) | (layout.bindless_types_mask != 0 ? 32 : 0));
+    if (layout.bindless_types_mask != 0) {
+        w.U32(layout.bindless_types_mask);
+    }
     w.U32(layout.unsupported_count);
     w.U32(static_cast<u32>(layout.bindings.size()));
     for (const VC::DescriptorBinding& b : layout.bindings) {
@@ -220,6 +224,11 @@ bool ReadLayout(Reader& r, VC::DescriptorLayout& out) {
     out.raw_stores_written_through = (raw_global & 4) != 0;
     out.requires_guest_warp = (raw_global & 8) != 0;
     out.uses_bindless_table = (raw_global & 16) != 0;
+    if ((raw_global & 32) != 0) {
+        out.bindless_types_mask = r.U32();
+    } else if (out.uses_bindless_table) {
+        out.bindless_types_mask = ~u32{0};
+    }
     out.unsupported_count = r.U32();
     const u32 count = r.U32();
     // Every binding takes at least 78 bytes: a count the input cannot hold is garbage.

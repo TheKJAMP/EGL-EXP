@@ -325,7 +325,7 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
     // the images/storages the replay updated meanwhile) without walking unchanged entries.
     if (!force && state.synced_seq == seq && textures_same && samplers_same &&
         state.entries_epoch == cur_tex_epoch && state.storage_change_epoch == cur_storage_epoch &&
-        state.retry_slots.empty()) {
+        state.retry_slots.empty() && !state.types_mask_dirty) {
         return;
     }
     state.synced_seq = seq;
@@ -345,19 +345,21 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
     infos.clear();
     std::array<VkImageView, TEXTURE_BINDINGS + 1> want{};
     std::array<VkImageLayout, TEXTURE_BINDINGS + 1> want_layout{};
-    bool full_scan = state.entries.empty();
-    if (full_scan) {
+    bool full_scan = state.entries.empty() || state.types_mask_dirty;
+    state.types_mask_dirty = false;
+    if (state.entries.empty()) {
         state.entries.resize(Shader::BINDLESS_TEXTURE_CAPACITY);
         state.synced_serials.assign(Shader::BINDLESS_TEXTURE_CAPACITY, 0);
-        state.unprimed_queued.assign(Shader::BINDLESS_TEXTURE_CAPACITY, 0);
-        state.unprimed_slots.clear();
-        state.unprimed_head = 0;
         state.entries_epoch = cur_tex_epoch;
         state.storage_change_epoch = cur_storage_epoch;
     } else if ((cur_tex_epoch - state.entries_epoch) > impl.texture_erased.size() ||
                (cur_storage_epoch - state.storage_change_epoch) >
                    impl.bindless_storage_changed.size()) {
         full_scan = true;
+    }
+    if (full_scan) {
+        state.unprimed_queued.assign(Shader::BINDLESS_TEXTURE_CAPACITY, 0);
+        state.unprimed_slots.clear();
     }
 
     thread_local std::vector<u32> dirty_ids;
@@ -433,6 +435,7 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
         VkImageLayout layout = VK_IMAGE_LAYOUT_UNDEFINED;
         bool ready = false;
         bool any = false;
+        bool eligible_for_prime = false;
         if (serial != 0) {
             const std::shared_ptr<Texture>& texture = TextureOfId(id);
             if (texture) {
@@ -445,20 +448,23 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                 image_gen = s.image_gen;
                 format = s.host.format;
                 ready = has_data(s);
+                const s32 target = texture->desc.view.set_target ? texture->desc.view.target
+                                                                 : texture->desc.target;
+                const auto target_types = TypesOfTarget(target);
                 if (ready) {
                     layout = ReadLayoutOf(s);
-                    const s32 target = texture->desc.view.set_target ? texture->desc.view.target
-                                                                     : texture->desc.target;
                     const bool is_integer =
                         VideoCore::Surface::IsPixelFormatInteger(texture->host.pixel_format);
-                    for (const std::optional<Shader::TextureType>& type : TypesOfTarget(target)) {
-                        if (!type) {
+                    for (const std::optional<Shader::TextureType>& type : target_types) {
+                        if (!type ||
+                            (state.requested_types_mask & (1u << static_cast<u32>(*type))) == 0) {
                             continue;
                         }
                         ViewKey key{};
                         if (!ViewKeyOf(*texture, s, *type, false, key)) {
                             continue;
                         }
+                        eligible_for_prime = true;
                         if (s.pending_unrestricted_formats || !s.FormatListAllows(key.format)) {
                             if (!pass_open) {
                                 host->HostUpgradeImageCaps(s, false, true);
@@ -491,12 +497,25 @@ void DrawContext::BindlessSync(bool force, DrawPlan* plan) {
                         }
                         any = true;
                     }
+                } else if (NeedsBindlessPrime(impl, s)) {
+                    for (const std::optional<Shader::TextureType>& type : target_types) {
+                        if (!type ||
+                            (state.requested_types_mask & (1u << static_cast<u32>(*type))) == 0) {
+                            continue;
+                        }
+                        ViewKey key{};
+                        if (ViewKeyOf(*texture, s, *type, false, key)) {
+                            eligible_for_prime = true;
+                            break;
+                        }
+                    }
                 }
             }
         }
         BindlessAttachEntry(state, id, serial, texture_node, storage_sp, image_gen, format, layout,
                             ready, any);
-        if (storage_sp && NeedsBindlessPrime(impl, *storage_sp) && !state.unprimed_queued[id]) {
+        if (eligible_for_prime && storage_sp && NeedsBindlessPrime(impl, *storage_sp) &&
+            !state.unprimed_queued[id]) {
             state.unprimed_queued[id] = 1;
             state.unprimed_slots.push_back(id);
         }

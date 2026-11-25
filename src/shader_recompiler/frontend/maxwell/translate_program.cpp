@@ -349,13 +349,13 @@ void TightenOutputVertices(IR::Program& program) {
 }
 } // Anonymous namespace
 
-IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
-                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+IR::Program FinalizeProgram(IR::AbstractSyntaxList&& syntax_list, Environment& env,
+                            const HostTranslateInfo& host_info) {
     HostTranslateInfo normalized_host_info{host_info};
     normalized_host_info.ApplyDescriptorLimitPolicy();
 
     IR::Program program;
-    program.syntax_list = BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info);
+    program.syntax_list = std::move(syntax_list);
     program.blocks = GenerateBlocks(program.syntax_list);
     program.post_order_blocks = PostOrder(program.syntax_list.front());
     program.stage = env.ShaderStage();
@@ -448,6 +448,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::SsaRewritePass(program);
 
     Optimization::ConstantPropagationPass(env, program);
+    Optimization::ValueNumberingPass(program);
 
     Optimization::PositionPass(env, program);
     Optimization::BlitConstantsPass(env, program);
@@ -456,6 +457,7 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     Optimization::GlobalMemoryToStorageBufferPass(env, program, normalized_host_info);
     Optimization::GeometryCompactionPass(program, normalized_host_info);
     Optimization::TexturePass(env, program, normalized_host_info);
+    Optimization::ValueNumberingPass(program);
 
     if (Settings::values.resolution_info.active && !host_info.skip_rescaling_pass) {
         Optimization::RescalingPass(program);
@@ -485,6 +487,14 @@ IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Blo
     AddNVNStorageBuffers(program, normalized_host_info);
     Optimization::AddRawGlobalTableDescriptor(program.info);
     return program;
+}
+
+IR::Program TranslateProgram(ObjectPool<IR::Inst>& inst_pool, ObjectPool<IR::Block>& block_pool,
+                             Environment& env, Flow::CFG& cfg, const HostTranslateInfo& host_info) {
+    HostTranslateInfo normalized_host_info{host_info};
+    normalized_host_info.ApplyDescriptorLimitPolicy();
+    return FinalizeProgram(BuildASL(inst_pool, block_pool, env, cfg, normalized_host_info), env,
+                           normalized_host_info);
 }
 
 IR::Program MergeDualVertexPrograms(IR::Program& vertex_a, IR::Program& vertex_b,

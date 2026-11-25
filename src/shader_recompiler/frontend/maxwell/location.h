@@ -23,6 +23,14 @@ public:
         Align();
     }
 
+    /// Constructs a location storing an unaligned or native byte offset without Maxwell scheduling
+    /// word alignment (used by the direct Ampere CFG).
+    [[nodiscard]] static constexpr Location Raw(u32 raw_offset) noexcept {
+        Location loc;
+        loc.offset = raw_offset;
+        return loc;
+    }
+
     constexpr Location Virtual() const noexcept {
         Location virtual_location;
         virtual_location.offset = offset - VIRTUAL_BIAS;

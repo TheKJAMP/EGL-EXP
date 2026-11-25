@@ -27,6 +27,7 @@
 
 #include "common/cityhash.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/host_translate_info.h"
@@ -68,6 +69,14 @@ std::string Translate(Shader::Environment& env) try {
     profile.support_vote = true;
     profile.warp_size_potentially_larger_than_guest = false;
 
+    if (const auto native = env.NativeAmpereProgram()) {
+        Shader::IR::Program program{Shader::Ampere::TranslateProgram(
+            inst_pool, block_pool, flow_pool, env, native->code, native->options,
+            native->uses_async_copy, native->branch_targets, host)};
+        const std::vector<u32> spirv{Shader::Backend::SPIRV::EmitSPIRV(profile, program)};
+        return fmt::format("{:016x}", Common::CityHash64(reinterpret_cast<const char*>(spirv.data()),
+                                                         spirv.size() * sizeof(u32)));
+    }
     Shader::Maxwell::Flow::CFG cfg{env, flow_pool, env.StartAddress()};
     Shader::IR::Program program{
         Shader::Maxwell::TranslateProgram(inst_pool, block_pool, env, cfg, host)};

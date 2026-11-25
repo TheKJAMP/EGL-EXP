@@ -19,12 +19,15 @@
 //      https://link.springer.com/chapter/10.1007/978-3-642-37051-9_6
 //
 
+#include <algorithm>
 #include <deque>
 #include <map>
 #include <span>
 #include "common/container/unordered_map.h"
 #include <variant>
 #include <vector>
+
+#include <boost/container/small_vector.hpp>
 
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/opcodes.h"
@@ -61,11 +64,11 @@ using Variant = std::variant<IR::Reg, IR::Pred, ZeroFlagTag, SignFlagTag, CarryF
 // Fixed-count variables live in the blocks, like registers: every read walks back through
 // blocks and looks up or writes a definition in each, and node-based maps per variable made
 // those lookups and their allocations a large part of the pass.
-constexpr size_t SSA_ZERO_FLAG = IR::NUM_USER_PREDS;
-constexpr size_t SSA_SIGN_FLAG = IR::NUM_USER_PREDS + 1;
-constexpr size_t SSA_CARRY_FLAG = IR::NUM_USER_PREDS + 2;
-constexpr size_t SSA_OVERFLOW_FLAG = IR::NUM_USER_PREDS + 3;
-constexpr size_t SSA_INDIRECT_BRANCH = IR::NUM_USER_PREDS + 4;
+constexpr size_t SSA_ZERO_FLAG = IR::NUM_SSA_PREDS;
+constexpr size_t SSA_SIGN_FLAG = IR::NUM_SSA_PREDS + 1;
+constexpr size_t SSA_CARRY_FLAG = IR::NUM_SSA_PREDS + 2;
+constexpr size_t SSA_OVERFLOW_FLAG = IR::NUM_SSA_PREDS + 3;
+constexpr size_t SSA_INDIRECT_BRANCH = IR::NUM_SSA_PREDS + 4;
 static_assert(SSA_INDIRECT_BRANCH < IR::Block::NUM_SSA_VALUES);
 
 struct GotoKey {
@@ -354,7 +357,7 @@ private:
         const size_t num_args{phi.NumArgs()};
         for (size_t arg_index = 0; arg_index < num_args; ++arg_index) {
             const IR::Value& op{phi.Arg(arg_index)};
-            if (op.Resolve() == same.Resolve() || op == IR::Value{&phi}) {
+            if (op.Resolve() == same.Resolve() || op.Resolve() == IR::Value{&phi}) {
                 // Unique value or self-reference
                 continue;
             }
@@ -467,19 +470,26 @@ void VisitBlock(Pass& pass, IR::Block* block) {
 }
 
 IR::Type GetConcreteType(IR::Inst* inst) {
+    boost::container::small_vector<IR::Inst*, 16> visited;
     std::deque<IR::Inst*> queue;
+    visited.push_back(inst);
     queue.push_back(inst);
     while (!queue.empty()) {
         IR::Inst* current = queue.front();
         queue.pop_front();
         const size_t num_args{current->NumArgs()};
         for (size_t i = 0; i < num_args; ++i) {
-            const auto set_type = current->Arg(i).Type();
+            const IR::Value resolved = current->Arg(i).Resolve();
+            const auto set_type = resolved.Type();
             if (set_type != IR::Type::Opaque) {
                 return set_type;
             }
-            if (!current->Arg(i).IsImmediate()) {
-                queue.push_back(current->Arg(i).Inst());
+            if (!resolved.IsImmediate()) {
+                IR::Inst* const next_inst = resolved.Inst();
+                if (std::ranges::find(visited, next_inst) == visited.end()) {
+                    visited.push_back(next_inst);
+                    queue.push_back(next_inst);
+                }
             }
         }
     }
@@ -492,6 +502,63 @@ void SsaRewritePass(IR::Program& program) {
     const auto end{program.post_order_blocks.rend()};
     for (auto block = program.post_order_blocks.rbegin(); block != end; ++block) {
         VisitBlock(pass, *block);
+    }
+    const auto undef_for_type = [](IR::Type type) {
+        switch (type) {
+        case IR::Type::U1:
+            return IR::Opcode::UndefU1;
+        case IR::Type::U8:
+            return IR::Opcode::UndefU8;
+        case IR::Type::U16:
+            return IR::Opcode::UndefU16;
+        case IR::Type::U64:
+            return IR::Opcode::UndefU64;
+        default:
+            return IR::Opcode::UndefU32;
+        }
+    };
+    for (int iter = 0; iter < 16; ++iter) {
+        bool changed = false;
+        for (auto block = program.post_order_blocks.rbegin(); block != end; ++block) {
+            IR::Block* const blk = *block;
+            auto& list = blk->Instructions();
+            for (auto it = list.begin(); it != list.end() && it->GetOpcode() == IR::Opcode::Phi;) {
+                auto next = std::next(it);
+                IR::Inst& inst = *it;
+                IR::Value same;
+                bool trivial = true;
+                const size_t num_args = inst.NumArgs();
+                for (size_t i = 0; i < num_args; ++i) {
+                    const IR::Value op = inst.Arg(i).Resolve();
+                    if (op == same.Resolve() || op == IR::Value{&inst}) {
+                        continue;
+                    }
+                    if (!same.IsEmpty()) {
+                        trivial = false;
+                        break;
+                    }
+                    same = op;
+                }
+                if (trivial) {
+                    list.erase(it);
+                    auto reinsert = std::ranges::find_if_not(list, IR::IsPhi);
+                    if (same.IsEmpty()) {
+                        const IR::Type concrete =
+                            inst.Type() == IR::Type::Opaque ? GetConcreteType(&inst) : inst.Type();
+                        reinsert = blk->PrependNewInst(reinsert, undef_for_type(concrete));
+                        same = IR::Value{&*reinsert};
+                        ++reinsert;
+                    }
+                    list.insert(reinsert, inst);
+                    inst.ReplaceUsesWith(same);
+                    changed = true;
+                }
+                it = next;
+            }
+        }
+        if (!changed) {
+            break;
+        }
     }
     for (auto block = program.post_order_blocks.rbegin(); block != end; ++block) {
         for (IR::Inst& inst : (*block)->Instructions()) {

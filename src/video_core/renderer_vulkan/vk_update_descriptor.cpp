@@ -22,18 +22,26 @@ namespace Vulkan {
 UpdateDescriptorQueue::UpdateDescriptorQueue(const Device& device_, size_t frame_payload_size_,
                                              bool supports_descriptor_buffer_)
     : device{device_}, frame_payload_size{frame_payload_size_},
-      supports_descriptor_buffer{supports_descriptor_buffer_},
-      payload(std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(frame_payload_size_ * FRAMES_IN_FLIGHT))
-{
-    payload_start = payload.get();
-    payload_cursor = payload.get();
-}
+      supports_descriptor_buffer{supports_descriptor_buffer_} {}
 
 UpdateDescriptorQueue::~UpdateDescriptorQueue() = default;
+
+void UpdateDescriptorQueue::EnsureAllocated() {
+    if (payload) {
+        return;
+    }
+    payload = std::make_unique_for_overwrite<DescriptorUpdateEntry[]>(frame_payload_size *
+                                                                    FRAMES_IN_FLIGHT);
+    payload_start = payload.get() + frame_index * frame_payload_size;
+    payload_cursor = payload_start;
+}
 
 void UpdateDescriptorQueue::TickFrame() {
     if (++frame_index >= FRAMES_IN_FLIGHT) {
         frame_index = 0;
+    }
+    if (!payload) {
+        return;
     }
     payload_start = payload.get() + frame_index * frame_payload_size;
     payload_cursor = payload_start;

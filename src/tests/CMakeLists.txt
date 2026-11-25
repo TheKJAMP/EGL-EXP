@@ -100,6 +100,7 @@ add_executable(tests
     video_core/virtual_range_cache.cpp
     video_core/query_copy.cpp
     video_core/ampere_lowering.cpp
+    video_core/ampere_direct.cpp
     video_core/spirv_software_matrix.cpp
     video_core/ampere_geometry.cpp
     video_core/ampere_i2f.cpp
@@ -132,6 +133,7 @@ add_executable(tests
     input_common/calibration_configuration_job.cpp
     common/vtx_hle_settings.cpp
     nvn/ampere_exec.cpp
+    nvn/ampere_direct_exec.cpp
     nvn/astc_bc.cpp
     nvn/astc_gpu.cpp
     nvn/backing_log.cpp

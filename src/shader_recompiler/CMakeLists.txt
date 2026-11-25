@@ -63,9 +63,28 @@ add_library(shader_recompiler STATIC
     frontend/ir/type.h
     frontend/ir/value.cpp
     frontend/ir/value.h
-    frontend/ampere/lower_to_maxwell.h
-    frontend/ampere/program_override.h
-    frontend/ampere/program_address_map.h
+    frontend/ampere/control_flow.cpp
+    frontend/ampere/control_flow.h
+    frontend/ampere/instruction.h
+    frontend/ampere/program_capture.h
+    frontend/ampere/translate/impl/floating_point.cpp
+    frontend/ampere/translate/impl/fp16_and_convert.cpp
+    frontend/ampere/translate/impl/impl.cpp
+    frontend/ampere/translate/impl/impl.h
+    frontend/ampere/translate/impl/integer_add.cpp
+    frontend/ampere/translate/impl/integer_multiply.cpp
+    frontend/ampere/translate/impl/logic_and_bit.cpp
+    frontend/ampere/translate/impl/memory_and_barrier.cpp
+    frontend/ampere/translate/impl/move_and_load_const.cpp
+    frontend/ampere/translate/impl/predicate_and_select.cpp
+    frontend/ampere/translate/impl/surface_and_warp.cpp
+    frontend/ampere/translate/impl/tensor.cpp
+    frontend/ampere/translate/impl/texture.cpp
+    frontend/ampere/translate/impl/warp_uniform.cpp
+    frontend/ampere/translate/translate.cpp
+    frontend/ampere/translate/translate.h
+    frontend/ampere/translate_program.cpp
+    frontend/ampere/translate_program.h
     frontend/maxwell/control_flow.cpp
     frontend/maxwell/control_flow.h
     frontend/maxwell/decode.cpp
@@ -161,7 +180,6 @@ add_library(shader_recompiler STATIC
     frontend/maxwell/translate/impl/texture_gradient.cpp
     frontend/maxwell/translate/impl/texture_load.cpp
     frontend/maxwell/translate/impl/texture_load_swizzled.cpp
-    frontend/maxwell/translate/impl/tensor_mul_add.cpp
     frontend/maxwell/translate/impl/texture_mipmap_level.cpp
     frontend/maxwell/translate/impl/texture_query.cpp
     frontend/maxwell/translate/impl/video_helper.cpp
@@ -194,6 +212,7 @@ add_library(shader_recompiler STATIC
     ir_opt/rescaling_pass.cpp
     ir_opt/ssa_rewrite_pass.cpp
     ir_opt/texture_pass.cpp
+    ir_opt/value_numbering_pass.cpp
     ir_opt/vendor_workaround_pass.cpp
     ir_opt/verification_pass.cpp
     object_pool.h

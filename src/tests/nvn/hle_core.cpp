@@ -196,6 +196,42 @@ TEST_CASE("nvn hle device: initialize tags the object and stores the builder fla
     CHECK(rig.Call("nvnDeviceGetFlags", {Rig::I(DEVICE)}) == 0x1234);
 }
 
+TEST_CASE("nvn hle device: ray tracing sizing, uniform handles and fast-clear indices", "[nvn]") {
+    Rig rig;
+    const u64 out_as = Rig::SCRATCH;
+    const u64 out_build = Rig::SCRATCH + 8;
+    const u64 out_update = Rig::SCRATCH + 16;
+    rig.memory.Put<u64>(out_as, 0x100000001ull);
+    rig.memory.Put<u64>(out_build, 0x100000001ull);
+    rig.memory.Put<u64>(out_update, 0x100000001ull);
+    rig.Call("nvnDeviceCalculateAccelerationStructureMemoryRequirements",
+             {Rig::I(DEVICE), Rig::I(Rig::SCRATCH + 64), Rig::I(out_as), Rig::I(out_build),
+              Rig::I(out_update)});
+    CHECK(rig.memory.Get<u64>(out_as) == 256);
+    CHECK(rig.memory.Get<u64>(out_build) == 256);
+    CHECK(rig.memory.Get<u64>(out_update) == 256);
+
+    // Null optional output pointers are skipped without disturbing mapped outputs.
+    rig.memory.Put<u64>(out_as, 0xDEAD);
+    rig.Call("nvnDeviceCalculateAccelerationStructureMemoryRequirements",
+             {Rig::I(DEVICE), Rig::I(Rig::SCRATCH + 64), Rig::I(out_as), Rig::I(0), Rig::I(0)});
+    CHECK(rig.memory.Get<u64>(out_as) == 256);
+
+    CHECK(rig.Call("nvnDeviceRegisterFastClearStencil", {Rig::I(DEVICE), Rig::I(0)}) == 1);
+    CHECK(rig.Call("nvnDeviceRegisterFastClearColorIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);
+    CHECK(rig.Call("nvnDeviceRegisterFastClearColoriIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);
+    CHECK(rig.Call("nvnDeviceRegisterFastClearColoruiIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);
+    CHECK(rig.Call("nvnDeviceRegisterFastClearDepthIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);
+    CHECK(rig.Call("nvnDeviceRegisterFastClearStencilIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);
+
+    const u64 gpu_address = 0x1234567890ULL;
+    const u64 size = 0x100ULL;
+    const u64 expected_ubo =
+        ((u64{0x1e0000000000} + (size << 41)) & u64{0xffffe00000000000}) | (gpu_address >> 4);
+    CHECK(rig.Call("nvnDeviceGetUniformBufferHandle",
+                   {Rig::I(DEVICE), Rig::I(gpu_address), Rig::I(size)}) == expected_ubo);
+}
+
 TEST_CASE("nvn hle queue: builder layout and the SDK's queue memory size", "[nvn]") {
     Rig rig;
     rig.Call("nvnQueueBuilderSetDefaults", {Rig::I(BUILDER)});

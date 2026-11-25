@@ -39,6 +39,7 @@
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
+#include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
 #include "shader_recompiler/ir_opt/passes.h"
@@ -93,11 +94,24 @@ using VideoCommon::GraphicsEnvironment;
 // Bump CACHE_VERSION for translation changes, as before: a cache from an older version is then
 // translated again at boot and written back under the new one. Bump MIN_COMPATIBLE_CACHE_VERSION
 // too only when the record layout (environment or key serialization) changes, which deletes older
-// caches. 20 changed the environment layout; the keys last changed before it.
+// caches. 36 replaces Maxwell-lowered native blobs with direct native Ampere streams.
 constexpr u32 CACHE_VERSION = 36;
 static_assert(CACHE_VERSION == VideoCommon::ShaderWarm::WarmCacheVersion,
               "Shader precache files use the pipeline cache version");
-constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 20;
+constexpr u32 MIN_COMPATIBLE_CACHE_VERSION = 36;
+
+[[nodiscard]] Shader::IR::Program TranslateStage(ShaderPools& pools, Shader::Environment& env,
+                                                 u32 cfg_offset, bool is_vertex_a,
+                                                 const Shader::HostTranslateInfo& host_info) {
+    if (const auto native = env.NativeAmpereProgram()) {
+        return Shader::Ampere::TranslateProgram(pools.inst, pools.block, pools.flow_block, env,
+                                                native->code, native->options,
+                                                native->uses_async_copy, native->branch_targets,
+                                                host_info);
+    }
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, is_vertex_a);
+    return TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+}
 constexpr size_t VULKAN_CACHE_FLUSH_PIPELINES = 128;
 constexpr size_t VULKAN_CACHE_FLUSH_MIN_SECONDS = 30;
 constexpr std::array<char, 8> VULKAN_CACHE_MAGIC_NUMBER{'y', 'u', 'z', 'u', 'v', 'k', 'c', 'h'};
@@ -2926,8 +2940,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 StageCache::Recorder recorder{env};
                 const u32 cfg_offset{
                     static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                Shader::Maxwell::Flow::CFG cfg(recorder, own.flow_block, cfg_offset, index == 0);
-                programs[index] = TranslateProgram(own.inst, own.block, recorder, cfg, host_info);
+                programs[index] = TranslateStage(own, recorder, cfg_offset, index == 0, host_info);
                 auto translation = std::make_shared<StageCache::Translation>();
                 translation->signature = signatures[index];
                 translation->reads = recorder.TakeReads();
@@ -3001,8 +3014,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             // programs[index] and recorded[index] came from the parallel translation above.
         } else if (cacheable) {
             StageCache::Recorder recorder{env};
-            Shader::Maxwell::Flow::CFG cfg(recorder, pools.flow_block, cfg_offset, index == 0);
-            programs[index] = TranslateProgram(pools.inst, pools.block, recorder, cfg, host_info);
+            programs[index] = TranslateStage(pools, recorder, cfg_offset, index == 0, host_info);
             auto translation = std::make_shared<StageCache::Translation>();
             translation->signature = std::move(signature);
             translation->reads = recorder.TakeReads();
@@ -3010,13 +3022,11 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
             recorded[index] = std::move(translation);
         } else if (!uses_vertex_a || index != 1) {
             // Normal path
-            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            programs[index] = TranslateStage(pools, env, cfg_offset, index == 0, host_info);
         } else {
-            Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
-            auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            auto program_vb{TranslateStage(pools, env, cfg_offset, index == 0, host_info)};
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
 
@@ -3264,8 +3274,7 @@ std::unique_ptr<GraphicsPipeline> PipelineCache::CreateGraphicsPipeline(
                 Shader::Environment& env{*stage_envs[index]};
                 const u32 cfg_offset{
                     static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader))};
-                Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
-                program = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+                program = TranslateStage(pools, env, cfg_offset, index == 0, host_info);
             }
             if (mesh_emulation &&
                 (program.stage == Shader::Stage::Mesh || program.stage == Shader::Stage::Task)) {
@@ -4039,14 +4048,12 @@ ComputePipelineCacheEntry PipelineCache::CreateComputePipeline(ShaderPools& pool
 
     LOG_DEBUG(Render_Vulkan, "{:#016x}", hash);
 
-    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
-
     // Dump it before error.
     if (Settings::values.dump_guest_shaders) {
         env.Dump(hash, key.unique_hash);
     }
 
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    auto program{TranslateStage(pools, env, env.StartAddress(), false, host_info)};
     const VkDriverIdKHR driver_id = device.GetDriverID();
     const bool needs_shared_mem_clamp = driver_id == VK_DRIVER_ID_QUALCOMM_PROPRIETARY ||
                                         driver_id == VK_DRIVER_ID_ARM_PROPRIETARY ||

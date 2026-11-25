@@ -30,10 +30,12 @@
 #include "common/literals.h"
 #include "common/scope_exit.h"
 #include "common/settings.h"
+#include "video_core/nvn/guest_layouts.h"
 #include "video_core/nvn/guest_memory.h"
 #include "video_core/nvn/record.h"
 #include "video_core/nvn/sink.h"
 #include "video_core/renderer_vulkan/nvn/nvn_context.h"
+#include "video_core/renderer_vulkan/nvn/nvn_draw_resources.h"
 #include "video_core/renderer_vulkan/nvn/nvn_format.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pool_mirror.h"
@@ -205,6 +207,21 @@ public:
         return Find(va, 1);
     }
 
+    void HintCold(u64 va, u64 size) override {
+        std::scoped_lock lock{regions_mutex};
+        cold_hints.emplace_back(va, size);
+    }
+
+    [[nodiscard]] std::vector<std::pair<u64, u64>> ColdHints() {
+        std::scoped_lock lock{regions_mutex};
+        return cold_hints;
+    }
+
+    void ClearColdHints() {
+        std::scoped_lock lock{regions_mutex};
+        cold_hints.clear();
+    }
+
 private:
     struct Region {
         u64 base{};
@@ -228,6 +245,7 @@ private:
     // Regions never move: the vector holds them by value but `data` points into `raw`'s heap
     // block, which survives a vector reallocation (std::vector<u8> moves keep their buffer).
     std::vector<Region> regions;
+    std::vector<std::pair<u64, u64>> cold_hints;
     std::mutex regions_mutex;
 };
 
@@ -2226,6 +2244,145 @@ private:
 
 } // namespace
 
+TEST_CASE("nvn memory: cold hints, resource cleanup, and linux memory description",
+          "[nvn][memory][cold-hint]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    const auto has_cold_cover = [](const std::vector<std::pair<u64, u64>>& hints, u64 va,
+                                   u64 min_size) {
+        return std::ranges::any_of(hints, [&](const auto& h) {
+            return h.first <= va && h.first + h.second >= va + min_size;
+        });
+    };
+
+    {
+        constexpr u64 BUFFER_POOL_VA = 0x3000'0000;
+        constexpr u64 TEX_POOL_VA = 0x4000'0000;
+        constexpr u64 RAW_POOL_VA = 0x5000'0000;
+
+        FakeMemory memory;
+        u8* const buf = memory.Add(BUFFER_POOL_VA, 512_KiB);
+        u8* const tex = memory.Add(TEX_POOL_VA, 512_KiB);
+        u8* const raw = memory.Add(RAW_POOL_VA, 256_KiB);
+        std::memset(buf, 0, 512_KiB);
+        std::memset(tex, 0x3C, 512_KiB);
+        std::memset(raw, 0x5A, 256_KiB);
+
+        const auto layout =
+            MakeStorage(NVN_FORMAT_RGBA8, 256, 256, 1, PixelFormat::A8B8G8R8_UNORM,
+                        VK_FORMAT_A8B8G8R8_UNORM_PACK32)
+                .layout;
+        REQUIRE(layout.size >= 256_KiB);
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        context.SetGuestMemory(&memory);
+        context.CreatePool({.serial = 1,
+                            .guest_address = BUFFER_POOL_VA,
+                            .size = 512_KiB,
+                            .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = 512_KiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreatePool({.serial = 3,
+                            .guest_address = RAW_POOL_VA,
+                            .size = 256_KiB,
+                            .flags = POOL_CPU_NO_ACCESS});
+        context.CreateTexture(MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 256, 256));
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::CopyTextureToBuffer,
+                 CopyToBuffer(BUFFER_POOL_VA, 10, 256, 256));
+            Run(context, seq, std::move(list));
+        }
+        CHECK(has_cold_cover(memory.ColdHints(), TEX_POOL_VA, layout.size));
+
+        memory.ClearColdHints();
+        {
+            std::vector<u64> list;
+            const VC::CopyBufferToBufferPayload copy{
+                .src = RAW_POOL_VA, .dst = BUFFER_POOL_VA, .size = 4096};
+            Push(list, VC::Op::CopyBufferToBuffer, copy);
+            Run(context, seq, std::move(list));
+        }
+        CHECK(has_cold_cover(memory.ColdHints(), RAW_POOL_VA, 256_KiB));
+
+        const std::string mem_desc = context.DescribeMemory();
+        CHECK(mem_desc.find("process private ") != std::string::npos);
+        CHECK(mem_desc.find("private working set ") != std::string::npos);
+    }
+
+    {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr, {});
+        REQUIRE(impl.draw_resources != nullptr);
+
+        VC::SamplerDesc sampler{};
+        sampler.serial = 50;
+        sampler.min_filter = 2;
+        impl.samplers[50] = sampler;
+        REQUIRE(impl.draw_resources->GetSampler(50, false) != VK_NULL_HANDLE);
+        CHECK(impl.draw_resources->samplers.contains(50));
+
+        std::vector<u8> control(0x100, 0);
+        const auto put32 = [&](size_t off, u32 v) { std::memcpy(&control[off], &v, 4); };
+        put32(0, VC::NVN2_CONTROL_MAGIC);
+        put32(4, VC::NVN2_CONTROL_VERSION);
+        put32(0x38, 64);
+        put32(0x40, 64);
+        put32(0x44, 64);
+        control[0x56] = 5;
+        put32(0x58, 1);
+        put32(0x5c, 1);
+        put32(0x60, 1);
+        VC::ProgramDesc program{};
+        program.serial = 51;
+        program.stage_mask = 1u << 5;
+        program.control[5] = std::move(control);
+        program.code[5] = std::vector<u8>(64, 0);
+        auto prog_ptr = std::make_shared<VC::ProgramDesc>(std::move(program));
+        impl.programs[51] = prog_ptr;
+        impl.draw_resources->OnProgramCreated(prog_ptr);
+        CHECK(impl.draw_resources->program_hashes.contains(51));
+        CHECK(impl.draw_resources->compute_controls.contains(51));
+
+        const u64 epoch_before = impl.draw_resources->samplers_epoch;
+        impl.DestroyNow(50);
+        impl.DestroyNow(51);
+        CHECK(impl.draw_resources->samplers_epoch > epoch_before);
+        CHECK_FALSE(impl.draw_resources->samplers.contains(50));
+        CHECK_FALSE(impl.draw_resources->program_hashes.contains(51));
+        CHECK_FALSE(impl.draw_resources->compute_controls.contains(51));
+
+        FakeMemory import_guard_mem;
+        impl.guest.store(&import_guard_mem, std::memory_order_release);
+        SCOPE_EXIT {
+            impl.guest.store(nullptr, std::memory_order_release);
+        };
+        impl.NoteImportedGuestRange(0x6000'0000, 256_KiB);
+        CHECK(impl.OverlapsImportedGuestRange(0x6000'1000, 4096));
+        CHECK_FALSE(impl.OverlapsImportedGuestRange(0x7000'0000, 4096));
+
+        Nvn::Pool imported_span_pool{};
+        imported_span_pool.address = 0x6000'0000;
+        imported_span_pool.size = 256_KiB;
+        imported_span_pool.backing = Nvn::Pool::Backing::DeviceLocal;
+        impl.HintColdGuestSpan(imported_span_pool, 0, 256_KiB);
+        CHECK(import_guard_mem.ColdHints().empty());
+
+        Nvn::Pool unimported_span_pool{};
+        unimported_span_pool.address = 0x7000'0000;
+        unimported_span_pool.size = 256_KiB;
+        unimported_span_pool.backing = Nvn::Pool::Backing::DeviceLocal;
+        impl.HintColdGuestSpan(unimported_span_pool, 0, 256_KiB);
+        CHECK(has_cold_cover(import_guard_mem.ColdHints(), 0x7000'0000, 256_KiB));
+    }
+}
+
 TEST_CASE("NVN present keeps the previous picture until the new source has pixels",
           "[nvn][present-filter]") {
     auto vulkan = MakeHeadlessVulkan();
@@ -3443,5 +3600,113 @@ TEST_CASE("nvn memory: lazy STORAGE_BIT and format-list upgrade preserves conten
             REQUIRE(data[idx + 2] == (x < 4 ? 0 : 255));
             REQUIRE(data[idx + 3] == 255);
         }
+    }
+}
+
+TEST_CASE("nvn memory: Compressible CpuNoAccess pool defers VkBuffer backing until buffer use",
+          "[nvn][memory][pool]") {
+    auto vulkan = MakeHeadlessVulkan();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+
+    SECTION("Context::Impl skips eager backing and backs lazily on EnsureBacking") {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                {.allow_host_import = false, .background_backing = false});
+        constexpr u64 POOL_BYTES = 1_MiB;
+        impl.CreatePoolNow({.serial = 1,
+                            .guest_address = 0x5000'0000,
+                            .size = POOL_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess | Nvn::PoolFlag::Compressible});
+        const auto& raw = impl.RawGlobalMemoryTable();
+        (void)raw;
+        const auto pool = impl.pools.at(1);
+        REQUIRE(pool->pending.load());
+        REQUIRE(pool->backing == Nvn::Pool::Backing::None);
+        REQUIRE(impl.pool_bytes.load() == 0);
+
+        impl.EnsureBacking(*pool);
+        REQUIRE_FALSE(pool->pending.load());
+        REQUIRE(pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(impl.pool_bytes.load() == POOL_BYTES);
+    }
+
+    SECTION("Large (>= 16 MiB) plain CpuNoAccess pool is deferred without host import") {
+        Nvn::Context::Impl impl(*vulkan->device, vulkan->submit_mutex, nullptr,
+                                {.allow_host_import = false, .background_backing = false});
+        constexpr u64 SMALL_BYTES = 1_MiB;
+        constexpr u64 LARGE_BYTES = 16_MiB;
+        impl.CreatePoolNow({.serial = 1,
+                            .guest_address = 0x5000'0000,
+                            .size = SMALL_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess});
+        impl.CreatePoolNow({.serial = 2,
+                            .guest_address = 0x6000'0000,
+                            .size = LARGE_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess});
+        const auto& raw = impl.RawGlobalMemoryTable();
+        (void)raw;
+        const auto small_pool = impl.pools.at(1);
+        const auto large_pool = impl.pools.at(2);
+        REQUIRE_FALSE(small_pool->pending.load());
+        REQUIRE(small_pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(large_pool->pending.load());
+        REQUIRE(large_pool->backing == Nvn::Pool::Backing::None);
+        REQUIRE(impl.pool_bytes.load() == SMALL_BYTES);
+
+        impl.EnsureBacking(*large_pool);
+        REQUIRE_FALSE(large_pool->pending.load());
+        REQUIRE(large_pool->backing == Nvn::Pool::Backing::DeviceLocal);
+        REQUIRE(impl.pool_bytes.load() == SMALL_BYTES + LARGE_BYTES);
+    }
+
+    SECTION("Texture operations do not back Compressible pool while ClearBuffer does") {
+        constexpr u64 BUF_POOL_VA = 0x3000'0000;
+        constexpr u64 TEX_POOL_VA = 0x4000'0000;
+        constexpr u64 BUF_BYTES = 1_MiB;
+        constexpr u64 TEX_BYTES = 2_MiB;
+        FakeMemory memory;
+        u8* readback = memory.Add(BUF_POOL_VA, BUF_BYTES);
+        std::memset(readback, 0, BUF_BYTES);
+        memory.Add(TEX_POOL_VA, TEX_BYTES);
+
+        Nvn::Context context(*vulkan->device, vulkan->submit_mutex, nullptr,
+                             {.allow_host_import = false, .background_backing = true});
+        context.SetGuestMemory(&memory);
+        context.CreatePool(
+            {.serial = 1, .guest_address = BUF_POOL_VA, .size = BUF_BYTES, .flags = POOL_CPU_CACHED});
+        context.CreatePool({.serial = 2,
+                            .guest_address = TEX_POOL_VA,
+                            .size = TEX_BYTES,
+                            .flags = Nvn::PoolFlag::CpuNoAccess | Nvn::PoolFlag::Compressible});
+        VC::TextureDesc tex = MakeTexture(10, 2, 0, NVN_FORMAT_RGBA8, 8, 8);
+        tex.flags = Nvn::TexFlag::Compressible;
+        context.CreateTexture(tex);
+
+        u64 seq = 0;
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::ClearTexture, ClearColor(10, 8, 8, 1.0f, 0.25f, 0.5f, 1.0f), 0xF);
+            Push(list, VC::Op::CopyTextureToBuffer, CopyToBuffer(BUF_POOL_VA, 10, 8, 8));
+            Run(context, seq, std::move(list));
+        }
+
+        // Only BUF_POOL (1 MiB) should be backed after texture ops + copy-to-buffer.
+        CHECK(context.DescribeState().find("pool_MB=1 ") != std::string::npos);
+        REQUIRE(readback[0] == 255);
+        REQUIRE(readback[3] == 255);
+
+        {
+            std::vector<u64> list;
+            Push(list, VC::Op::ClearBuffer,
+                 VC::ClearBufferPayload{.address = TEX_POOL_VA, .size = 256, .value = 0x11223344u});
+            Run(context, seq, std::move(list));
+        }
+
+        // Now TEX_POOL (2 MiB) is lazily backed as well -> 1 + 2 = 3 MiB.
+        CHECK(context.DescribeState().find("pool_MB=3 ") != std::string::npos);
+        const Nvn::ContextStats stats = context.Stats();
+        CHECK(stats.ops_failed == 0);
+        CHECK(stats.ops_unsupported == 0);
     }
 }

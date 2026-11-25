@@ -199,6 +199,18 @@ void nvnProgramBuilderGetSampleShading(Call& c) {
     c.ret.SetU32(c.Load<u32>(c.args.NextPointer() + PgbSampleShading));
 }
 
+/// nvnProgramGetShaderGroupHandle (Switch 2 sdk+0x672620): writes a zeroed 32-byte placeholder
+/// shader group handle when `handle_out` is non-null (ray tracing is unimplemented on VTX-HLE).
+void nvnProgramGetShaderGroupHandle(Call& c) {
+    static_cast<void>(c.args.NextPointer()); // program
+    static_cast<void>(c.args.NextU64());     // group / ray-gen index
+    static_cast<void>(c.args.NextU64());     // hit group index
+    const u64 handle_out = c.args.NextPointer();
+    if (handle_out != 0) {
+        c.Zero(handle_out, 32);
+    }
+}
+
 /// nvnProgramInitialize + SetShaders over the builder's array (3.2.0 sdk+0x5e56b0: the same object
 /// setup, then the SetShaders path). A builder without shaders gives an empty program.
 void nvnProgramInitializeFromBuilder(Call& c) {
@@ -230,6 +242,7 @@ void RegisterProgramFunctions(Registry& registry) {
     NVN_HLE(registry, nvnProgramBuilderGetShaderCount);
     NVN_HLE(registry, nvnProgramBuilderGetShaders);
     NVN_HLE(registry, nvnProgramBuilderGetSampleShading);
+    NVN_HLE(registry, nvnProgramGetShaderGroupHandle);
     NVN_HLE(registry, nvnProgramInitializeFromBuilder);
 }
 

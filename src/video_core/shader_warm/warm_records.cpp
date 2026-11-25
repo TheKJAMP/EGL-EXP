@@ -7,7 +7,8 @@
 #include <algorithm>
 #include <cstring>
 
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
 #include "video_core/shader_environment.h"
 #include "video_core/shader_warm/warm_records.h"
@@ -83,15 +84,19 @@ std::optional<std::string> LowerProgram(std::span<const u8> program, LoweredCode
         return "Native allocation lacks a complete runtime capture";
     }
     // As GenericEnvironment::LowerNativeCode for a compute dispatch, without the tensor forms.
-    auto lowered = Shader::Ampere::LowerToMaxwell(native, {});
-    if (!lowered) {
-        return std::string(lowered.error);
+    auto analysis = Shader::Ampere::AnalyzeProgram(native, {});
+    if (!analysis) {
+        return std::string(analysis.error);
+    }
+    if (analysis.instruction_count < native.size()) {
+        native.resize(analysis.instruction_count);
     }
     constexpr std::array<u64, ComputeHeaderWords> header{};
-    const std::vector<u64> words = LayOutLoweredNativeCode(header, native, lowered);
+    const std::vector<u64> words =
+        Shader::Ampere::PackNativeAmpereCode(header, native, {}, analysis.uses_async_copy);
     out.code.resize(words.size() * sizeof(u64));
     std::memcpy(out.code.data(), words.data(), out.code.size());
-    out.texture_buffer = lowered.required_texture_buffer;
+    out.texture_buffer = analysis.required_texture_buffer;
     return std::nullopt;
 }
 

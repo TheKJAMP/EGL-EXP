@@ -16,8 +16,8 @@
 namespace Vulkan {
 
 DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
-                                           MemoryAllocator& memory_allocator)
-    : device{device_} {
+                                           MemoryAllocator& memory_allocator_)
+    : device{device_}, memory_allocator{memory_allocator_} {
     if (!device.IsExtDescriptorBufferSupported() || !device.IsBufferDeviceAddressSupported()) {
         return;
     }
@@ -30,8 +30,7 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
                                              props.resourceDescriptorBufferAddressSpaceSize,
                                              props.descriptorBufferAddressSpaceSize})};
     const VkDeviceSize frame_size{device.IsTiler() ? TILER_FRAME_SIZE : DESKTOP_FRAME_SIZE};
-    const VkDeviceSize chunk_size{
-        Common::AlignDown((std::min)(frame_size, max_bound), alignment)};
+    chunk_size = Common::AlignDown((std::min)(frame_size, max_bound), alignment);
     if (chunk_size <= alignment) {
         LOG_DEBUG(Render_Vulkan, "Descriptor buffer binding limit of {} is unusable, disabling",
                   max_bound);
@@ -39,7 +38,16 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
     }
     chunk_capacity = chunk_size - alignment;
     chunks_per_frame = static_cast<size_t>(frame_size / chunk_size);
+    supported = true;
+}
 
+bool DescriptorBufferRing::EnsureAllocated() {
+    if (!chunks.empty()) {
+        return true;
+    }
+    if (!supported || allocation_failed) {
+        return false;
+    }
     const VkBufferCreateInfo buffer_ci{
         .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
         .pNext = nullptr,
@@ -61,12 +69,18 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
         if (!buffer.IsHostVisible()) {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer is not host visible, disabling");
             chunks.clear();
-            return;
+            chunk_addresses.clear();
+            chunk_hosts.clear();
+            allocation_failed = true;
+            return false;
         }
         if (!buffer.IsHostCoherent()) {
             LOG_DEBUG(Render_Vulkan, "Descriptor buffer is not host coherent, disabling");
             chunks.clear();
-            return;
+            chunk_addresses.clear();
+            chunk_hosts.clear();
+            allocation_failed = true;
+            return false;
         }
         if (device.HasDebuggingToolAttached()) {
             buffer.SetObjectNameEXT("Descriptor buffer");
@@ -77,6 +91,7 @@ DescriptorBufferRing::DescriptorBufferRing(const Device& device_,
         chunk_hosts.push_back(buffer.Mapped().data() + (address - raw_address));
         chunks.push_back(std::move(buffer));
     }
+    return true;
 }
 
 DescriptorBufferRing::~DescriptorBufferRing() = default;
@@ -97,7 +112,9 @@ void DescriptorBufferRing::TouchFrame(Scheduler& scheduler) {
 
 DescriptorBufferRing::Allocation DescriptorBufferRing::Allocate(Scheduler& scheduler,
                                                                 VkDeviceSize size) {
-    ASSERT(!chunks.empty());
+    if (!EnsureAllocated()) {
+        return Allocation{};
+    }
     if (!CanAllocate(size)) {
         LOG_DEBUG(Render_Vulkan, "Descriptor set of {} bytes exceeds chunk capacity {}", size,
                   chunk_capacity);

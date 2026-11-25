@@ -116,6 +116,13 @@ public:
         static_cast<void>(va);
         static_cast<void>(size);
     }
+
+    /// Hints that guest bytes [va, va + size) have been uploaded to the host GPU and are unlikely
+    /// to be touched by the CPU soon (Common::HostMemory::HintCold). Optional no-op by default.
+    virtual void HintCold(u64 va, u64 size) {
+        static_cast<void>(va);
+        static_cast<void>(size);
+    }
 };
 
 /// Kinds of guest NVN objects that carry a GuestTag.

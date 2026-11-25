@@ -18,9 +18,15 @@
 
 #include <fmt/format.h>
 
+#include <algorithm>
+#include <limits>
+#include <vector>
+
 #include "common/boot_counter.h"
 #include "common/cityhash.h"
+#include "common/host_memory.h"
 #include "common/logging.h"
+#include "common/settings.h"
 #include "video_core/nx2.h"
 #include "video_core/renderer_vulkan/nvn/nvn_impl.h"
 #include "video_core/renderer_vulkan/nvn/nvn_draw.h"
@@ -94,11 +100,12 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
         // Load split_raw_epoch (acquire) before split_raw_epoch_unaliased (acquire) to pair with
         // the completion thread's reverse release store order.
         const u64 raw_epoch = split_raw_epoch.load(std::memory_order_acquire);
-        pool.split_raw_epoch_unaliased_seen =
-            split_raw_epoch_unaliased.load(std::memory_order_acquire);
+        const u64 unaliased_epoch = split_raw_epoch_unaliased.load(std::memory_order_acquire);
+        const bool unaliased_changed = unaliased_epoch != pool.split_raw_epoch_unaliased_seen;
+        pool.split_raw_epoch_unaliased_seen = unaliased_epoch;
         if (raw_epoch != pool.split_raw_epoch_seen) {
             pool.split_raw_epoch_seen = raw_epoch;
-            if (!mario_kart_world) {
+            if (!mario_kart_world && (!pool.raw_written_through || unaliased_changed)) {
                 pool.ClearAllMirrorTrusted();
             }
             // Textures of the pool must see raw writes even in Mario Kart World; only the mirror
@@ -1533,6 +1540,206 @@ void Context::Impl::NotifyTextureWrittenNow(u64 texture_serial) {
     storage.force_check = true;
 }
 
+void Context::Impl::HintColdGuestSpan(const Pool& pool, u64 offset, u64 size) const {
+    if (size == 0 || offset >= pool.size || pool.backing == Pool::Backing::Imported ||
+        !pool.split_runs.empty()) {
+        return;
+    }
+    const u64 clamped = (std::min)(size, pool.size - offset);
+    if (clamped < (u64{64} << 10)) {
+        return;
+    }
+    VC::GuestMemory* const mem = guest.load(std::memory_order_acquire);
+    if (!mem) {
+        return;
+    }
+    const auto emit_cold = [&](u64 va, u64 len) {
+        if (va != 0 && len >= (u64{64} << 10) && !OverlapsImportedGuestRange(va, len)) {
+            mem->HintCold(va, len);
+        }
+    };
+    if (!pool.IsVirtual()) {
+        emit_cold(pool.address + offset, clamped);
+        return;
+    }
+    Pool* physical = nullptr;
+    u64 phys_off = 0;
+    if (ResolveVirtualRange(pool, offset, clamped, physical, phys_off)) {
+        if (physical && physical->address != 0 && physical->backing != Pool::Backing::Imported &&
+            physical->split_runs.empty()) {
+            emit_cold(physical->address + phys_off, clamped);
+        }
+        return;
+    }
+    constexpr u64 kChunk = u64{64} << 10;
+    u64 run_va = 0;
+    u64 run_len = 0;
+    const auto flush_run = [&] {
+        emit_cold(run_va, run_len);
+        run_va = 0;
+        run_len = 0;
+    };
+    for (u64 pos = offset, end = offset + clamped; pos < end;) {
+        const u64 step = (std::min)(kChunk, end - pos);
+        if (ResolveVirtualRange(pool, pos, step, physical, phys_off) && physical &&
+            physical->address != 0 && physical->backing != Pool::Backing::Imported &&
+            physical->split_runs.empty()) {
+            const u64 va = physical->address + phys_off;
+            if (run_len != 0 && run_va + run_len == va) {
+                run_len += step;
+            } else {
+                flush_run();
+                run_va = va;
+                run_len = step;
+            }
+        } else {
+            flush_run();
+        }
+        pos += step;
+    }
+    flush_run();
+}
+
+void Context::Impl::HintColdUploadedGuestRanges(u64 presents) {
+    if (presents < cold_hint_next_present) {
+        return;
+    }
+    const auto mode = Common::ColdHintModeInEffect();
+    if (mode == Settings::ColdHintMode::Off) {
+        return;
+    }
+    if (mode != Settings::ColdHintMode::Always && !Common::MemoryIsLow()) {
+        return;
+    }
+    VC::GuestMemory* const mem = guest.load(std::memory_order_acquire);
+    if (!mem) {
+        return;
+    }
+
+    struct ColdSpan {
+        u64 va;
+        u64 end;
+    };
+    std::vector<ColdSpan> spans;
+    spans.reserve(storage_cache.size() + pools.size());
+    const auto push_va = [&](u64 va, u64 size) {
+        if (va == 0 || size == 0) {
+            return;
+        }
+        const u64 end = (size <= (std::numeric_limits<u64>::max)() - va)
+                            ? (va + size)
+                            : (std::numeric_limits<u64>::max)();
+        if (end > va) {
+            spans.push_back({va, end});
+        }
+    };
+    const auto push_pool_span = [&](const Pool& pool, u64 offset, u64 size) {
+        if (size == 0 || offset >= pool.size) {
+            return;
+        }
+        const u64 clamped = (std::min)(size, pool.size - offset);
+        if (clamped < (u64{64} << 10)) {
+            return;
+        }
+        if (!pool.IsVirtual()) {
+            push_va(pool.address + offset, clamped);
+            return;
+        }
+        Pool* physical = nullptr;
+        u64 phys_off = 0;
+        if (ResolveVirtualRange(pool, offset, clamped, physical, phys_off)) {
+            if (physical) {
+                push_va(physical->address + phys_off, clamped);
+            }
+            return;
+        }
+        constexpr u64 kChunk = u64{64} << 10;
+        for (u64 pos = offset, end = offset + clamped; pos < end;) {
+            const u64 step = (std::min)(kChunk, end - pos);
+            if (ResolveVirtualRange(pool, pos, step, physical, phys_off) && physical &&
+                physical->address != 0) {
+                push_va(physical->address + phys_off, step);
+            }
+            pos += step;
+        }
+    };
+
+    for (const auto& [serial, pool_ptr] : pools) {
+        if (!pool_ptr || pool_ptr->IsVirtual() || pool_ptr->backing == Pool::Backing::None ||
+            pool_ptr->backing == Pool::Backing::Imported || !pool_ptr->split_runs.empty() ||
+            pool_ptr->size < (u64{64} << 10)) {
+            continue;
+        }
+        if ((pool_ptr->flags &
+             (PoolFlag::CpuNoAccess | PoolFlag::Compressible | PoolFlag::ShaderCode)) == 0) {
+            continue;
+        }
+        push_va(pool_ptr->address, pool_ptr->size);
+    }
+
+    for (const auto& [key, s_ptr] : storage_cache) {
+        if (!s_ptr) {
+            continue;
+        }
+        const Storage& s = *s_ptr;
+        if (s.sparse || s.dynamic || !s.image || !s.contents_valid ||
+            s.layout.size < (u64{64} << 10)) {
+            continue;
+        }
+        if (s.origin != StorageOrigin::Cpu &&
+            (s.origin != StorageOrigin::Gpu || (s.desc.flags & TexFlag::Linear) != 0)) {
+            continue;
+        }
+        const auto pool_it = pools.find(s.pool_serial);
+        if (pool_it == pools.end() || !pool_it->second ||
+            pool_it->second->backing == Pool::Backing::Imported ||
+            !pool_it->second->split_runs.empty()) {
+            continue;
+        }
+        push_pool_span(*pool_it->second, s.pool_offset, s.layout.size);
+    }
+
+    if (spans.empty()) {
+        cold_hint_va_cursor = 0;
+        cold_hint_next_present = presents + 300;
+        return;
+    }
+    std::sort(spans.begin(), spans.end(),
+              [](const ColdSpan& a, const ColdSpan& b) { return a.va < b.va; });
+    size_t out = 0;
+    for (const ColdSpan& span : spans) {
+        if (out == 0 || span.va > spans[out - 1].end) {
+            spans[out++] = span;
+        } else {
+            spans[out - 1].end = (std::max)(spans[out - 1].end, span.end);
+        }
+    }
+    spans.resize(out);
+    auto start_it = std::lower_bound(spans.begin(), spans.end(), cold_hint_va_cursor,
+                                     [](const ColdSpan& s, u64 cursor) { return s.va < cursor; });
+    size_t idx = static_cast<size_t>(start_it - spans.begin());
+    if (idx == spans.size()) {
+        idx = 0;
+    }
+    size_t emitted = 0;
+    u64 emitted_bytes = 0;
+    for (; idx < spans.size() && emitted < 64 && emitted_bytes < (u64{512} << 20); ++idx) {
+        const u64 len = spans[idx].end - spans[idx].va;
+        if (len >= (u64{64} << 10) && !OverlapsImportedGuestRange(spans[idx].va, len)) {
+            mem->HintCold(spans[idx].va, len);
+            ++emitted;
+            emitted_bytes += len;
+        }
+    }
+    if (idx < spans.size()) {
+        cold_hint_va_cursor = spans[idx].va;
+        cold_hint_next_present = presents + 30;
+    } else {
+        cold_hint_va_cursor = 0;
+        cold_hint_next_present = presents + 300;
+    }
+}
+
 void Context::Impl::EvictPoolStorages(u64 pool_serial) {
     const auto index_it = storage_index.find(pool_serial);
     if (index_it == storage_index.end()) {
@@ -1613,16 +1820,16 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             return;
         }
     } else if (at_present) {
+        HintColdUploadedGuestRanges(presents);
         // The periodic pass: textures died, storages aged, the device budget moved. Strict
         // device-local allocations over the budget (EDEN_NX2_TRY_VMA_DEVICE_STRICT) bring it
         // forward: the driver pages until the cache sheds what it can rebuild.
         const u64 strict_over_budget = spills.over_budget_count.load(std::memory_order_relaxed);
         bool hard_pressure_due = false;
-        if (mario_kart_world && presents >= trim_hard_next_present) {
+        if (presents >= trim_hard_next_present) {
             const u64 budget = device.GetDeviceMemoryBudget();
             if (budget != 0 &&
-                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() >
-                    budget + budget / 4) {
+                device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack() > budget) {
                 hard_pressure_due = true;
             } else {
                 trim_hard_next_present = presents + HARD_PRESSURE_INTERVAL_PRESENTS;
@@ -1637,8 +1844,8 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                (storage_cache_bytes < trim_floor_bytes && presents < trim_next_present)) {
         return;
     }
-    // The device near its memory budget (85% soft threshold for MKW, 90% for other titles;
-    // VK_EXT_memory_budget, the allocator's empty block space counts and the driver counts it too)
+    // The device near its memory budget (85% soft threshold, 100% hard threshold via
+    // VK_EXT_memory_budget; the allocator's empty block space counts and the driver counts it too)
     // sheds rebuildable storages before spills begin.
     u64 device_budget = 0;
     u64 device_used = 0;
@@ -1649,14 +1856,11 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             return;
         }
         device_used = device.GetDeviceMemoryUsage() + device.GetDeviceMemorySlack();
-        const u64 pressure_threshold = mario_kart_world
-                                           ? device_budget - (device_budget * 15) / 100
-                                           : device_budget - device_budget / 10;
-        hard_pressure = mario_kart_world && device_used > device_budget + device_budget / 4;
+        const u64 pressure_threshold = device_budget - (device_budget * 15) / 100;
+        hard_pressure = device_used > device_budget;
         if (device_used > pressure_threshold) {
             trim_device_excess = device_used - pressure_threshold;
-            if (count_pass &&
-                !(!at_present && mario_kart_world && !over_budget && !hard_pressure)) {
+            if (count_pass && !(!at_present && !over_budget && !hard_pressure)) {
                 stats.storage_trim_pressure_passes.fetch_add(1, std::memory_order_relaxed);
             }
         } else {
@@ -1667,7 +1871,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         device_budget = device.GetDeviceMemoryBudget();
         refresh_pressure(true);
     }
-    if (!at_present && mario_kart_world && !over_budget && !hard_pressure) {
+    if (!at_present && !over_budget && !hard_pressure) {
         return;
     }
     if (trim_device_excess != 0) {
@@ -1678,7 +1882,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
         refresh_pressure(false);
     }
     const bool emergency_pressure =
-        hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 2;
+        hard_pressure && device_budget != 0 && device_used > device_budget + device_budget / 4;
     constexpr size_t MAX_SOFT_PRESSURE_OPS_PER_PASS = 48;
     constexpr u64 SOFT_PRESSURE_INTERVAL_PRESENTS = 4;
     const bool soft_pressure_capped = trim_device_excess != 0 && !hard_pressure;
@@ -1686,7 +1890,7 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
     const u64 budget_target = storage_cache_budget / 10 * 9;
     u64 target = over_budget ? budget_target : storage_cache_bytes;
     if (hard_pressure) {
-        const u64 hard_target_device = device_budget + device_budget / 4;
+        const u64 hard_target_device = device_budget - device_budget / 16;
         const u64 hard_excess = device_used > hard_target_device ? device_used - hard_target_device : 0;
         const u64 shed = hard_excess + device_budget / 16;
         const u64 min_target = emergency_pressure ? device_budget / 4 : device_budget / 2;
@@ -1831,29 +2035,26 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
                               : trim_device_excess != 0 ? DEMOTE_KEEP_PRESENTS_PRESSURE
                                                         : DEMOTE_KEEP_PRESENTS_BUDGET;
         std::vector<Candidate> demotable;
+        std::vector<Candidate> live_gpu_demotable;
         for (const auto& [key, storage] : storage_cache) {
             if (storage.use_count() <= 1 || !storage->image || storage->sparse || storage->scaled ||
-                storage->origin != StorageOrigin::Cpu || storage->last_used_seq > done_seq ||
-                storage->touched_seq > done_seq || storage->bindless_tracked_count != 0) {
+                storage->last_used_seq > done_seq || storage->touched_seq > done_seq ||
+                storage->bindless_active_count != 0) {
                 continue;
             }
-            if (presents >= storage->last_used_present &&
-                presents - storage->last_used_present >= demote_keep) {
-                demotable.push_back({storage->last_used_seq, key});
+            if (presents < storage->last_used_present) {
+                continue;
+            }
+            const u64 idle_presents = presents - storage->last_used_present;
+            if (storage->origin == StorageOrigin::Cpu) {
+                if (idle_presents >= demote_keep) {
+                    demotable.push_back({storage->last_used_seq, key});
+                }
+            } else if (storage->origin == StorageOrigin::Gpu && idle_presents >= 60) {
+                live_gpu_demotable.push_back({storage->last_used_seq, key});
             }
         }
-        std::sort(demotable.begin(), demotable.end(), by_age);
-        for (const Candidate& candidate : demotable) {
-            if (storage_cache_bytes <= target ||
-                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) ||
-                (midframe_demote && demote_ops >= MAX_MIDFRAME_DEMOTE_OPS)) {
-                break;
-            }
-            const auto it = storage_cache.find(candidate.key);
-            if (it == storage_cache.end() || !it->second->image) {
-                continue;
-            }
-            Storage& s = *it->second;
+        const auto demote_storage = [&](Storage& s, bool is_superseded) {
             const u64 fb_epoch_before =
                 draw_resources ? draw_resources->framebuffer_views_epoch : 0;
             std::vector<vk::ImageView> views = draw_resources
@@ -1879,6 +2080,10 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             s.contents_valid = false;
             s.origin = StorageOrigin::None;
             ++s.image_gen;
+            NoteBindlessStorageChanged(s);
+            if (is_superseded) {
+                stats.storages_superseded_evicted.fetch_add(1, std::memory_order_relaxed);
+            }
             if (trim_device_excess != 0 || storage_cache_bytes <= budget_target) {
                 stats.storages_pressure_evicted.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1886,6 +2091,33 @@ void Context::Impl::TrimStorageCache(bool at_present, u64 retire_seq) {
             stats.storages_evicted.fetch_add(1, std::memory_order_relaxed);
             ++pressure_ops;
             ++demote_ops;
+        };
+        std::sort(live_gpu_demotable.begin(), live_gpu_demotable.end(), by_age);
+        for (const Candidate& candidate : live_gpu_demotable) {
+            if (storage_cache_bytes <= target || tests >= MAX_SUPERSEDED_TESTS ||
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) ||
+                (midframe_demote && demote_ops >= MAX_MIDFRAME_DEMOTE_OPS)) {
+                break;
+            }
+            const auto it = storage_cache.find(candidate.key);
+            if (it == storage_cache.end() || !it->second->image ||
+                !superseded(*it->second).value_or(false)) {
+                continue;
+            }
+            demote_storage(*it->second, true);
+        }
+        std::sort(demotable.begin(), demotable.end(), by_age);
+        for (const Candidate& candidate : demotable) {
+            if (storage_cache_bytes <= target ||
+                (soft_pressure_capped && pressure_ops >= MAX_SOFT_PRESSURE_OPS_PER_PASS) ||
+                (midframe_demote && demote_ops >= MAX_MIDFRAME_DEMOTE_OPS)) {
+                break;
+            }
+            const auto it = storage_cache.find(candidate.key);
+            if (it == storage_cache.end() || !it->second->image) {
+                continue;
+            }
+            demote_storage(*it->second, false);
         }
     }
     // Under the budget too: render targets nothing used for `trim_age_presents` that cost nothing

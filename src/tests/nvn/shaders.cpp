@@ -16,8 +16,8 @@
 #include "shader_recompiler/backend/bindings.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
 #include "shader_recompiler/exception.h"
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
-#include "shader_recompiler/frontend/ampere/program_address_map.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/ir/program.h"
@@ -257,7 +257,7 @@ TEST_CASE("NVN compute local memory comes from the control section", "[nvn][shad
     CHECK(parsed->local_memory_per_warp_bytes == 0x2000);
     CHECK(parsed->LocalMemoryBytes() == 0x100);
 
-    const auto lowered = LowerNvnProgram(binary.View(ShaderStage::Compute));
+    const auto lowered = PrepareNvnProgram(binary.View(ShaderStage::Compute));
     REQUIRE(lowered->error.empty());
     CHECK(NvnEnvironment{lowered}.LocalMemorySize() == 0x100);
     // The caller can still override the control's value.
@@ -267,7 +267,7 @@ TEST_CASE("NVN compute local memory comes from the control section", "[nvn][shad
 
     // A shader without local memory has none, and the declared size reaches the IR program.
     auto none = MakeBinary(ShaderStage::Compute, program);
-    const auto lowered_none = LowerNvnProgram(none.View(ShaderStage::Compute));
+    const auto lowered_none = PrepareNvnProgram(none.View(ShaderStage::Compute));
     REQUIRE(lowered_none->error.empty());
     CHECK(NvnEnvironment{lowered_none}.LocalMemorySize() == 0);
     NvnShaderPools pools;
@@ -386,80 +386,59 @@ TEST_CASE("NVN storage buffer slot math", "[nvn][shaders]") {
     CHECK(StorageBufferSlot(0x40, 0x70) == 3u);
 }
 
-TEST_CASE("NVN lowering packs exactly like LowerNativeCode", "[nvn][shaders]") {
+TEST_CASE("NVN preparation matches direct Ampere analysis", "[nvn][shaders]") {
     SECTION("EXIT-only program") {
         const std::array<Instruction, 1> program{Exit};
         const auto binary = MakeBinary(ShaderStage::Vertex, program);
-        const auto lowered = LowerNvnProgram(binary.View(ShaderStage::Vertex));
-        REQUIRE(lowered->error.empty());
-        CHECK(lowered->capture_complete);
-        CHECK(lowered->texture_bound == ~0U);
-        REQUIRE(lowered->code.size() >= 0x50 / 8 + 1);
-        const auto reference = Shader::Ampere::LowerToMaxwell(program);
+        const auto prepared = PrepareNvnProgram(binary.View(ShaderStage::Vertex));
+        REQUIRE(prepared->error.empty());
+        CHECK(prepared->capture_complete);
+        CHECK(prepared->texture_bound == ~0U);
+        const auto reference = Shader::Ampere::AnalyzeProgram(program);
         REQUIRE(static_cast<bool>(reference));
-        // The first instruction follows the 0x50-byte SPH.
-        CHECK(lowered->code[0x50 / 8] == reference.instructions[0]);
-        CHECK(lowered->source_size == GraphicsHeaderBytes + reference.source_size);
-        CHECK(Shader::Ampere::HasNativeAddressMap(lowered->code));
-        CHECK(Shader::Ampere::NativeProgramAddress(lowered->code, 0) == 0x50u);
-        CHECK_FALSE(Shader::Ampere::NativeProgramAddress(lowered->code, 16).has_value());
-        // [sph][instructions][0][address map][count][magic]
-        const size_t expected = 0x50 / 8 + reference.instructions.size() + 1 +
-                                reference.source_instruction_offsets.size() + 2;
-        CHECK(lowered->code.size() == expected);
+        REQUIRE(prepared->native.size() == 1);
+        CHECK(prepared->native[0].words == program[0].words);
+        CHECK(prepared->source_size == GraphicsHeaderBytes + reference.source_size);
+        CHECK(prepared->instruction_count == reference.instruction_count);
+        CHECK(prepared->branch_targets == reference.branch_targets);
     }
-    SECTION("scheduling words and the address map of a longer program") {
+    SECTION("control-flow branch targets and texture buffer of a longer program") {
         const auto binary = MakeBinary(ShaderStage::Fragment, TwoTextureProgram);
-        const auto lowered = LowerNvnProgram(binary.View(ShaderStage::Fragment));
-        REQUIRE(lowered->error.empty());
-        const auto reference = Shader::Ampere::LowerToMaxwell(TwoTextureProgram);
+        const auto prepared = PrepareNvnProgram(binary.View(ShaderStage::Fragment));
+        REQUIRE(prepared->error.empty());
+        const auto reference = Shader::Ampere::AnalyzeProgram(TwoTextureProgram);
         REQUIRE(static_cast<bool>(reference));
-        for (size_t i = 0; i < reference.instructions.size(); ++i) {
-            const size_t address = 0x50 + i * 8 + ((i + 1) / 3) * 8;
-            REQUIRE(address / 8 < lowered->code.size());
-            CHECK(lowered->code[address / 8] == reference.instructions[i]);
-            CHECK(address % 32 != 0); // never lands on a scheduling word
-        }
-        for (size_t native = 0; native < reference.source_instruction_offsets.size(); ++native) {
-            const u32 index = reference.source_instruction_offsets[native];
-            const u32 address = 0x50 + index * 8 + ((index + 1) / 3) * 8;
-            CHECK(Shader::Ampere::NativeProgramAddress(lowered->code,
-                                                       static_cast<u32>(native * 16)) == address);
-        }
-        // Every 32-byte group starts with a zero scheduling word, up to the last instruction.
-        const size_t count = reference.instructions.size();
-        const size_t last_address = 0x50 + (count - 1) * 8 + (count / 3) * 8;
-        for (size_t address = 0x60; address <= last_address; address += 32) {
-            CHECK(lowered->code[address / 8] == 0);
-        }
+        CHECK(prepared->instruction_count == reference.instruction_count);
+        CHECK(prepared->texture_bound == reference.required_texture_buffer);
+        CHECK(prepared->branch_targets == reference.branch_targets);
     }
     SECTION("c1 is the code area past the instructions, rounded to 0x100") {
         const std::array<Instruction, 1> program{Exit};
         const std::array<u32, 4> c1{0x11111111, 0x22222222, 0x33333333, 0x44444444};
         const auto binary = MakeBinary(ShaderStage::Fragment, program, c1);
-        const auto lowered = LowerNvnProgram(binary.View(ShaderStage::Fragment));
-        REQUIRE(lowered->error.empty());
-        CHECK(lowered->c1 == std::vector<u32>(c1.begin(), c1.end()));
+        const auto prepared = PrepareNvnProgram(binary.View(ShaderStage::Fragment));
+        REQUIRE(prepared->error.empty());
+        CHECK(prepared->c1 == std::vector<u32>(c1.begin(), c1.end()));
     }
     SECTION("errors carry a category and never throw") {
         const std::array<Instruction, 1> program{Exit};
         auto binary = MakeBinary(ShaderStage::Fragment, program);
         // A stage that does not match the control's stage byte.
-        CHECK(LowerNvnProgram(binary.View(ShaderStage::Compute))->error.find("control:") == 0);
+        CHECK(PrepareNvnProgram(binary.View(ShaderStage::Compute))->error.find("control:") == 0);
         // Code area size not matching the control.
         binary.code.push_back(0);
-        CHECK(LowerNvnProgram(binary.View(ShaderStage::Fragment))->error.find("control:") == 0);
+        CHECK(PrepareNvnProgram(binary.View(ShaderStage::Fragment))->error.find("control:") == 0);
         binary.code.pop_back();
         // Truncated control.
         binary.control.resize(0x30);
-        CHECK(LowerNvnProgram(binary.View(ShaderStage::Fragment))->error.find("control:") == 0);
+        CHECK(PrepareNvnProgram(binary.View(ShaderStage::Fragment))->error.find("control:") == 0);
         // A branch leaving the captured program.
         const std::array<Instruction, 2> bad{{
             {{0x947U | (7U << 12), 0x1000, 0x03800000, 0}},
             Exit,
         }};
         const auto escaped = MakeBinary(ShaderStage::Fragment, bad);
-        const auto result = LowerNvnProgram(escaped.View(ShaderStage::Fragment));
+        const auto result = PrepareNvnProgram(escaped.View(ShaderStage::Fragment));
         CHECK_FALSE(result->error.empty());
     }
     SECTION("a program the driver uploaded ends at its size footer") {
@@ -482,13 +461,13 @@ TEST_CASE("NVN lowering packs exactly like LowerNativeCode", "[nvn][shaders]") {
         uploaded.push_back({{0x00ff7802, inst_bytes, 0x00000f00, 0x000fc000}});
         uploaded.resize(16, nop);
         const auto binary = MakeBinary(ShaderStage::Fragment, uploaded);
-        const auto lowered = LowerNvnProgram(binary.View(ShaderStage::Fragment));
-        REQUIRE(lowered->error.empty());
-        CHECK(lowered->capture_complete);
-        const auto reference = Shader::Ampere::LowerToMaxwell(program);
+        const auto prepared = PrepareNvnProgram(binary.View(ShaderStage::Fragment));
+        REQUIRE(prepared->error.empty());
+        CHECK(prepared->capture_complete);
+        const auto reference = Shader::Ampere::AnalyzeProgram(program);
         REQUIRE(static_cast<bool>(reference));
-        CHECK(lowered->instruction_count == reference.instructions.size());
-        CHECK(lowered->source_size == GraphicsHeaderBytes + reference.source_size);
+        CHECK(prepared->instruction_count == reference.instruction_count);
+        CHECK(prepared->source_size == GraphicsHeaderBytes + reference.source_size);
     }
 }
 
@@ -504,7 +483,7 @@ struct Translated {
 std::unique_ptr<Translated> Translate(ShaderStage stage, std::span<const Instruction> code) {
     auto result = std::make_unique<Translated>();
     const auto binary = MakeBinary(stage, code);
-    result->lowered = LowerNvnProgram(binary.View(stage));
+    result->lowered = PrepareNvnProgram(binary.View(stage));
     REQUIRE(result->lowered->error.empty());
     result->env = std::make_unique<NvnEnvironment>(result->lowered);
     result->program =
@@ -518,7 +497,7 @@ TEST_CASE("NVN environment hands out synthetic handles", "[nvn][shaders]") {
     const std::array<u32, 8> c1{1, 2, 3, 4, 5, 6, 7, 8};
     const std::array<Instruction, 1> program{Exit};
     const auto binary = MakeBinary(ShaderStage::Fragment, program, c1);
-    auto lowered = LowerNvnProgram(binary.View(ShaderStage::Fragment));
+    auto lowered = PrepareNvnProgram(binary.View(ShaderStage::Fragment));
     REQUIRE(lowered->error.empty());
     NvnEnvironment env{lowered, {[](const NvnHandleRecord& record) {
                            NvnTextureInfo info;
@@ -546,8 +525,6 @@ TEST_CASE("NVN environment hands out synthetic handles", "[nvn][shaders]") {
     CHECK(env.HandleRecords().size() == 3);
     CHECK_FALSE(env.HandleKeyOverflow());
     CHECK_THROWS_AS(env.ReadInstruction(0x1000), Shader::RuntimeError);
-    CHECK_THROWS_AS(env.TranslateProgramAddress(0x20), Shader::RuntimeError);
-    CHECK(env.TranslateProgramAddress(0) == 0x50);
 }
 
 TEST_CASE("NVN translation yields the expected descriptors and bindings", "[nvn][shaders]") {
@@ -829,7 +806,7 @@ TEST_CASE("NVN layout rejects ambiguous uniform-buffer handle pairs", "[nvn][sha
 TEST_CASE("NVN environment reserves the last handle key", "[nvn][shaders]") {
     const std::array<Instruction, 1> program{Exit};
     const auto binary = MakeBinary(ShaderStage::Fragment, program);
-    auto lowered = LowerNvnProgram(binary.View(ShaderStage::Fragment));
+    auto lowered = PrepareNvnProgram(binary.View(ShaderStage::Fragment));
     REQUIRE(lowered->error.empty());
     NvnEnvironment env{lowered, {[](const NvnHandleRecord&) {
                            NvnTextureInfo info;
@@ -916,23 +893,23 @@ TEST_CASE("NVN mesh controls name the per-primitive header", "[nvn][shaders]") {
     for (u32 i = 0; i < SphBytes; ++i) {
         code[0x200 + i] = static_cast<u8>(0xA0 + i);
     }
-    const auto lowered = LowerNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
+    const auto lowered = PrepareNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
     REQUIRE(lowered->primitive_header.has_value());
     CHECK((*lowered->primitive_header)[0] == 0xA3A2A1A0u);
     CHECK((*lowered->primitive_header)[19] == 0xEFEEEDECu);
 
     // No size: no header (the SDK disables the geometry pipeline).
     Put32(control, 0x68, 0);
-    const auto none = LowerNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
+    const auto none = PrepareNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
     CHECK_FALSE(none->primitive_header.has_value());
     // A header outside the code area or shorter than an SPH is refused, visibly.
     Put32(control, 0x68, 0x50);
     Put32(control, 0x64, 0x2c0);
-    const auto outside = LowerNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
+    const auto outside = PrepareNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
     CHECK(outside->error.find("per-primitive header") != std::string::npos);
     Put32(control, 0x64, 0x200);
     Put32(control, 0x68, 0x40);
-    const auto short_header = LowerNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
+    const auto short_header = PrepareNvnProgram(NvnProgramBinary{ShaderStage::Mesh, control, code});
     CHECK(short_header->error.find("per-primitive header") != std::string::npos);
 }
 
@@ -943,7 +920,7 @@ TEST_CASE("NVN environment: native pointer search over the driver bank's buffer 
     auto compute = MakeBinary(ShaderStage::Compute, program);
     compute.control[0xb1] = 2;
     compute.control[0xb2] = 3;
-    const auto lowered = LowerNvnProgram(compute.View(ShaderStage::Compute));
+    const auto lowered = PrepareNvnProgram(compute.View(ShaderStage::Compute));
     REQUIRE(lowered->error.empty());
     NvnEnvironment env{lowered};
     CHECK(env.IsNativeProgram());
@@ -959,7 +936,7 @@ TEST_CASE("NVN environment: native pointer search over the driver bank's buffer 
 
     SECTION("graphics stages: their own storage table") {
         const auto vertex = MakeBinary(ShaderStage::Vertex, program);
-        const auto lowered_vertex = LowerNvnProgram(vertex.View(ShaderStage::Vertex));
+        const auto lowered_vertex = PrepareNvnProgram(vertex.View(ShaderStage::Vertex));
         REQUIRE(lowered_vertex->error.empty());
         NvnEnvironment vertex_env{lowered_vertex};
         CHECK(vertex_env.IsNativeProgram());
@@ -972,7 +949,7 @@ TEST_CASE("NVN environment: native pointer search over the driver bank's buffer 
 
     SECTION("task and mesh stages: their own storage tables, not the vertex/tess-eval ones") {
         const auto task = MakeBinary(ShaderStage::Task, program);
-        const auto lowered_task = LowerNvnProgram(task.View(ShaderStage::Task));
+        const auto lowered_task = PrepareNvnProgram(task.View(ShaderStage::Task));
         REQUIRE(lowered_task->error.empty());
         NvnEnvironment task_env{lowered_task};
         CHECK(task_env.IsCbufStorageBufferPointer(DriverBank, 0x670));
@@ -981,7 +958,7 @@ TEST_CASE("NVN environment: native pointer search over the driver bank's buffer 
         CHECK_FALSE(task_env.IsCbufStorageBufferPointer(DriverBank, 0x110));
         CHECK_FALSE(task_env.IsCbufStorageBufferPointer(DriverBank, 0x770));
         const auto mesh = MakeBinary(ShaderStage::Mesh, program);
-        const auto lowered_mesh = LowerNvnProgram(mesh.View(ShaderStage::Mesh));
+        const auto lowered_mesh = PrepareNvnProgram(mesh.View(ShaderStage::Mesh));
         REQUIRE(lowered_mesh->error.empty());
         NvnEnvironment mesh_env{lowered_mesh};
         CHECK(mesh_env.IsCbufStorageBufferPointer(DriverBank, 0x770));
@@ -1048,7 +1025,7 @@ TEST_CASE("NVN task and mesh programs bind the buffers of their own driver bank 
                           Case{ShaderStage::Mesh, Stage::Mesh, 0x770}}) {
         INFO(StageName(c.stage));
         const auto binary = MakeBinary(c.stage, program);
-        const auto lowered = LowerNvnProgram(binary.View(c.stage));
+        const auto lowered = PrepareNvnProgram(binary.View(c.stage));
         REQUIRE(lowered->error.empty());
         NvnEnvironment env{lowered};
         ObjectPool<IR::Inst> pool;

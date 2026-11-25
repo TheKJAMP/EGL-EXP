@@ -485,7 +485,28 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
                  tensor_lowering == VideoCommon::NativeTensorLowering::Compact ? "compact"
                                                                                : "full");
     }
-    const u32 mode_word = static_cast<u32>(vertex_input_mode);
+    if (options.dedup_dynamic_state) {
+        dynamic_caps.fixed = device.IsExtExtendedDynamicStateSupported() &&
+                             device.IsExtExtendedDynamicState2Supported();
+        dynamic_caps.polygon_mode = device.SupportsDynamicState3PolygonMode();
+        dynamic_caps.depth_clamp = device.SupportsDynamicState3DepthClampEnable();
+        dynamic_caps.provoking_vertex = device.SupportsDynamicState3ProvokingVertexMode() &&
+                                        device.SupportsProvokingVertexLastMode();
+        dynamic_caps.patch_control_points = device.SupportsDynamicState2PatchControlPoints();
+        dynamic_caps.blend = device.IsExtExtendedDynamicState3BlendingSupported() &&
+                             device.SupportsDynamicState3LogicOpEnable() &&
+                             device.IsExtExtendedDynamicState2ExtrasSupported();
+        dynamic_caps.alpha_to_coverage = device.SupportsDynamicState3AlphaToCoverageEnable();
+    }
+    const u32 mode_word = static_cast<u32>(vertex_input_mode) |
+                          (options.dedup_dynamic_state ? (1u << 8) : 0u) |
+                          (dynamic_caps.fixed ? (1u << 9) : 0u) |
+                          (dynamic_caps.polygon_mode ? (1u << 10) : 0u) |
+                          (dynamic_caps.depth_clamp ? (1u << 11) : 0u) |
+                          (dynamic_caps.provoking_vertex ? (1u << 12) : 0u) |
+                          (dynamic_caps.patch_control_points ? (1u << 13) : 0u) |
+                          (dynamic_caps.blend ? (1u << 14) : 0u) |
+                          (dynamic_caps.alpha_to_coverage ? (1u << 15) : 0u);
     disk_header.profile_hash = Common::CityHash64WithSeed(
         reinterpret_cast<const char*>(&mode_word), sizeof(mode_word),
         HashProfile(profile, host_info));
@@ -556,7 +577,7 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
     } else {
         if (options.preload) {
             const s64 hw = static_cast<s64>(std::thread::hardware_concurrency());
-            const size_t threads = static_cast<size_t>(std::max<s64>(1, hw / 2 - 1));
+            const size_t threads = static_cast<size_t>(std::clamp<s64>(hw / 2, 2, 4));
             workers.reset(new Common::ThreadWorker(threads, "NvnPipelineLoader", {},
                                                    Common::ThreadPlacement::Background));
         }
@@ -565,7 +586,7 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
         // Run-time compiles block draws that cannot be skipped by the preload, so they run at
         // normal priority on their own threads (the preload workers are a background queue).
         const s64 hw = static_cast<s64>(std::thread::hardware_concurrency());
-        size_t threads = static_cast<size_t>(std::clamp<s64>(hw / 4, 2, 6));
+        size_t threads = static_cast<size_t>(std::clamp<s64>(hw / 3, 2, 4));
         if (const u32 forced = Debug::Get().async_workers; forced != 0) {
             threads = forced; // EDEN_NX2_NVN_ASYNC_WORKERS: worker-count experiments
         }
@@ -575,23 +596,24 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
         async_workers.reset(new Common::ThreadWorker(threads, "NvnPipelineAsync"));
     }
     if (options.graphics_pipeline_library) {
+        constexpr size_t prepare_threads = 1;
+        prepare_workers.reset(new Common::ThreadWorker(prepare_threads, "NvnProgramPrepare", {},
+                                                       Common::ThreadPlacement::Background));
         if (device.IsExtGraphicsPipelineLibrarySupported()) {
             library_cache = std::make_unique<GraphicsPipelineLibraryCache>(device);
             gpl_dynamic_fixed = device.IsExtExtendedDynamicStateSupported() &&
                                 device.IsExtExtendedDynamicState2Supported();
-            const s64 hw = static_cast<s64>(std::thread::hardware_concurrency());
-            const size_t optimize_threads = static_cast<size_t>(std::clamp<s64>(hw / 8, 1, 4));
-            // A link compiles at most four parts: one on the calling thread, three here.
-            part_workers.reset(new Common::ThreadWorker(3, "NvnPipelineParts"));
+            constexpr size_t optimize_threads = 1;
+            constexpr size_t part_threads = 2;
+            part_workers.reset(new Common::ThreadWorker(part_threads, "NvnPipelineParts"));
             optimize_workers.reset(new Common::ThreadWorker(optimize_threads, "NvnPipelineOptimize",
                                                             {}, Common::ThreadPlacement::Background));
-            prepare_workers.reset(new Common::ThreadWorker(1, "NvnProgramPrepare", {},
-                                                           Common::ThreadPlacement::Background));
             LOG_INFO(Render_Vulkan,
                      "[nvn] nvn_pipeline_library on: graphics pipelines are fast-linked from "
                      "pipeline libraries when a draw needs them (cull, depth and stencil state {}), "
-                     "then compiled whole on {} background threads",
-                     gpl_dynamic_fixed ? "dynamic" : "in the parts", optimize_threads);
+                     "then compiled whole on {} background thread(s) ({} prepare worker(s))",
+                     gpl_dynamic_fixed ? "dynamic" : "in the parts", optimize_threads,
+                     prepare_threads);
         } else {
             LOG_WARNING(Render_Vulkan,
                         "[nvn] nvn_pipeline_library is on, but the device has no "
@@ -609,6 +631,10 @@ PipelineCache::Impl::Impl(const Device& device_, PipelineCacheOptions options_)
 
 PipelineCache::Impl::~Impl() {
     stopping = true;
+    {
+        std::scoped_lock lock{async_mutex};
+    }
+    async_cv.notify_all();
     if (loader.joinable()) {
         loader.request_stop();
         loader.join();
@@ -626,6 +652,10 @@ PipelineCache::Impl::~Impl() {
     part_workers.reset();
     optimize_workers.reset();
     prepare_workers.reset();
+    {
+        std::scoped_lock lock{gpl_mutex};
+        deferred_optimizes.clear();
+    }
     if (new_since_vk_write.load() != 0 && DiskEnabled() && !vk_cache_path.empty()) {
         writer.Post([this] { WriteVkCache(); });
     }
@@ -668,6 +698,10 @@ void PipelineCache::Impl::ClearShaders() {
     {
         std::scoped_lock lock{translation_mutex};
         translations.clear();
+    }
+    {
+        std::scoped_lock lock{gpl_mutex};
+        deferred_optimizes.clear();
     }
     library_cache = std::move(fresh_libraries);
     {
@@ -748,7 +782,7 @@ LoweredEntry PipelineCache::Impl::GetLowered(const StageProgram& program, u32 nv
     }
     LoweredEntry entry;
     try {
-        entry.program = VC::LowerNvnProgram(
+        entry.program = VC::PrepareNvnProgram(
             VC::NvnProgramBinary{
                 static_cast<VC::ShaderStage>(nvn_stage),
                 std::span<const u8>{program.control->data(), program.control->size()},
@@ -763,7 +797,7 @@ LoweredEntry PipelineCache::Impl::GetLowered(const StageProgram& program, u32 nv
         entry.program = std::move(failed);
     }
     if (entry.program && entry.program->error.empty()) {
-        entry.c1 = std::make_shared<const std::vector<u32>>(entry.program->c1);
+        entry.c1 = std::shared_ptr<const std::vector<u32>>(entry.program, &entry.program->c1);
         // The GPU profile names programs by stage hash, the shader tools by the native key.
         static const bool log_keys = [] {
             const char* value = std::getenv("EDEN_NX2_NVN_GPU_PROFILE");
@@ -1114,9 +1148,14 @@ bool PipelineCache::Impl::Translate(const TranslateInput& in, TranslateOutput& o
         record.layout.uses_raw_global_memory = programs[stage].info.uses_raw_global_memory;
         record.layout.stores_raw_global_memory = programs[stage].info.stores_raw_global_memory;
         record.layout.raw_stores_written_through = VC::RawStoresWrittenThrough(programs[stage].info);
-        record.layout.uses_bindless_table = std::ranges::any_of(
-            programs[stage].info.texture_descriptors,
-            [](const Shader::TextureDescriptor& desc) { return desc.bindless; });
+        u32 bindless_mask = 0;
+        for (const Shader::TextureDescriptor& desc : programs[stage].info.texture_descriptors) {
+            if (desc.bindless) {
+                bindless_mask |= 1u << static_cast<u32>(desc.type);
+            }
+        }
+        record.layout.uses_bindless_table = bindless_mask != 0;
+        record.layout.bindless_types_mask = bindless_mask;
         record.layout.requires_guest_warp =
             is_compute && tensor_lowering == VideoCommon::NativeTensorLowering::Compact &&
             programs[stage].info.UsesWarpOps();
@@ -1271,6 +1310,27 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     // form holds the vertex type classes instead of the vertex layout.
     GraphicsRequest request = source;
     MakeKeyState(request.state, vertex_input_mode, must_emulate_scaled_formats);
+    if (options.dedup_dynamic_state) {
+        if (vertex_input_mode == VertexInputMode::Dynamic &&
+            request.stages[STAGE_VERTEX].hash != 0 &&
+            request.stages[STAGE_VERTEX].control != nullptr &&
+            request.stages[STAGE_VERTEX].code != nullptr) {
+            const LoweredEntry vertex_lowered =
+                GetLowered(request.stages[STAGE_VERTEX], STAGE_VERTEX);
+            if (vertex_lowered.program && vertex_lowered.program->error.empty()) {
+                const u32 read_mask = vertex_lowered.program->attributes_read_mask;
+                for (u32 loc = 0; loc < MAX_VERTEX_ATTRIBUTES; ++loc) {
+                    if ((read_mask & (1u << loc)) == 0) {
+                        request.state.vertex_types[loc] =
+                            static_cast<u8>(Shader::AttributeType::Disabled);
+                    }
+                }
+            }
+        }
+        const bool has_tess = request.stages[STAGE_TESS_CONTROL].hash != 0 ||
+                              request.stages[STAGE_TESS_EVAL].hash != 0;
+        StripDynamicKeyState(request.state, dynamic_caps, has_tess);
+    }
     const TextureOracle& oracle = request.oracle != nullptr ? *request.oracle : DEFAULT_ORACLE;
     GraphicsKey key;
     for (size_t i = 0; i < GRAPHICS_STAGE_COUNT; ++i) {
@@ -1283,7 +1343,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     key_hash = key.hash;
 
     const bool prefetch = prefetch_skip.has_value();
-    if (prefetch && (key_hash == *prefetch_skip || !options.prefetch_graphics ||
+    if (prefetch && (key_hash == *prefetch_skip || !options.prefetch_graphics || !async_workers ||
                      !loader_queued.load(std::memory_order_acquire))) {
         return nullptr;
     }
@@ -1342,6 +1402,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         return nullptr;
     };
     if (auto hit = search()) {
+        if (!prefetch) {
+            NoteGraphicsUsed(*hit);
+        }
         return hit;
     }
     if (async) {
@@ -1378,7 +1441,11 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
                 return nullptr;
             }
             // An oracle that cannot be copied cannot be used by a worker: compile here.
-            return CompileGraphics(request, key, had_variants);
+            auto result = CompileGraphics(request, key, had_variants);
+            if (result) {
+                NoteGraphicsUsed(*result);
+            }
+            return result;
         }
         auto job = std::make_shared<AsyncGraphicsJob>();
         job->request.state = request.state;
@@ -1426,6 +1493,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
     if (const auto wait_start = std::chrono::steady_clock::now(); WaitLoaderQueued()) {
         NoteWait(wait_start);
         if (auto hit = search()) {
+            NoteGraphicsUsed(*hit);
             return hit;
         }
     }
@@ -1456,6 +1524,7 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         WaitPending(pending);
         NoteWait(wait_start);
         if (auto hit = search()) {
+            NoteGraphicsUsed(*hit);
             return hit;
         }
     }
@@ -1471,6 +1540,9 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::GetGraphics(const Graphic
         // Not built again for every later draw of the key (the asynchronous path does the same).
         std::scoped_lock lock{pipeline_mutex};
         failed_graphics.insert(key);
+    }
+    if (result) {
+        NoteGraphicsUsed(*result);
     }
     return result;
 }
@@ -1612,7 +1684,11 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::Impl::CompileGraphics(
         ++stat_gpl_reused;
     }
     if (pipeline->fast_linked) {
-        QueueOptimize(pipeline, gpl_set, request.state, request.targets);
+        if (options.gpl_optimize_after_presents > 0) {
+            DeferOptimize(pipeline, gpl_set, request.state, request.targets);
+        } else {
+            QueueOptimize(pipeline, gpl_set, request.state, request.targets);
+        }
     }
     NoteCompileTime(speculative             ? "graphics prefetch"
                     : !gpl_set               ? "graphics"
@@ -1642,7 +1718,7 @@ void PipelineCache::Impl::RunAsyncCompute(AsyncComputeJob& job) {
     std::shared_ptr<ComputePipeline> pipeline;
     if (!stopping.load()) {
         try {
-            pipeline = CompileCompute(job.request, job.key, job.had_variants);
+            pipeline = CompileCompute(job.request, job.key, job.had_variants, job.speculative);
         } catch (const std::exception& e) {
             ++stat_failures;
             NoteRow(fmt::format("pipeline: async compile failed: {}", FirstLine(e.what())));
@@ -1650,7 +1726,7 @@ void PipelineCache::Impl::RunAsyncCompute(AsyncComputeJob& job) {
             ++stat_failures;
             NoteRow("pipeline: async compile failed: unknown exception");
         }
-        if (!pipeline) {
+        if (!pipeline && !job.speculative) {
             ++stat_async_failed;
             std::scoped_lock lock{pipeline_mutex};
             failed_compute.insert(job.key);
@@ -1660,8 +1736,9 @@ void PipelineCache::Impl::RunAsyncCompute(AsyncComputeJob& job) {
     AsyncDone();
 }
 
-std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRequest& request,
-                                                                 bool* not_ready) {
+std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(
+    const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead,
+    std::optional<u64> prefetch_skip) {
     if (not_ready != nullptr) {
         *not_ready = false;
     }
@@ -1677,17 +1754,32 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRe
         key.environment_flags |= ENV_SHARED_MEMORY;
         key.shared_memory_size = *request.environment.compute_shared_memory_size;
     }
-    const bool async = AsyncEnabled(not_ready);
+    const bool prefetch = prefetch_skip.has_value();
+    if (prefetch && (key.hash == *prefetch_skip || !options.prefetch_graphics || !async_workers ||
+                     !loader_queued.load(std::memory_order_acquire))) {
+        return nullptr;
+    }
+    if (prefetch) {
+        std::scoped_lock lock{async_mutex};
+        if (async_outstanding >= async_worker_count) {
+            return nullptr;
+        }
+    }
+    const bool async = prefetch || AsyncEnabled(not_ready);
     const bool preload_registered = !async || loader_queued.load(std::memory_order_acquire);
     std::shared_ptr<PendingKey> pending;
     std::shared_ptr<PendingKey> claim;
     bool had_variants = false;
     bool failed = false;
     const auto search = [&]() -> std::shared_ptr<ComputePipeline> {
+        pending.reset();
         std::scoped_lock lock{pipeline_mutex};
         if (const auto it = compute.find(key); it != compute.end()) {
             for (const auto& candidate : it->second) {
                 if (candidate->QueriesMatch(oracle)) {
+                    if (!prefetch && candidate->prefetched_unused.exchange(false)) {
+                        ++stat_prefetch_used;
+                    }
                     return candidate;
                 }
             }
@@ -1700,6 +1792,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRe
                 failed = true;
             } else {
                 claim = std::make_shared<PendingKey>();
+                claim->speculative = prefetch;
                 claim->outstanding = 1;
                 pending_compute.emplace(key, claim);
             }
@@ -1712,23 +1805,32 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRe
     if (async) {
         const u64 hashes[1]{key.hash};
         if (!preload_registered || pending) {
-            *not_ready = true;
-            NoteNotReady("dispatch", hashes);
+            if (!prefetch) {
+                *not_ready = true;
+                NoteNotReady("dispatch", hashes);
+            }
             return nullptr;
         }
         if (failed) {
-            NoteRow("pipeline: dispatch skipped, the pipeline was rejected earlier");
+            if (!prefetch) {
+                NoteRow("pipeline: dispatch skipped, the pipeline was rejected earlier");
+            }
             return nullptr;
         }
+        SCOPE_EXIT {
+            if (claim) {
+                ReleasePending(pending_compute, key, claim);
+            }
+        };
         if (AnyStageRejected(hashes)) {
-            ReleasePending(pending_compute, key, claim);
             return nullptr;
         }
         std::unique_ptr<TextureOracle> frozen = oracle.Freeze(1u << STAGE_COMPUTE);
         if (!frozen) {
-            auto result = CompileCompute(request, key, had_variants);
-            ReleasePending(pending_compute, key, claim);
-            return result;
+            if (prefetch) {
+                return nullptr;
+            }
+            return CompileCompute(request, key, had_variants, false);
         }
         auto job = std::make_shared<AsyncComputeJob>();
         job->request.program.hash = request.program.hash;
@@ -1744,42 +1846,72 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::GetCompute(const ComputeRe
         job->request.oracle = job->oracle.get();
         job->key = key;
         job->had_variants = had_variants;
-        job->pending = std::move(claim);
+        job->speculative = prefetch;
+        job->pending = claim;
         AsyncQueued();
         try {
             async_workers->QueueWork([this, job] { RunAsyncCompute(*job); });
         } catch (...) {
             AsyncDone();
-            ReleasePending(pending_compute, key, job->pending);
             throw;
         }
+        claim.reset();
         ++stat_async_queued;
-        *not_ready = true;
-        NoteNotReady("dispatch", hashes);
+        if (prefetch) {
+            ++stat_prefetch_queued;
+        }
+        if (!prefetch) {
+            *not_ready = true;
+            NoteNotReady("dispatch", hashes);
+        }
         return nullptr;
     }
     if (const auto wait_start = std::chrono::steady_clock::now(); WaitLoaderQueued()) {
         NoteWait(wait_start);
-        pending.reset();
         if (auto hit = search()) {
             return hit;
         }
     }
+    bool scanned_ahead = false;
+    const auto scan_ahead = [&] {
+        if (scanned_ahead || failed || !options.prefetch_graphics || !look_ahead) {
+            return;
+        }
+        {
+            std::scoped_lock lock{async_mutex};
+            if (async_outstanding >= async_worker_count) {
+                return;
+            }
+        }
+        scanned_ahead = true;
+        try {
+            look_ahead(key.hash);
+        } catch (const std::exception& error) {
+            NoteIssue(
+                fmt::format("pipeline: compute lookahead failed: {}", FirstLine(error.what())));
+        }
+    };
     if (pending) {
+        if (pending->speculative) {
+            scan_ahead();
+        }
         const auto wait_start = std::chrono::steady_clock::now();
         WaitPending(pending);
         NoteWait(wait_start);
-        pending.reset();
         if (auto hit = search()) {
             return hit;
         }
     }
-    return CompileCompute(request, key, had_variants);
+    if (!had_variants) {
+        scan_ahead();
+    }
+    return CompileCompute(request, key, had_variants, false);
 }
 
 std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const ComputeRequest& request,
                                                                      const ComputeKey& key,
-                                                                     bool had_variants) {
+                                                                     bool had_variants,
+                                                                     bool speculative) {
     const auto start = std::chrono::steady_clock::now();
     CompileFailureNote failure{*this, LogBaseKey(key)};
     const u64 hashes[1]{request.program.hash};
@@ -1822,6 +1954,7 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
                                .count(),
                            static_cast<u32>(variants.size()));
         }
+        pipeline->prefetched_unused = speculative;
         variants.push_back(pipeline);
     }
     failure.armed = false;
@@ -1829,8 +1962,8 @@ std::shared_ptr<ComputePipeline> PipelineCache::Impl::CompileCompute(const Compu
     if (had_variants) {
         ++stat_retranslated;
     }
-    NoteCompileTime("compute", request.program.hash, start, create_start - translate_start,
-                    create_end - create_start);
+    NoteCompileTime(speculative ? "compute prefetch" : "compute", request.program.hash, start,
+                    create_start - translate_start, create_end - create_start);
     if (DiskEnabled()) {
         PostShader(stage);
         Disk::ComputePipelineRecord record;
@@ -1882,11 +2015,15 @@ std::shared_ptr<GraphicsPipeline> PipelineCache::GetGraphics(const GraphicsReque
     return result;
 }
 
-std::shared_ptr<ComputePipeline> PipelineCache::GetCompute(const ComputeRequest& request,
-                                                           bool* not_ready) {
+void PipelineCache::PrefetchCompute(const ComputeRequest& request, u64 skip_hash) {
+    (void)impl->GetCompute(request, nullptr, {}, skip_hash);
+}
+
+std::shared_ptr<ComputePipeline> PipelineCache::GetCompute(
+    const ComputeRequest& request, bool* not_ready, const std::function<void(u64)>& look_ahead) {
     const auto begin = Common::FrameStats::Enabled() ? std::chrono::steady_clock::now()
                                                      : std::chrono::steady_clock::time_point{};
-    auto result = impl->GetCompute(request, not_ready);
+    auto result = impl->GetCompute(request, not_ready, look_ahead);
     if (Common::FrameStats::Enabled()) {
         const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
                             std::chrono::steady_clock::now() - begin)
@@ -1908,6 +2045,14 @@ void PipelineCache::LogComputeFallback(const ComputeRequest& request, std::strin
 void PipelineCache::PrepareProgram(const std::array<StageProgram, STAGE_COUNT>& stages,
                                    std::shared_ptr<const void> owner) {
     impl->PrepareProgram(stages, std::move(owner));
+}
+
+void PipelineCache::OnPresent() {
+    impl->OnPresent();
+}
+
+void PipelineCache::NoteGraphicsUsed(GraphicsPipeline& pipeline) {
+    impl->NoteGraphicsUsed(pipeline);
 }
 
 bool PipelineCache::UsesGraphicsPipelineLibrary() const noexcept {

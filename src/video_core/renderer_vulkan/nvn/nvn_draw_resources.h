@@ -375,6 +375,8 @@ struct DrawResources {
     std::chrono::steady_clock::time_point last_shader_refresh{};
     /// Called at present boundaries; existing flights keep their pipelines until GPU completion.
     void MaybeRefreshShaders();
+    /// Advances the pipeline cache present counter for deferred background optimization.
+    void OnPresent();
     ClearPipelines clears;
     DrawCounters counters;
     /// Called once per present (replay thread): logs the draws skipped awaiting an asynchronous
@@ -407,6 +409,7 @@ struct DrawResources {
     /// Records the stage hashes of a program the game created; on the GPL path the cache also
     /// lowers its stages now (PipelineCache::PrepareProgram), ahead of its first draw.
     void OnProgramCreated(const std::shared_ptr<const VC::ProgramDesc>& program);
+    void ReleaseProgram(u64 serial);
     /// Content hashes of the compute programs dispatched so far (logged once each).
     std::unordered_set<u64> compute_programs;
 

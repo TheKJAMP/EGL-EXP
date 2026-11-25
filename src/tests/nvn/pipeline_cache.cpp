@@ -155,6 +155,8 @@ void RequireSameLayout(const VC::DescriptorLayout& x, const VC::DescriptorLayout
     REQUIRE(x.stores_raw_global_memory == y.stores_raw_global_memory);
     REQUIRE(x.raw_stores_written_through == y.raw_stores_written_through);
     REQUIRE(x.requires_guest_warp == y.requires_guest_warp);
+    REQUIRE(x.uses_bindless_table == y.uses_bindless_table);
+    REQUIRE(x.bindless_types_mask == y.bindless_types_mask);
     REQUIRE(x.unsupported_count == y.unsupported_count);
     REQUIRE(x.bindings.size() == y.bindings.size());
     for (size_t i = 0; i < x.bindings.size(); ++i) {
@@ -562,6 +564,24 @@ TEST_CASE("Descriptor layout serialization round trip", "[nvn]") {
             VC::DescriptorLayout out;
             (void)Disk::DeserializeDescriptorLayout(garbage, out);
         }
+    }
+    SECTION("bindless_types_mask round trip and legacy fallback") {
+        VC::DescriptorLayout with_mask = layout;
+        with_mask.uses_bindless_table = true;
+        with_mask.bindless_types_mask = 0x15u;
+        const std::vector<u8> encoded = Disk::SerializeDescriptorLayout(with_mask);
+        VC::DescriptorLayout roundtrip;
+        REQUIRE(Disk::DeserializeDescriptorLayout(encoded, roundtrip));
+        RequireSameLayout(with_mask, roundtrip);
+
+        VC::DescriptorLayout legacy = layout;
+        legacy.uses_bindless_table = true;
+        legacy.bindless_types_mask = 0u;
+        const std::vector<u8> legacy_bytes = Disk::SerializeDescriptorLayout(legacy);
+        VC::DescriptorLayout legacy_decoded;
+        REQUIRE(Disk::DeserializeDescriptorLayout(legacy_bytes, legacy_decoded));
+        REQUIRE(legacy_decoded.uses_bindless_table);
+        REQUIRE(legacy_decoded.bindless_types_mask == ~u32{0});
     }
 }
 
@@ -3168,7 +3188,7 @@ TEST_CASE("TranslationState holds the state the translation reads and nothing el
 }
 
 TEST_CASE("Dynamic fixed state: the static create info and the per-draw values agree", "[nvn]") {
-    const auto vulkan = MakeHeadlessVulkan();
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
     if (!vulkan) {
         SKIP("no Vulkan device");
     }
@@ -3180,7 +3200,10 @@ TEST_CASE("Dynamic fixed state: the static create info and the per-draw values a
         GraphicsFixedState s = TrianglesState();
         s.polygon = VC::PolygonState::WithCullFace(s.polygon, i % 4);
         s.polygon = VC::PolygonState::WithFrontFace(s.polygon, i % 2);
+        s.polygon = VC::PolygonState::WithPolygonMode(s.polygon, i % 3);
         s.polygon = VC::PolygonState::WithOffsetEnables(s.polygon, (i % 3) == 0 ? 4 : 0);
+        s.depth_clamp = i % 2;
+        s.provoking_first = (i / 2) % 2;
         s.depth_stencil = VC::DepthStencilState::WithDepthTestEnable(s.depth_stencil, i % 2);
         s.depth_stencil = VC::DepthStencilState::WithDepthWriteEnable(s.depth_stencil, (i / 2) % 2);
         s.depth_stencil = VC::DepthStencilState::WithDepthFunc(s.depth_stencil, 1 + i % 8);
@@ -3192,23 +3215,39 @@ TEST_CASE("Dynamic fixed state: the static create info and the per-draw values a
         states.push_back(s);
     }
     const auto describe = [&](const GraphicsFixedState& state, bool dynamic_fixed,
-                              Vulkan::Nvn::GraphicsPipelineDescription& out) {
+                              Vulkan::Nvn::GraphicsPipelineDescription& out,
+                              bool has_tessellation = false) {
         std::vector<std::string> issues;
         Vulkan::Nvn::DescribeGraphicsPipeline(*vulkan->device,
                                               Vulkan::Nvn::GraphicsPipelineParams{
                                                   .state = &state,
                                                   .targets = &targets,
+                                                  .has_tessellation = has_tessellation,
                                                   .vertex_input = VertexInputMode::Dynamic,
                                                   .dynamic_fixed = dynamic_fixed,
                                               },
                                               out, issues);
     };
-    constexpr std::array<VkDynamicState, 8> FIXED{
+    const auto dynamic_polygon_mode = vulkan->device->SupportsDynamicState3PolygonMode();
+    const auto dynamic_depth_clamp = vulkan->device->SupportsDynamicState3DepthClampEnable();
+    const auto dynamic_provoking_vertex =
+        vulkan->device->SupportsDynamicState3ProvokingVertexMode() &&
+        vulkan->device->SupportsProvokingVertexLastMode();
+    std::vector<VkDynamicState> expected_dynamic{
         VK_DYNAMIC_STATE_CULL_MODE,           VK_DYNAMIC_STATE_FRONT_FACE,
         VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE,   VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
         VK_DYNAMIC_STATE_DEPTH_COMPARE_OP,    VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
         VK_DYNAMIC_STATE_STENCIL_OP,          VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
     };
+    if (dynamic_polygon_mode) {
+        expected_dynamic.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
+    }
+    if (dynamic_depth_clamp) {
+        expected_dynamic.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+    }
+    if (dynamic_provoking_vertex) {
+        expected_dynamic.push_back(VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT);
+    }
     const auto declares = [](const Vulkan::Nvn::GraphicsPipelineDescription& d, VkDynamicState s) {
         return std::ranges::find(d.dynamic_states, s) != d.dynamic_states.end();
     };
@@ -3221,6 +3260,8 @@ TEST_CASE("Dynamic fixed state: the static create info and the per-draw values a
         describe(state, false, fixed);
         REQUIRE(fixed.rasterization.cullMode == values.cull_mode);
         REQUIRE(fixed.rasterization.frontFace == values.front_face);
+        REQUIRE(fixed.rasterization.polygonMode == values.polygon_mode);
+        REQUIRE((fixed.rasterization.depthClampEnable == VK_TRUE) == values.depth_clamp_enable);
         REQUIRE((fixed.rasterization.depthBiasEnable == VK_TRUE) == values.depth_bias_enable);
         REQUIRE((fixed.depth_stencil.depthTestEnable == VK_TRUE) == values.depth_test_enable);
         REQUIRE((fixed.depth_stencil.depthWriteEnable == VK_TRUE) == values.depth_write_enable);
@@ -3231,19 +3272,22 @@ TEST_CASE("Dynamic fixed state: the static create info and the per-draw values a
         REQUIRE(fixed.depth_stencil.front.depthFailOp == values.front.depth_fail);
         REQUIRE(fixed.depth_stencil.front.compareOp == values.front.compare);
         REQUIRE(fixed.depth_stencil.back.compareOp == values.back.compare);
-        for (const VkDynamicState dynamic : FIXED) {
+        for (const VkDynamicState dynamic : expected_dynamic) {
             REQUIRE_FALSE(declares(fixed, dynamic));
         }
         // Dynamic: declared, and the create info no longer depends on them (equal library keys).
         Vulkan::Nvn::GraphicsPipelineDescription dynamic;
         describe(state, true, dynamic);
-        for (const VkDynamicState s : FIXED) {
+        for (const VkDynamicState s : expected_dynamic) {
             REQUIRE(declares(dynamic, s));
         }
         const auto& raster = dynamic.rasterization;
         const auto& raster0 = first_dynamic.rasterization;
         REQUIRE(raster.cullMode == raster0.cullMode);
         REQUIRE(raster.frontFace == raster0.frontFace);
+        REQUIRE((!dynamic_polygon_mode || raster.polygonMode == raster0.polygonMode));
+        REQUIRE((!dynamic_depth_clamp || raster.depthClampEnable == raster0.depthClampEnable));
+        REQUIRE((!dynamic_provoking_vertex || raster.pNext == nullptr));
         REQUIRE(raster.depthBiasEnable == raster0.depthBiasEnable);
         const auto& ds = dynamic.depth_stencil;
         const auto& ds0 = first_dynamic.depth_stencil;
@@ -3259,7 +3303,20 @@ TEST_CASE("Dynamic fixed state: the static create info and the per-draw values a
             REQUIRE(face.depthFailOp == face0.depthFailOp);
             REQUIRE(face.compareOp == face0.compareOp);
         }
-        REQUIRE(dynamic.dynamic_states.size() == fixed.dynamic_states.size() + FIXED.size());
+        REQUIRE(dynamic.dynamic_states.size() == fixed.dynamic_states.size() + expected_dynamic.size());
+    }
+    if (vulkan->device->SupportsDynamicState2PatchControlPoints()) {
+        GraphicsFixedState tess = TrianglesState();
+        tess.topology = 14; // PATCHES
+        tess.patch_vertices = 7;
+        Vulkan::Nvn::GraphicsPipelineDescription tess_fixed;
+        describe(tess, false, tess_fixed, true);
+        REQUIRE(tess_fixed.tessellation.patchControlPoints == 7);
+        REQUIRE_FALSE(declares(tess_fixed, VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT));
+        Vulkan::Nvn::GraphicsPipelineDescription tess_dyn;
+        describe(tess, true, tess_dyn, true);
+        REQUIRE(tess_dyn.tessellation.patchControlPoints == 1);
+        REQUIRE(declares(tess_dyn, VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT));
     }
 }
 
@@ -3817,4 +3874,209 @@ TEST_CASE("GPL: the emulated GPU path ignores nvn_pipeline_library", "[nvn]") {
     const auto emulated = MakeHeadlessVulkanWithGpl(Settings::GraphicsPath::Emulated);
     REQUIRE(emulated);
     REQUIRE_FALSE(emulated->device->IsExtGraphicsPipelineLibrarySupported());
+}
+
+TEST_CASE("GPL: background optimization waits for gpl_optimize_after_presents", "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan || !vulkan->device->IsExtGraphicsPipelineLibrarySupported()) {
+        SKIP("no Vulkan device with VK_EXT_graphics_pipeline_library");
+    }
+    PipelineCacheOptions options = GplOptions();
+    options.gpl_optimize_after_presents = 3;
+    PipelineCache cache{*vulkan->device, options};
+    const TestProgram vertex = MakeAddProgram(0, 15);
+    const TestProgram fragment = MakeTexturedFragment();
+    FreezableOracle oracle;
+    const GraphicsRequest request = MakeGraphicsRequest(vertex, fragment, &oracle);
+
+    bool not_ready = false;
+    REQUIRE(cache.GetGraphics(request, &not_ready) == nullptr);
+    REQUIRE(not_ready);
+    cache.Flush();
+
+    // Present 1 (sync/hit counts as 1 present) -> not optimized yet.
+    const auto pipeline = cache.GetGraphics(request, &not_ready);
+    REQUIRE(pipeline != nullptr);
+    REQUIRE(pipeline->fast_linked);
+    cache.Flush();
+    REQUIRE(cache.Stats().gpl_optimized == 0);
+    REQUIRE(pipeline->optimized_handle.load() == VK_NULL_HANDLE);
+
+    // Same present repeated use -> still present 1.
+    REQUIRE(cache.GetGraphics(request, &not_ready) == pipeline);
+    cache.Flush();
+    REQUIRE(cache.Stats().gpl_optimized == 0);
+
+    // Present 2 -> still deferred.
+    cache.OnPresent();
+    REQUIRE(cache.GetGraphics(request, &not_ready) == pipeline);
+    cache.Flush();
+    REQUIRE(cache.Stats().gpl_optimized == 0);
+
+    // Present 3 -> queues background optimization.
+    cache.OnPresent();
+    REQUIRE(cache.GetGraphics(request, &not_ready) == pipeline);
+    cache.Flush();
+    REQUIRE(cache.Stats().gpl_optimized == 1);
+    REQUIRE(pipeline->optimized_handle.load() != VK_NULL_HANDLE);
+    REQUIRE(pipeline->Handle() == *pipeline->optimized);
+}
+
+TEST_CASE("dedup_dynamic_state: dynamic states and unread vertex inputs share one pipeline",
+          "[nvn]") {
+    const auto vulkan = MakeHeadlessVulkanWithGpl();
+    if (!vulkan) {
+        SKIP("no Vulkan device");
+    }
+    const auto& dev = *vulkan->device;
+    if (!dev.IsExtVertexInputDynamicStateSupported()) {
+        SKIP("no VK_EXT_vertex_input_dynamic_state");
+    }
+
+    // Vertex shader that reads Generic0 (address 0x80) only and stores Position (address 0x70).
+    constexpr u32 Sched = 0x000fe200;
+    const std::array<u32, 12> vert_words{
+        0xff047321U, (0x80U << 8) | 0xffU, (3U << 10),         Sched, // ALD R4..7, a[0x80], RZ
+        0xff007322U, (0x70U << 8) | 4U,    (3U << 10) | 0xffU, Sched, // AST a[0x70], R4..7, RZ
+        EXIT_INSTRUCTION[0], EXIT_INSTRUCTION[1], EXIT_INSTRUCTION[2], EXIT_INSTRUCTION[3],
+    };
+    const TestProgram vertex = MakeTestProgram(0, vert_words);
+    const TestProgram fragment = MakeTexturedFragment();
+
+    constexpr u32 F_RGBA8 = 0x25;
+    constexpr u32 F_RGBA8UI = 0x27;
+
+    TempDirectory directory;
+    PipelineCacheOptions options = GplOptions();
+    options.directory = directory.path;
+    options.translation_epoch = "dedup-dynamic-state-test";
+    options.dedup_dynamic_state = true;
+    options.async_compile = false;
+
+    FreezableOracle oracle;
+    GraphicsRequest base = MakeGraphicsRequest(vertex, fragment, &oracle);
+    base.state.polygon = VC::PolygonState::Defaults();
+    base.state.color = VC::ColorState::Defaults();
+    base.state.channel_mask = 0xFFFF'FFFFu;
+    base.state.depth_stencil = VC::DepthStencilState::Defaults();
+    base.state.blend.fill(VC::BlendState::Defaults());
+    base.state.multisample.fill(0);
+    base.state.attributes[0] = F_RGBA8;
+    base.targets.depth = VK_FORMAT_D32_SFLOAT;
+
+    {
+        PipelineCache cold{*vulkan->device, options};
+        cold.Flush();
+
+        const auto first = cold.GetGraphics(base);
+        REQUIRE(first != nullptr);
+        REQUIRE(cold.Stats().compiled_at_runtime == 1);
+
+        // Vary unread vertex attribute slot 1 -> same pipeline!
+        GraphicsRequest unread_attr = base;
+        unread_attr.state.attributes[1] = F_RGBA8UI;
+        REQUIRE(cold.GetGraphics(unread_attr) == first);
+
+        if (dev.IsExtExtendedDynamicStateSupported() && dev.IsExtExtendedDynamicState2Supported()) {
+            GraphicsRequest ds_var = base;
+            ds_var.state.polygon = VC::PolygonState::WithCullFace(ds_var.state.polygon, 2);
+            ds_var.state.polygon = VC::PolygonState::WithFrontFace(ds_var.state.polygon, 0);
+            ds_var.state.depth_stencil =
+                VC::DepthStencilState::WithDepthTestEnable(ds_var.state.depth_stencil, 1);
+            ds_var.state.depth_stencil =
+                VC::DepthStencilState::WithDepthWriteEnable(ds_var.state.depth_stencil, 1);
+            ds_var.state.depth_stencil =
+                VC::DepthStencilState::WithDepthFunc(ds_var.state.depth_stencil, 4);
+            REQUIRE(cold.GetGraphics(ds_var) == first);
+        }
+        if (dev.SupportsDynamicState3PolygonMode()) {
+            GraphicsRequest poly_var = base;
+            poly_var.state.polygon = VC::PolygonState::WithPolygonMode(poly_var.state.polygon, 1);
+            REQUIRE(cold.GetGraphics(poly_var) == first);
+        }
+        if (dev.SupportsDynamicState3DepthClampEnable()) {
+            GraphicsRequest clamp_var = base;
+            clamp_var.state.depth_clamp = 1;
+            REQUIRE(cold.GetGraphics(clamp_var) == first);
+        }
+        if (dev.SupportsDynamicState3ProvokingVertexMode() &&
+            dev.SupportsProvokingVertexLastMode()) {
+            GraphicsRequest prov_var = base;
+            prov_var.state.provoking_first = 1;
+            REQUIRE(cold.GetGraphics(prov_var) == first);
+        }
+        if (dev.SupportsDynamicState3AlphaToCoverageEnable()) {
+            GraphicsRequest a2c_var = base;
+            a2c_var.state.multisample[VC::MultisampleState::OFFSET_ALPHA_TO_COVERAGE] = 1;
+            a2c_var.state.multisample[VC::MultisampleState::OFFSET_ALPHA_TO_COVERAGE_DITHER] = 1;
+            REQUIRE(cold.GetGraphics(a2c_var) == first);
+        }
+        if (dev.IsExtExtendedDynamicState3BlendingSupported() &&
+            dev.SupportsDynamicState3LogicOpEnable() &&
+            dev.IsExtExtendedDynamicState2ExtrasSupported()) {
+            GraphicsRequest blend_var = base;
+            blend_var.state.color = VC::ColorState::WithBlendEnabled(blend_var.state.color, 0, true);
+            blend_var.state.color = VC::ColorState::WithLogicOp(blend_var.state.color, 6);
+            blend_var.state.channel_mask = VC::ChannelMaskState::WithChannels(0, 0, 0x5);
+            blend_var.state.blend[0] =
+                VC::BlendState::WithSrcRgbFunc(VC::BlendState::Defaults(), 5);
+            REQUIRE(cold.GetGraphics(blend_var) == first);
+        }
+        REQUIRE(cold.Stats().compiled_at_runtime == 1);
+
+        // Real shader differences MUST still allocate distinct pipelines:
+        // 1) Read vertex attribute slot 0 type class changed (Float -> UInt)
+        GraphicsRequest read_attr = base;
+        read_attr.state.attributes[0] = F_RGBA8UI;
+        const auto p_attr = cold.GetGraphics(read_attr);
+        REQUIRE(p_attr != nullptr);
+        REQUIRE(p_attr != first);
+
+        // 2) Alpha test function changed (ALWAYS -> GREATER)
+        GraphicsRequest alpha_test = base;
+        alpha_test.state.color = VC::ColorState::WithAlphaFunc(alpha_test.state.color, 5);
+        alpha_test.state.alpha_ref_bits = 0x3F000000u;
+        const auto p_alpha = cold.GetGraphics(alpha_test);
+        REQUIRE(p_alpha != nullptr);
+        REQUIRE(p_alpha != first);
+
+        // 3) Dual-source blend state changed (Src1)
+        GraphicsRequest dual_src = base;
+        dual_src.state.color = VC::ColorState::WithBlendEnabled(dual_src.state.color, 0, true);
+        dual_src.state.blend[0] =
+            VC::BlendState::WithSrcRgbFunc(VC::BlendState::Defaults(), 0x10);
+        const auto p_dual = cold.GetGraphics(dual_src);
+        REQUIRE(p_dual != nullptr);
+        REQUIRE(p_dual != first);
+        REQUIRE(cold.Stats().compiled_at_runtime == 4);
+
+        cold.Flush();
+    }
+
+    // Warm reload: all 4 pipelines preload and hit with 0 runtime compiles.
+    {
+        PipelineCache warm{*vulkan->device, options};
+        warm.Flush();
+        REQUIRE(warm.Stats().loaded == 4);
+
+        const auto w_first = warm.GetGraphics(base);
+        REQUIRE(w_first != nullptr);
+        if (dev.IsExtExtendedDynamicState3BlendingSupported() &&
+            dev.SupportsDynamicState3LogicOpEnable() &&
+            dev.IsExtExtendedDynamicState2ExtrasSupported()) {
+            GraphicsRequest blend_var = base;
+            blend_var.state.color = VC::ColorState::WithBlendEnabled(blend_var.state.color, 0, true);
+            blend_var.state.blend[0] =
+                VC::BlendState::WithSrcRgbFunc(VC::BlendState::Defaults(), 5);
+            REQUIRE(warm.GetGraphics(blend_var) == w_first);
+        }
+        GraphicsRequest dual_src = base;
+        dual_src.state.color = VC::ColorState::WithBlendEnabled(dual_src.state.color, 0, true);
+        dual_src.state.blend[0] =
+            VC::BlendState::WithSrcRgbFunc(VC::BlendState::Defaults(), 0x10);
+        const auto w_dual = warm.GetGraphics(dual_src);
+        REQUIRE(w_dual != nullptr);
+        REQUIRE(w_dual != w_first);
+        REQUIRE(warm.Stats().compiled_at_runtime == 0);
+    }
 }

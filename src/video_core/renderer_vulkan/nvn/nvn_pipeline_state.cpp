@@ -16,6 +16,7 @@
 #include "common/logging.h"
 #include "common/settings.h"
 #include "video_core/buffer_cache/raw_coverage.h"
+#include "video_core/nvn/shader/nvn_program_map.h"
 #include "video_core/nvn/state_layouts.h"
 #include "video_core/renderer_vulkan/nvn/nvn_debug.h"
 #include "video_core/renderer_vulkan/nvn/nvn_pipeline_disk.h"
@@ -596,11 +597,14 @@ DynamicFixedState MakeDynamicFixedState(const GraphicsFixedState& state) {
     switch (VCN::PolygonState::PolygonMode(state.polygon)) {
     case 0:
         offset_bit = 1; // POINT
+        out.polygon_mode = VK_POLYGON_MODE_POINT;
         break;
     case 1:
         offset_bit = 2; // LINE
+        out.polygon_mode = VK_POLYGON_MODE_LINE;
         break;
     default:
+        out.polygon_mode = VK_POLYGON_MODE_FILL;
         break;
     }
     // The replay's viewports are negative-height whatever the window origin (nvn_viewport.h), so
@@ -658,7 +662,102 @@ DynamicFixedState MakeDynamicFixedState(const GraphicsFixedState& state) {
         .depth_fail = ToStencilOp(DS::BackDepthFailOp(ds)),
         .compare = ToCompareOp(DS::BackStencilFunc(ds)),
     };
+    out.depth_clamp_enable = state.depth_clamp != 0;
+    out.provoking_vertex_mode = state.provoking_first != 0
+                                    ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
+                                    : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT;
+    out.patch_control_points = state.patch_vertices != 0 ? state.patch_vertices : 1u;
     return out;
+}
+
+DynamicBlendState MakeDynamicBlendState(const GraphicsFixedState& state,
+                                        const RenderPassKey& targets) {
+    DynamicBlendState out;
+    for (u32 slot = 0; slot < MAX_COLOR_TARGETS; ++slot) {
+        if (targets.color[slot] != VK_FORMAT_UNDEFINED) {
+            out.attachment_count = slot + 1;
+        }
+    }
+    out.logic_op = static_cast<VkLogicOp>(VCN::ColorState::LogicOp(state.color));
+    out.logic_op_enable = VCN::ColorState::LogicOp(state.color) != VCN::STATE_LOGIC_OP_COPY;
+    static constexpr VkColorBlendEquationEXT DEFAULT_EQUATION{
+        .srcColorBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstColorBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .colorBlendOp = VK_BLEND_OP_ADD,
+        .srcAlphaBlendFactor = VK_BLEND_FACTOR_ONE,
+        .dstAlphaBlendFactor = VK_BLEND_FACTOR_ZERO,
+        .alphaBlendOp = VK_BLEND_OP_ADD,
+    };
+    for (u32 slot = 0; slot < out.attachment_count; ++slot) {
+        out.equations[slot] = DEFAULT_EQUATION;
+        if (targets.color[slot] == VK_FORMAT_UNDEFINED) {
+            out.blend_enable[slot] = VK_FALSE;
+            out.write_masks[slot] = 0;
+            continue;
+        }
+        out.write_masks[slot] =
+            VCN::ChannelMaskState::Channels(state.channel_mask, static_cast<s32>(slot));
+        bool is_signed{};
+        const bool integer_target =
+            IsIntegerColorFormat(static_cast<VkFormat>(targets.color[slot]), is_signed);
+        const bool enabled = VCN::ColorState::BlendEnabled(state.color, static_cast<s32>(slot));
+        if (!enabled || integer_target) {
+            out.blend_enable[slot] = VK_FALSE;
+            continue;
+        }
+        out.blend_enable[slot] = VK_TRUE;
+        const u64 blend = state.blend[slot];
+        bool known{};
+        out.equations[slot] = {
+            .srcColorBlendFactor = ToBlendFactor(VCN::BlendState::SrcRgbFunc(blend), known),
+            .dstColorBlendFactor = ToBlendFactor(VCN::BlendState::DstRgbFunc(blend), known),
+            .colorBlendOp = ToBlendOp(VCN::BlendState::RgbEquation(blend), known),
+            .srcAlphaBlendFactor = ToBlendFactor(VCN::BlendState::SrcAlphaFunc(blend), known),
+            .dstAlphaBlendFactor = ToBlendFactor(VCN::BlendState::DstAlphaFunc(blend), known),
+            .alphaBlendOp = ToBlendOp(VCN::BlendState::AlphaEquation(blend), known),
+        };
+    }
+    return out;
+}
+
+void StripDynamicKeyState(GraphicsFixedState& state, const DynamicStateCaps& caps,
+                          bool has_tessellation) {
+    if (caps.fixed) {
+        state.polygon = VCN::PolygonState::WithCullFace(state.polygon, VCN::STATE_FACE_NONE);
+        state.polygon = VCN::PolygonState::WithFrontFace(state.polygon, VCN::STATE_FRONT_FACE_CCW);
+        state.polygon = VCN::PolygonState::WithOffsetEnables(state.polygon, 0);
+        state.depth_stencil = 0;
+    }
+    if (caps.polygon_mode) {
+        state.polygon =
+            VCN::PolygonState::WithPolygonMode(state.polygon, VCN::STATE_POLYGON_MODE_FILL);
+    }
+    if (caps.depth_clamp) {
+        state.depth_clamp = 0;
+    }
+    if (caps.provoking_vertex) {
+        state.provoking_first = 0;
+    }
+    if (caps.patch_control_points && has_tessellation) {
+        state.patch_vertices = 0;
+    }
+    if (caps.alpha_to_coverage) {
+        state.multisample[VCN::MultisampleState::OFFSET_ALPHA_TO_COVERAGE] = 0;
+        state.multisample[VCN::MultisampleState::OFFSET_ALPHA_TO_COVERAGE_DITHER] = 0;
+    }
+    if (caps.blend) {
+        const bool dual_src = UsesDualSourceBlend(state);
+        const u32 alpha_func = VCN::ColorState::AlphaFunc(state.color);
+        state.color = VCN::ColorState::WithLogicOp(0, VCN::STATE_LOGIC_OP_COPY);
+        state.color = VCN::ColorState::WithAlphaFunc(state.color, alpha_func);
+        state.channel_mask = 0;
+        state.blend.fill(0);
+        if (dual_src) {
+            state.color = VCN::ColorState::WithBlendEnabled(state.color, 0, true);
+            state.blend[0] =
+                VCN::BlendState::WithSrcRgbFunc(VCN::BlendState::Defaults(), BLEND_SRC1_COLOR);
+        }
+    }
 }
 
 VertexFormatInfo ResolveVertexFormat(const Device& device, u32 nvn_format) {
@@ -999,6 +1098,17 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     const RenderPassKey& targets = *params.targets;
     const u8* const ms = state.multisample.data();
     const DynamicFixedState fixed = MakeDynamicFixedState(state);
+    const bool dynamic_fixed = params.dynamic_fixed;
+    const bool dynamic_polygon_mode = dynamic_fixed && device.SupportsDynamicState3PolygonMode();
+    const bool dynamic_depth_clamp = dynamic_fixed && device.SupportsDynamicState3DepthClampEnable();
+    const bool dynamic_provoking_vertex =
+        dynamic_fixed && device.SupportsDynamicState3ProvokingVertexMode() &&
+        device.SupportsProvokingVertexLastMode();
+    const bool dynamic_patch_control_points =
+        dynamic_fixed && params.has_tessellation &&
+        device.SupportsDynamicState2PatchControlPoints();
+    const bool dynamic_alpha_to_coverage =
+        params.dynamic_alpha_to_coverage && device.SupportsDynamicState3AlphaToCoverageEnable();
 
     // --- vertex input --------------------------------------------------------------------
     // Dynamic: no bindings or attributes here, the replay sets the layout per draw with
@@ -1088,7 +1198,7 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .sType = VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .patchControlPoints = patch_points,
+        .patchControlPoints = dynamic_patch_control_points ? 1u : patch_points,
     };
 
     // --- viewport -------------------------------------------------------------------------
@@ -1111,27 +1221,17 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
     }
 
     // --- rasterization --------------------------------------------------------------------
-    VkPolygonMode vk_polygon_mode = VK_POLYGON_MODE_FILL;
-    switch (VCN::PolygonState::PolygonMode(state.polygon)) {
-    case 0:
-        vk_polygon_mode = VK_POLYGON_MODE_POINT;
-        break;
-    case 1:
-        vk_polygon_mode = VK_POLYGON_MODE_LINE;
-        break;
-    default:
-        break;
-    }
-    // With dynamic fixed state the cull mode, front face and depth bias enable are set per draw
-    // (the create-info values are ignored): fixed values keep the library keys equal.
-    const bool dynamic_fixed = params.dynamic_fixed;
+    // With dynamic fixed state the cull mode, front face and depth bias enable (plus EDS3/EDS2
+    // polygon mode, depth clamp, and provoking vertex when supported) are set per draw (the
+    // create-info values are ignored): canonical values keep the library keys equal.
     out.rasterization = {
         .sType = VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .depthClampEnable = state.depth_clamp != 0 ? VK_TRUE : VK_FALSE,
+        .depthClampEnable =
+            dynamic_depth_clamp ? VK_FALSE : (state.depth_clamp != 0 ? VK_TRUE : VK_FALSE),
         .rasterizerDiscardEnable = state.rasterizer_discard != 0 ? VK_TRUE : VK_FALSE,
-        .polygonMode = vk_polygon_mode,
+        .polygonMode = dynamic_polygon_mode ? VK_POLYGON_MODE_FILL : fixed.polygon_mode,
         .cullMode = dynamic_fixed ? VkCullModeFlags{VK_CULL_MODE_NONE} : fixed.cull_mode,
         .frontFace = dynamic_fixed ? VK_FRONT_FACE_COUNTER_CLOCKWISE : fixed.front_face,
         .depthBiasEnable = !dynamic_fixed && fixed.depth_bias_enable ? VK_TRUE : VK_FALSE,
@@ -1149,13 +1249,15 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .provokingVertexMode = first_vertex ? VK_PROVOKING_VERTEX_MODE_FIRST_VERTEX_EXT
                                             : VK_PROVOKING_VERTEX_MODE_LAST_VERTEX_EXT,
     };
-    if (!first_vertex && device.SupportsProvokingVertexLastMode()) {
-        out.rasterization.pNext = &out.provoking_vertex;
-    } else if (!first_vertex) {
-        issues.push_back(
-            "provoking vertex: the device has no last-vertex mode "
-            "(VK_EXT_provoking_vertex provokingVertexLast); flat outputs come from the "
-            "first vertex");
+    if (!dynamic_provoking_vertex) {
+        if (!first_vertex && device.SupportsProvokingVertexLastMode()) {
+            out.rasterization.pNext = &out.provoking_vertex;
+        } else if (!first_vertex) {
+            issues.push_back(
+                "provoking vertex: the device has no last-vertex mode "
+                "(VK_EXT_provoking_vertex provokingVertexLast); flat outputs come from the "
+                "first vertex");
+        }
     }
 
     // --- multisample ----------------------------------------------------------------------
@@ -1183,7 +1285,9 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .minSampleShading = 0.0f,
         .pSampleMask = samples <= VK_SAMPLE_COUNT_32_BIT ? &out.sample_mask : nullptr,
         .alphaToCoverageEnable =
-            writes_color0 && VCN::MultisampleState::AlphaToCoverage(ms) ? VK_TRUE : VK_FALSE,
+            !dynamic_alpha_to_coverage && writes_color0 && VCN::MultisampleState::AlphaToCoverage(ms)
+                ? VK_TRUE
+                : VK_FALSE,
         .alphaToOneEnable = VK_FALSE,
     };
 
@@ -1224,50 +1328,58 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
             attachment_count = slot + 1;
         }
     }
+    const bool dynamic_blend = params.dynamic_blend && attachment_count > 0 &&
+                               device.IsExtExtendedDynamicState3BlendingSupported() &&
+                               device.SupportsDynamicState3LogicOpEnable() &&
+                               device.IsExtExtendedDynamicState2ExtrasSupported();
     const bool logic_op_enabled = VCN::ColorState::LogicOp(state.color) != VCN::STATE_LOGIC_OP_COPY;
     bool unknown_blend = false;
     bool advanced_blend = false;
     bool blend_on_integer = false;
-    for (u32 slot = 0; slot < attachment_count; ++slot) {
-        VkPipelineColorBlendAttachmentState attachment{};
-        if (targets.color[slot] == VK_FORMAT_UNDEFINED) {
-            out.blend_attachments.push_back(attachment); // unused slot: write mask 0
-            continue;
+    if (dynamic_blend) {
+        out.blend_attachments.resize(attachment_count);
+    } else {
+        for (u32 slot = 0; slot < attachment_count; ++slot) {
+            VkPipelineColorBlendAttachmentState attachment{};
+            if (targets.color[slot] == VK_FORMAT_UNDEFINED) {
+                out.blend_attachments.push_back(attachment); // unused slot: write mask 0
+                continue;
+            }
+            attachment.colorWriteMask = VCN::ChannelMaskState::Channels(state.channel_mask, slot);
+            // NVN's r/g/b/a nibble bits are VkColorComponentFlagBits' R/G/B/A bits.
+            const u64 blend = state.blend[slot];
+            bool is_signed{};
+            const bool integer_target =
+                IsIntegerColorFormat(static_cast<VkFormat>(targets.color[slot]), is_signed);
+            const bool enabled = VCN::ColorState::BlendEnabled(state.color, static_cast<s32>(slot));
+            if (enabled && integer_target) {
+                blend_on_integer = true;
+            }
+            if (enabled && !integer_target) {
+                bool known_all = true;
+                bool known{};
+                attachment.blendEnable = VK_TRUE;
+                attachment.srcColorBlendFactor =
+                    ToBlendFactor(VCN::BlendState::SrcRgbFunc(blend), known);
+                known_all &= known;
+                attachment.dstColorBlendFactor =
+                    ToBlendFactor(VCN::BlendState::DstRgbFunc(blend), known);
+                known_all &= known;
+                attachment.srcAlphaBlendFactor =
+                    ToBlendFactor(VCN::BlendState::SrcAlphaFunc(blend), known);
+                known_all &= known;
+                attachment.dstAlphaBlendFactor =
+                    ToBlendFactor(VCN::BlendState::DstAlphaFunc(blend), known);
+                known_all &= known;
+                attachment.colorBlendOp = ToBlendOp(VCN::BlendState::RgbEquation(blend), known);
+                known_all &= known;
+                attachment.alphaBlendOp = ToBlendOp(VCN::BlendState::AlphaEquation(blend), known);
+                known_all &= known;
+                unknown_blend |= !known_all;
+                advanced_blend |= VCN::BlendState::AdvancedMode(blend) != 0;
+            }
+            out.blend_attachments.push_back(attachment);
         }
-        attachment.colorWriteMask = VCN::ChannelMaskState::Channels(state.channel_mask, slot);
-        // NVN's r/g/b/a nibble bits are VkColorComponentFlagBits' R/G/B/A bits.
-        const u64 blend = state.blend[slot];
-        bool is_signed{};
-        const bool integer_target =
-            IsIntegerColorFormat(static_cast<VkFormat>(targets.color[slot]), is_signed);
-        const bool enabled = VCN::ColorState::BlendEnabled(state.color, static_cast<s32>(slot));
-        if (enabled && integer_target) {
-            blend_on_integer = true;
-        }
-        if (enabled && !integer_target) {
-            bool known_all = true;
-            bool known{};
-            attachment.blendEnable = VK_TRUE;
-            attachment.srcColorBlendFactor =
-                ToBlendFactor(VCN::BlendState::SrcRgbFunc(blend), known);
-            known_all &= known;
-            attachment.dstColorBlendFactor =
-                ToBlendFactor(VCN::BlendState::DstRgbFunc(blend), known);
-            known_all &= known;
-            attachment.srcAlphaBlendFactor =
-                ToBlendFactor(VCN::BlendState::SrcAlphaFunc(blend), known);
-            known_all &= known;
-            attachment.dstAlphaBlendFactor =
-                ToBlendFactor(VCN::BlendState::DstAlphaFunc(blend), known);
-            known_all &= known;
-            attachment.colorBlendOp = ToBlendOp(VCN::BlendState::RgbEquation(blend), known);
-            known_all &= known;
-            attachment.alphaBlendOp = ToBlendOp(VCN::BlendState::AlphaEquation(blend), known);
-            known_all &= known;
-            unknown_blend |= !known_all;
-            advanced_blend |= VCN::BlendState::AdvancedMode(blend) != 0;
-        }
-        out.blend_attachments.push_back(attachment);
     }
     if (unknown_blend) {
         issues.push_back("blend: unknown NVN blend function or equation value (ONE/ADD used)");
@@ -1282,9 +1394,11 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
         .sType = VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO,
         .pNext = nullptr,
         .flags = 0,
-        .logicOpEnable = logic_op_enabled ? VK_TRUE : VK_FALSE,
+        .logicOpEnable = !dynamic_blend && logic_op_enabled ? VK_TRUE : VK_FALSE,
         // NVNlogicOp and VkLogicOp share their numbering (CLEAR=0 ... SET=15).
-        .logicOp = static_cast<VkLogicOp>(VCN::ColorState::LogicOp(state.color)),
+        .logicOp = dynamic_blend
+                       ? VK_LOGIC_OP_COPY
+                       : static_cast<VkLogicOp>(VCN::ColorState::LogicOp(state.color)),
         .attachmentCount = static_cast<u32>(out.blend_attachments.size()),
         .pAttachments = out.blend_attachments.data(),
         .blendConstants = {},
@@ -1311,6 +1425,32 @@ void DescribeGraphicsPipeline(const Device& device, const GraphicsPipelineParams
                  VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE,
                  VK_DYNAMIC_STATE_STENCIL_OP,
                  VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE,
+             }) {
+            out.dynamic_states.push_back(dynamic);
+        }
+        if (dynamic_polygon_mode) {
+            out.dynamic_states.push_back(VK_DYNAMIC_STATE_POLYGON_MODE_EXT);
+        }
+        if (dynamic_depth_clamp) {
+            out.dynamic_states.push_back(VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT);
+        }
+        if (dynamic_provoking_vertex) {
+            out.dynamic_states.push_back(VK_DYNAMIC_STATE_PROVOKING_VERTEX_MODE_EXT);
+        }
+        if (dynamic_patch_control_points) {
+            out.dynamic_states.push_back(VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT);
+        }
+    }
+    if (dynamic_alpha_to_coverage) {
+        out.dynamic_states.push_back(VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT);
+    }
+    if (dynamic_blend) {
+        for (const VkDynamicState dynamic : {
+                 VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT,
+                 VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT,
+                 VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT,
+                 VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT,
+                 VK_DYNAMIC_STATE_LOGIC_OP_EXT,
              }) {
             out.dynamic_states.push_back(dynamic);
         }
@@ -1357,7 +1497,7 @@ vk::Pipeline CreateGraphicsPipeline(const Device& device, VkPipelineCache cache,
 TranslationSwitches CurrentTranslationSwitches() {
     // Each reader below is the code that consumes the switch while translating; keep the
     // interpretation identical (shader_recompiler/backend/spirv,
-    // frontend/ampere/lower_to_maxwell.h). The settings are read live there, the EDEN_NX2_* ones
+    // frontend/ampere/instruction.h). The settings are read live there, the EDEN_NX2_* ones
     // once per process: both are the process-wide value when a cache opens. Settings that only
     // change what is presented (HDR, upscaler, anti-aliasing, scaling filter, frame generation) or
     // how big the output is (resolution: the HLE never rescales) are not read by the translation

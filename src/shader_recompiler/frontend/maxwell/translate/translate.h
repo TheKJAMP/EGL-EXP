@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "common/common_types.h"
 #include "shader_recompiler/environment.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 

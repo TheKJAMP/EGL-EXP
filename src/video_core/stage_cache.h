@@ -72,9 +72,8 @@ public:
         explicit Recorder(Shader::Environment& inner);
 
         u64 ReadInstruction(u32 address) override;
-        u32 TranslateProgramAddress(u32 address) const override;
         bool IsNativeProgram() const override;
-        std::span<const Shader::Ampere::NativeRegisterRemap> NativeRegisterRemaps() const override;
+        std::optional<Shader::Ampere::NativeAmpereView> NativeAmpereProgram() const override;
         bool IsCbufStorageBufferPointer(u32 index, u32 offset) override;
         bool IsCbufIndirectStorageBufferPointer(u32 index, u32 offset, u32 indirect) override;
         u32 ReadCbufValue(u32 index, u32 offset) override;

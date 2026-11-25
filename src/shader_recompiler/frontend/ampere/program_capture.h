@@ -5,7 +5,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 #pragma once
 
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 
 namespace Shader::Ampere {
 class ProgramCaptureState {
@@ -27,9 +27,10 @@ public:
             // CALL.REL.NOINC (bit 86) pushes no return address, but its callee still returns
             // with RET.REL.NODEC through the link register set ahead of the call.
             if (opcode == 0x944) {
-                last_call_target = std::max(last_call_target, static_cast<u32>(target / 16));
+                last_call_target = (std::max)(last_call_target, static_cast<u32>(target / 16));
             } else {
-                last_forward_target = std::max(last_forward_target, static_cast<u32>(target / 16));
+                last_forward_target =
+                    (std::max)(last_forward_target, static_cast<u32>(target / 16));
             }
             // The compiler ends every program with an unconditional branch to itself; with a jump
             // table (whose targets live in a constant buffer) that is the only reliable end.

@@ -506,9 +506,9 @@ Row ProcessShader(u64 index, const StoredShader& shader, const WorkerConfig& con
     }
 
     const NvnProgramBinary binary{*stage, shader.control, shader.code};
-    const auto lowered = LowerNvnProgram(binary, CooperativeMatrixRequested()
-                                                     ? VideoCommon::NativeTensorLowering::Full
-                                                     : VideoCommon::NativeTensorLowering::None);
+    const auto lowered = PrepareNvnProgram(binary, CooperativeMatrixRequested()
+                                                       ? VideoCommon::NativeTensorLowering::Full
+                                                       : VideoCommon::NativeTensorLowering::None);
     if (!lowered->capture_complete && lowered->error.empty()) {
         row.flags += "capture-incomplete ";
     }
@@ -1047,7 +1047,7 @@ void WriteReport(const std::vector<Row>& rows, const Containers::ScanOutput& sca
     for (const auto& root : roots) {
         md << '`' << root << "` ";
     }
-    md << "\n- Pipeline: `LowerNvnProgram` -> `NvnEnvironment` + `TranslateNvnStage` -> "
+    md << "\n- Pipeline: `PrepareNvnProgram` -> `NvnEnvironment` + `TranslateNvnStage` -> "
           "`ConvertLegacyToGeneric` + `EmitSPIRV` (reference profile, default RuntimeInfo; compute "
           "shared memory from control +0x64, local memory 0) -> "
        << (spirv_val.empty() ? "no spirv-val (unavailable)" : "`spirv-val --target-env vulkan1.3`")

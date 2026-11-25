@@ -13,11 +13,10 @@
 
 #include "common/alignment.h"
 #include "shader_recompiler/exception.h"
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
-#include "shader_recompiler/frontend/ampere/program_address_map.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ampere/program_capture.h"
-#include "shader_recompiler/frontend/ampere/program_override.h"
-#include "shader_recompiler/frontend/maxwell/translate_program.h"
+#include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/program_header.h"
 
 namespace VideoCommon::Nvn {
@@ -37,6 +36,126 @@ u32 ReadU16(std::span<const u8> bytes, size_t offset) {
 
 // Sampler ids are 12 bits wide: keys 1..0xFFE name records, 0xFFF means "unknown" (overflow).
 constexpr u32 UnknownHandleKey = 0xFFF;
+
+Shader::Ampere::LoweringOptions MakeLoweringOptions(ShaderStage stage,
+                                                    NativeTensorLowering tensor) {
+    const bool compute = stage == ShaderStage::Compute;
+    return {
+        .geometry = stage == ShaderStage::Geometry,
+        .tensor = compute && tensor != NativeTensorLowering::None,
+        .compact_tensor = compute && tensor == NativeTensorLowering::Compact,
+    };
+}
+
+std::shared_ptr<LoweredNvnProgram> CaptureNvnProgram(const NvnProgramBinary& binary,
+                                                     NativeTensorLowering tensor,
+                                                     u32& out_header_bytes) {
+    using Shader::Ampere::Instruction;
+    using Capture = Shader::Ampere::ProgramCaptureState;
+
+    auto result = std::make_shared<LoweredNvnProgram>();
+    result->stage = binary.stage;
+    result->tensor_lowering = tensor;
+    const auto fail = [&](std::string message) {
+        result->error = std::move(message);
+        return result;
+    };
+
+    std::string control_error;
+    const auto control = ParseControl(binary.control, control_error);
+    if (!control) {
+        return fail("control: " + control_error);
+    }
+    result->control = *control;
+    const bool is_compute = binary.stage == ShaderStage::Compute;
+    const bool needs_stage_byte = is_compute || binary.stage == ShaderStage::Task ||
+                                  binary.stage == ShaderStage::Mesh;
+    if (needs_stage_byte ? control->stage_byte != static_cast<u32>(binary.stage)
+                         : control->stage_byte >= static_cast<u32>(ShaderStage::Compute)) {
+        return fail(fmt::format("control: stage byte {} does not match the requested {} stage",
+                                control->stage_byte, StageName(binary.stage)));
+    }
+    if (binary.code.size() != control->code_bytes) {
+        return fail(fmt::format("control: code area is {:#x} bytes, control says {:#x}",
+                                binary.code.size(), control->code_bytes));
+    }
+    out_header_bytes = is_compute ? 0 : GraphicsHeaderBytes;
+    if (control->inst_bytes < out_header_bytes ||
+        (control->inst_bytes - out_header_bytes) % sizeof(Instruction) != 0) {
+        return fail(fmt::format("control: instruction bytes {:#x} are not {}whole instructions",
+                                control->inst_bytes, is_compute ? "" : "header + "));
+    }
+    const u32 instruction_count = (control->inst_bytes - out_header_bytes) / sizeof(Instruction);
+    if (instruction_count == 0) {
+        return fail("control: program has no instructions");
+    }
+    if (!is_compute) {
+        std::memcpy(result->sph.data(), binary.code.data(), SphBytes);
+    }
+    {
+        const size_t c1_words = (control->code_bytes - control->c1_offset) / sizeof(u32);
+        result->c1.resize(c1_words);
+        if (c1_words != 0) {
+            std::memcpy(result->c1.data(), binary.code.data() + control->c1_offset,
+                        c1_words * sizeof(u32));
+        }
+    }
+    if (binary.stage == ShaderStage::Mesh && control->mesh.primitive_header_bytes != 0) {
+        const u64 offset = control->mesh.primitive_header_offset;
+        if (control->mesh.primitive_header_bytes < SphBytes ||
+            offset + SphBytes > control->code_bytes) {
+            return fail(fmt::format("control: per-primitive header of {:#x} bytes at +{:#x} is "
+                                    "not a header inside the {:#x}-byte code area",
+                                    control->mesh.primitive_header_bytes, offset,
+                                    control->code_bytes));
+        }
+        auto& header = result->primitive_header.emplace();
+        std::memcpy(header.data(), binary.code.data() + offset, SphBytes);
+    }
+
+    // Capture, as LowerNativeCode does: instruction by instruction until the program completes.
+    Capture capture;
+    bool complete = false;
+    static_assert(sizeof(Instruction) == 4 * sizeof(u32));
+    // The driver's size footer: the last eight instructions of the instruction area are
+    // `MOV RZ, 0x12345678` then `MOV RZ, <inst_bytes>`. It is believed only when the size names
+    // exactly the place it sits at; the program ends before it.
+    constexpr u32 FooterInstructions = 8;
+    constexpr u32 FooterMagic = 0x12345678;
+    const auto is_mov_rz = [](const Instruction& instruction, u32 immediate) {
+        return instruction.words[0] == 0x00ff7802U && instruction.words[1] == immediate;
+    };
+    const u32 limit = (std::min<u32>)(instruction_count, Capture::MaximumInstructions);
+    result->native.reserve(limit);
+    for (u32 index = 0; index < limit; ++index) {
+        Instruction instruction;
+        std::memcpy(&instruction, binary.code.data() + out_header_bytes + index * sizeof(Instruction),
+                    sizeof(instruction));
+        if (index != 0 && is_mov_rz(result->native.back(), FooterMagic) &&
+            is_mov_rz(instruction, out_header_bytes + (index - 1 + FooterInstructions) *
+                                                          static_cast<u32>(sizeof(Instruction)))) {
+            result->native.pop_back();
+            complete = true;
+            break;
+        }
+        result->native.push_back(instruction);
+        const auto status = capture.Observe(instruction, index);
+        if (status == Capture::Result::InvalidTarget) {
+            result->error_offset = index * static_cast<u32>(sizeof(Instruction));
+            result->failed_instruction = index;
+            result->error_words = instruction.words;
+            return fail(fmt::format("capture: branch outside capture bounds at +{:#x}",
+                                    result->error_offset));
+        }
+        if (status == Capture::Result::Complete) {
+            complete = true;
+            break;
+        }
+    }
+    result->capture_complete = complete;
+    result->native_key = Shader::Ampere::NativeProgramKey(result->native);
+    return result;
+}
 
 } // namespace
 
@@ -160,153 +279,40 @@ std::optional<ShaderStage> StageFromSph(std::span<const u8> code) {
     return StageFromSphType((ReadU32(code, 0) >> 10) & 0xF);
 }
 
-std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(const NvnProgramBinary& binary,
-                                                        NativeTensorLowering tensor) {
+std::shared_ptr<const LoweredNvnProgram> PrepareNvnProgram(const NvnProgramBinary& binary,
+                                                          NativeTensorLowering tensor) {
     using Shader::Ampere::Instruction;
-    using Capture = Shader::Ampere::ProgramCaptureState;
 
-    auto result = std::make_shared<LoweredNvnProgram>();
-    result->stage = binary.stage;
-    const auto fail = [&](std::string message) {
-        result->error = std::move(message);
-        return std::shared_ptr<const LoweredNvnProgram>{result};
-    };
-
-    std::string control_error;
-    const auto control = ParseControl(binary.control, control_error);
-    if (!control) {
-        return fail("control: " + control_error);
-    }
-    result->control = *control;
-    const bool is_compute = binary.stage == ShaderStage::Compute;
-    const bool needs_stage_byte = is_compute || binary.stage == ShaderStage::Task ||
-                                  binary.stage == ShaderStage::Mesh;
-    if (needs_stage_byte ? control->stage_byte != static_cast<u32>(binary.stage)
-                         : control->stage_byte >= static_cast<u32>(ShaderStage::Compute)) {
-        return fail(fmt::format("control: stage byte {} does not match the requested {} stage",
-                                control->stage_byte, StageName(binary.stage)));
-    }
-    if (binary.code.size() != control->code_bytes) {
-        return fail(fmt::format("control: code area is {:#x} bytes, control says {:#x}",
-                                binary.code.size(), control->code_bytes));
-    }
-    const u32 header_bytes = is_compute ? 0 : GraphicsHeaderBytes;
-    if (control->inst_bytes < header_bytes ||
-        (control->inst_bytes - header_bytes) % sizeof(Instruction) != 0) {
-        return fail(fmt::format("control: instruction bytes {:#x} are not {}whole instructions",
-                                control->inst_bytes, is_compute ? "" : "header + "));
-    }
-    const u32 instruction_count = (control->inst_bytes - header_bytes) / sizeof(Instruction);
-    if (instruction_count == 0) {
-        return fail("control: program has no instructions");
-    }
-    if (!is_compute) {
-        std::memcpy(result->sph.data(), binary.code.data(), SphBytes);
-    }
-    {
-        const size_t c1_words = (control->code_bytes - control->c1_offset) / sizeof(u32);
-        result->c1.resize(c1_words);
-        if (c1_words != 0) {
-            std::memcpy(result->c1.data(), binary.code.data() + control->c1_offset,
-                        c1_words * sizeof(u32));
-        }
-    }
-    if (binary.stage == ShaderStage::Mesh && control->mesh.primitive_header_bytes != 0) {
-        // The geometry pipeline the SDK binds with the program (MeshControl): the hardware reads
-        // that program's SPH, whose output map lists the per-primitive outputs.
-        const u64 offset = control->mesh.primitive_header_offset;
-        if (control->mesh.primitive_header_bytes < SphBytes ||
-            offset + SphBytes > control->code_bytes) {
-            return fail(fmt::format("control: per-primitive header of {:#x} bytes at +{:#x} is "
-                                    "not a header inside the {:#x}-byte code area",
-                                    control->mesh.primitive_header_bytes, offset,
-                                    control->code_bytes));
-        }
-        auto& header = result->primitive_header.emplace();
-        std::memcpy(header.data(), binary.code.data() + offset, SphBytes);
+    u32 header_bytes{};
+    auto result = CaptureNvnProgram(binary, tensor, header_bytes);
+    if (!result->error.empty()) {
+        return std::shared_ptr<const LoweredNvnProgram>{std::move(result)};
     }
 
-    // Capture, as LowerNativeCode does: instruction by instruction until the program completes.
-    // The end of the program image plays the part of the end of the mapping: the lowering judges
-    // what was captured.
-    std::vector<Instruction> native;
-    Capture capture;
-    bool complete = false;
-    static_assert(sizeof(Instruction) == 4 * sizeof(u32));
-    // The driver's size footer: the last eight instructions of the instruction area are
-    // `MOV RZ, 0x12345678` then `MOV RZ, <inst_bytes>`. It is believed only when the size names
-    // exactly the place it sits at; the program ends before it.
-    constexpr u32 FooterInstructions = 8;
-    constexpr u32 FooterMagic = 0x12345678;
-    const auto is_mov_rz = [](const Instruction& instruction, u32 immediate) {
-        return instruction.words[0] == 0x00ff7802U && instruction.words[1] == immediate;
-    };
-    const u32 limit = std::min<u32>(instruction_count, Capture::MaximumInstructions);
-    native.reserve(limit);
-    for (u32 index = 0; index < limit; ++index) {
-        Instruction instruction;
-        std::memcpy(&instruction, binary.code.data() + header_bytes + index * sizeof(Instruction),
-                    sizeof(instruction));
-        if (index != 0 && is_mov_rz(native.back(), FooterMagic) &&
-            is_mov_rz(instruction, header_bytes + (index - 1 + FooterInstructions) *
-                                                      static_cast<u32>(sizeof(Instruction)))) {
-            native.pop_back();
-            complete = true;
-            break;
-        }
-        native.push_back(instruction);
-        const auto status = capture.Observe(instruction, index);
-        if (status == Capture::Result::InvalidTarget) {
-            result->error_offset = index * static_cast<u32>(sizeof(Instruction));
-            result->failed_instruction = index;
-            result->error_words = instruction.words;
-            return fail(fmt::format("capture: branch outside capture bounds at +{:#x}",
-                                    result->error_offset));
-        }
-        if (status == Capture::Result::Complete) {
-            complete = true;
-            break;
-        }
-    }
-    result->capture_complete = complete;
-    result->native_key = Shader::Ampere::NativeProgramKey(native);
-
-    const bool compute = binary.stage == ShaderStage::Compute;
-    auto lowered = Shader::Ampere::LowerToMaxwell(
-        native, {.geometry = binary.stage == ShaderStage::Geometry,
-                 .tensor = compute && tensor != NativeTensorLowering::None,
-                 .compact_tensor = compute && tensor == NativeTensorLowering::Compact});
-    if (!lowered) {
-        const size_t failed = lowered.error_offset / sizeof(Instruction);
-        result->error_offset = lowered.error_offset;
-        if (failed < native.size()) {
+    auto analysis =
+        Shader::Ampere::AnalyzeProgram(result->native, MakeLoweringOptions(binary.stage, tensor));
+    if (!analysis) {
+        const size_t failed = analysis.error_offset / sizeof(Instruction);
+        result->error_offset = analysis.error_offset;
+        if (failed < result->native.size()) {
             result->failed_instruction = static_cast<u32>(failed);
+            result->error_words = result->native[failed].words;
         }
-        if (failed < native.size()) {
-            result->error_words = native[failed].words;
-        }
-        const std::string reason{lowered.error};
-        return fail(complete ? "lower: " + reason
-                             : "capture: program never completes within its instruction bytes; "
-                               "lower: " + reason);
+        const std::string reason{analysis.error};
+        result->error =
+            result->capture_complete
+                ? "lower: " + reason
+                : "capture: program never completes within its instruction bytes; lower: " + reason;
+        return std::shared_ptr<const LoweredNvnProgram>{std::move(result)};
     }
-    result->texture_bound = lowered.required_texture_buffer;
-    // Eglantine's lowering reads surface handles through the texture bound buffer.
-    result->surface_bound = lowered.required_texture_buffer;
-    result->source_size = header_bytes + lowered.source_size;
-    result->instruction_count = static_cast<u32>(lowered.instructions.size());
-    auto& code = result->code;
-    code.resize(SphBytes / sizeof(u64));
-    std::memcpy(code.data(), result->sph.data(), SphBytes);
-    for (const u64 instruction : lowered.instructions) {
-        if ((code.size() * sizeof(u64)) % 32 == 0) {
-            code.push_back(0); // Maxwell scheduling word, absent from native instructions.
-        }
-        code.push_back(instruction);
-    }
-    // Keep the original padding ABI, then retain the native address map as unreachable data.
-    code.push_back(0);
-    Shader::Ampere::AppendNativeAddressMap(code, lowered.source_instruction_offsets);
+
+    result->texture_bound = analysis.required_texture_buffer;
+    result->surface_bound = analysis.required_texture_buffer;
+    result->source_size = header_bytes + analysis.source_size;
+    result->instruction_count = analysis.instruction_count;
+    result->attributes_read_mask = analysis.generic_attributes_read;
+    result->uses_async_copy = analysis.uses_async_copy;
+    result->branch_targets = std::move(analysis.branch_targets);
     return result;
 }
 
@@ -358,23 +364,24 @@ NvnEnvironment::NvnEnvironment(std::shared_ptr<const LoweredNvnProgram> lowered_
 NvnEnvironment::~NvnEnvironment() = default;
 
 u64 NvnEnvironment::ReadInstruction(u32 address) {
-    const auto& code = lowered->code;
-    if (address >= (code.size() - 1) * sizeof(u64)) {
-        throw Shader::RuntimeError("Lowered native instruction address out of range: {:#x}",
-                                   address);
-    }
-    return code[address / sizeof(u64)];
-}
-
-u32 NvnEnvironment::TranslateProgramAddress(u32 address) const {
-    if (const auto translated = Shader::Ampere::NativeProgramAddress(lowered->code, address)) {
-        return *translated;
-    }
-    throw Shader::RuntimeError("Invalid native indirect branch address {:#x}", address);
+    throw Shader::RuntimeError("NvnEnvironment does not support Maxwell ReadInstruction at {:#x}",
+                               address);
 }
 
 bool NvnEnvironment::IsNativeProgram() const {
     return true;
+}
+
+std::optional<Shader::Ampere::NativeAmpereView> NvnEnvironment::NativeAmpereProgram() const {
+    if (lowered->native.empty()) {
+        return std::nullopt;
+    }
+    return Shader::Ampere::NativeAmpereView{
+        .code = lowered->native,
+        .options = MakeLoweringOptions(lowered->stage, lowered->tensor_lowering),
+        .uses_async_copy = lowered->uses_async_copy,
+        .branch_targets = lowered->branch_targets.empty() ? nullptr : &lowered->branch_targets,
+    };
 }
 
 bool NvnEnvironment::IsCbufStorageBufferPointer(u32 cbuf_index, u32 cbuf_offset) {
@@ -544,13 +551,16 @@ void NvnEnvironment::Dump(u64, u64) {}
 
 Shader::IR::Program TranslateNvnStage(NvnShaderPools& pools, NvnEnvironment& env,
                                       const Shader::HostTranslateInfo& host_info) {
-    // The in-game path: graphics CFG starts after the SPH (StartAddress is 0 there), compute
-    // starts at StartAddress, which already is the end of the SPH.
-    const u32 cfg_offset = env.ShaderStage() == Shader::Stage::Compute
-                               ? env.StartAddress()
-                               : static_cast<u32>(env.StartAddress() + sizeof(Shader::ProgramHeader));
-    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, false);
-    return Shader::Maxwell::TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+    const auto& lowered = env.Program();
+    if (lowered.native.empty()) {
+        throw Shader::RuntimeError("NVN program has no native Ampere instructions");
+    }
+    const auto lowering_options = MakeLoweringOptions(lowered.stage, lowered.tensor_lowering);
+    const auto* const targets =
+        lowered.branch_targets.empty() ? nullptr : &lowered.branch_targets;
+    return Shader::Ampere::TranslateProgram(pools.inst, pools.block, pools.flow_block, env,
+                                            lowered.native, lowering_options,
+                                            lowered.uses_async_copy, targets, host_info);
 }
 
 Shader::Profile MakeReferenceProfile() {

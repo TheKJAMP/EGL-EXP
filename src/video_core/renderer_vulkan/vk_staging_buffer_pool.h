@@ -41,7 +41,7 @@ public:
     void FreeDeferred(StagingBufferRef& ref);
 
     [[nodiscard]] VkBuffer StreamBuf() const noexcept {
-        return *stream_buffer;
+        return stream_buffer ? *stream_buffer : VK_NULL_HANDLE;
     }
 
     void TickFrame();
@@ -51,6 +51,8 @@ private:
         size_t upper_bound;
         u64 tick;
     };
+
+    void EnsureStreamBuffer();
 
     struct StagingBuffer {
         vk::Buffer buffer;

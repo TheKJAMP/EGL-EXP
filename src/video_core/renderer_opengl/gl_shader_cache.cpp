@@ -24,6 +24,7 @@
 #include "shader_recompiler/backend/glasm/emit_glasm.h"
 #include "shader_recompiler/backend/glsl/emit_glsl.h"
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/translate_program.h"
@@ -57,7 +58,21 @@ using VideoCommon::LoadPipelines;
 using VideoCommon::SerializePipeline;
 using Context = ShaderContext::Context;
 
-constexpr u32 CACHE_VERSION = 28;
+constexpr u32 CACHE_VERSION = 29;
+
+[[nodiscard]] Shader::IR::Program TranslateStage(ShaderContext::ShaderPools& pools,
+                                                 Shader::Environment& env, u32 cfg_offset,
+                                                 bool is_vertex_a,
+                                                 const Shader::HostTranslateInfo& host_info) {
+    if (const auto native = env.NativeAmpereProgram()) {
+        return Shader::Ampere::TranslateProgram(pools.inst, pools.block, pools.flow_block, env,
+                                                native->code, native->options,
+                                                native->uses_async_copy, native->branch_targets,
+                                                host_info);
+    }
+    Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, is_vertex_a);
+    return TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+}
 
 template <typename Container>
 auto MakeSpan(Container& container) {
@@ -503,7 +518,6 @@ std::unique_ptr<GraphicsPipeline> ShaderCache::CreateGraphicsPipeline(
         ++env_index;
 
         const u32 cfg_offset = u32(env.StartAddress() + sizeof(Shader::ProgramHeader));
-        Shader::Maxwell::Flow::CFG cfg(env, pools.flow_block, cfg_offset, index == 0);
 
         if (Settings::values.dump_guest_shaders) {
             env.Dump(hash, key.unique_hashes[index]);
@@ -511,13 +525,13 @@ std::unique_ptr<GraphicsPipeline> ShaderCache::CreateGraphicsPipeline(
 
         if (!uses_vertex_a || index != 1) {
             // Normal path
-            programs[index] = TranslateProgram(pools.inst, pools.block, env, cfg, host_info);
+            programs[index] = TranslateStage(pools, env, cfg_offset, index == 0, host_info);
 
             total_storage_buffers += Shader::NumDescriptors(programs[index].info.storage_buffers_descriptors);
         } else {
             // VertexB path when VertexA is present.
             auto& program_va{programs[0]};
-            auto program_vb{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+            auto program_vb{TranslateStage(pools, env, cfg_offset, index == 0, host_info)};
             total_storage_buffers += Shader::NumDescriptors(program_vb.info.storage_buffers_descriptors);
             programs[index] = MergeDualVertexPrograms(program_va, program_vb, env, host_info);
         }
@@ -601,13 +615,11 @@ std::unique_ptr<ComputePipeline> ShaderCache::CreateComputePipeline(
     auto hash = key.Hash();
     LOG_INFO(Render_OpenGL, "{:#016x}", hash);
 
-    Shader::Maxwell::Flow::CFG cfg{env, pools.flow_block, env.StartAddress()};
-
     if (Settings::values.dump_guest_shaders) {
         env.Dump(hash, key.unique_hash);
     }
 
-    auto program{TranslateProgram(pools.inst, pools.block, env, cfg, host_info)};
+    auto program{TranslateStage(pools, env, env.StartAddress(), false, host_info)};
     const u32 num_storage_buffers{Shader::NumDescriptors(program.info.storage_buffers_descriptors)};
     Shader::RuntimeInfo info;
     info.glasm_use_storage_buffers = num_storage_buffers <= device.GetMaxGLASMStorageBufferBlocks();

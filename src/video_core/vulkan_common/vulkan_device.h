@@ -986,8 +986,20 @@ FN_MAX_LIMIT_LIST
         return features.features.alphaToOne != VK_FALSE;
     }
 
+    bool SupportsDynamicState2PatchControlPoints() const {
+        return dynamic_state2_patch_control_points;
+    }
+
     bool SupportsDynamicState3DepthClampEnable() const {
         return dynamic_state3_depth_clamp_enable;
+    }
+
+    bool SupportsDynamicState3PolygonMode() const {
+        return dynamic_state3_polygon_mode;
+    }
+
+    bool SupportsDynamicState3ProvokingVertexMode() const {
+        return dynamic_state3_provoking_vertex_mode;
     }
 
     bool SupportsDynamicState3LogicOpEnable() const {
@@ -1442,9 +1454,12 @@ private:
     bool has_radeon_gpu_profiler{};            ///< Has Radeon GPU Profiler attached.
     bool supports_d24_depth{};                 ///< Supports D24 depth buffers.
     bool must_emulate_scaled_formats{};        ///< Requires scaled vertex format emulation
+    bool dynamic_state2_patch_control_points{};
     bool dynamic_state3_blending{};            ///< Has blending features of dynamic_state3.
     bool dynamic_state3_enables{};             ///< Has at least one enable feature of dynamic_state3.
     bool dynamic_state3_depth_clamp_enable{};
+    bool dynamic_state3_polygon_mode{};
+    bool dynamic_state3_provoking_vertex_mode{};
     bool dynamic_state3_logic_op_enable{};
     bool dynamic_state3_line_raster_mode{};
     bool dynamic_state3_conservative_raster_mode{};

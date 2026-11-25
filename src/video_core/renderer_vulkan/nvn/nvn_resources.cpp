@@ -64,6 +64,23 @@ bool IsLayered(TexTarget target) {
     }
 }
 
+/// True when a pool should not eagerly allocate its full-size VkBuffer on creation/background
+/// backing: compressible texture/RT pools, shader-code pools, GPU-no-access pools, and CPU pools
+/// without zero-copy host import (allocated lazily only if buffer or raw-global access occurs).
+[[nodiscard]] bool DeferDirectPoolBacking(u32 flags, u64 size,
+                                          bool host_import_available) noexcept {
+    if ((flags & (PoolFlag::Compressible | PoolFlag::ShaderCode | PoolFlag::GpuNoAccess)) != 0) {
+        return true;
+    }
+    if (size >= (u64{16} << 20)) {
+        return true;
+    }
+    if (!host_import_available && (flags & PoolFlag::CpuNoAccess) == 0) {
+        return true;
+    }
+    return false;
+}
+
 } // Anonymous namespace
 
 vk::Buffer Context::Impl::CreateHostBuffer(VkDeviceSize size, VkBufferUsageFlags usage,
@@ -171,7 +188,42 @@ bool Context::Impl::ImportSplitRuns(Pool& pool, std::string& error) {
         return false;
     }
     pool.split_runs = std::move(runs);
+    for (const Pool::SplitRun& run : pool.split_runs) {
+        NoteImportedGuestRange(pool.address + run.offset, run.size);
+    }
     return true;
+}
+
+void Context::Impl::NoteImportedGuestRange(u64 begin, u64 size) {
+    if (begin == 0 || size == 0) {
+        return;
+    }
+    const u64 end =
+        (size <= (std::numeric_limits<u64>::max)() - begin)
+            ? (begin + size)
+            : (std::numeric_limits<u64>::max)();
+    {
+        std::scoped_lock lock{imported_ranges_mutex};
+        imported_guest_ranges.emplace_back(begin, end);
+    }
+    has_imported_guest_ranges.store(true, std::memory_order_release);
+}
+
+bool Context::Impl::OverlapsImportedGuestRange(u64 begin, u64 size) const {
+    if (size == 0 || !has_imported_guest_ranges.load(std::memory_order_acquire)) {
+        return false;
+    }
+    const u64 end =
+        (size <= (std::numeric_limits<u64>::max)() - begin)
+            ? (begin + size)
+            : (std::numeric_limits<u64>::max)();
+    std::scoped_lock lock{imported_ranges_mutex};
+    for (const auto& [lo, hi] : imported_guest_ranges) {
+        if (begin < hi && lo < end) {
+            return true;
+        }
+    }
+    return false;
 }
 
 void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>& record) {
@@ -303,9 +355,10 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
     }
     const bool host_import_available = HostImportEnabled();
     // Without host import, backing CPU-accessible pools in the background turns every untouched
-    // texture pool into a gigabyte-scale device-local mirror; back them on demand instead.
+    // texture pool into a gigabyte-scale device-local mirror; compressibles/shader-code/GPU-no-access
+    // pools likewise defer their full-pool VkBuffer until an actual buffer or raw-global access.
     if (options.background_backing &&
-        (host_import_available || (desc.flags & PoolFlag::CpuNoAccess) != 0)) {
+        !DeferDirectPoolBacking(desc.flags, desc.size, host_import_available)) {
         {
             std::scoped_lock lock{backing_queue_mutex};
             backing_queue.push_back(pool);
@@ -316,7 +369,7 @@ void Context::Impl::CreatePoolNow(const VC::PoolDesc& desc) {
 
 std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 address, u64 size,
                                                                       u8* host) const {
-    constexpr u64 ChunkSize = u64{256} << 20;
+    constexpr u64 ChunkSize = u64{16} << 20;
     const u64 align = importer->Alignment();
     VC::GuestMemory* memory = guest.load(std::memory_order_acquire);
     // Guest and host addresses must differ by a multiple of the import alignment.
@@ -325,13 +378,16 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     }
     const auto align_down = [align](u64 v) { return v & ~(align - 1); };
     const auto align_up = [align](u64 v) { return (v + align - 1) & ~(align - 1); };
-    // Up to half a chunk of guest space on each side of the pool (so pools next to each other,
-    // whichever side of any fixed grid line they are on, land in one chunk), cut down to the
-    // contiguous run of mapped pages that contains the pool.
+    const u64 window_gran = (std::max)(ChunkSize, align);
+    // Grid-align the chunk window on 16 MiB boundaries around the pool, cut down to the
+    // contiguous run of mapped pages and clipped against existing chunks so windows never overlap.
     const u64 pool_begin = align_down(address);
     const u64 pool_end = align_up(address + size);
-    const u64 window_begin = pool_begin > ChunkSize / 2 ? align_down(pool_begin - ChunkSize / 2) : 0;
-    const u64 window_end = pool_end + ChunkSize / 2;
+    const u64 window_begin = align_down(pool_begin & ~(window_gran - 1));
+    const u64 window_end =
+        pool_end <= (std::numeric_limits<u64>::max)() - (window_gran - 1)
+            ? align_up((pool_end + window_gran - 1) & ~(window_gran - 1))
+            : pool_end;
     u8* const base = host - (address - pool_begin);
     const auto mapped_like_base = [&](u64 page) {
         // Signed: pages below the pool lie before `base`.
@@ -346,6 +402,29 @@ std::optional<Context::Impl::ChunkWindow> Context::Impl::ImportWindow(u64 addres
     u64 high = pool_end;
     while (high < window_end && mapped_like_base(high)) {
         high += align;
+    }
+    const uintptr_t h_pool_low = reinterpret_cast<uintptr_t>(base);
+    const uintptr_t h_pool_high = h_pool_low + (pool_end - pool_begin);
+    uintptr_t h_low = h_pool_low - (pool_begin - low);
+    uintptr_t h_high = h_pool_low + (high - pool_begin);
+    for (const auto& candidate : import_chunks) {
+        const uintptr_t c_low = reinterpret_cast<uintptr_t>(candidate->host);
+        const uintptr_t c_high = c_low + candidate->size;
+        if (c_high <= h_low || c_low >= h_high) {
+            continue;
+        }
+        if (c_high <= h_pool_low) {
+            h_low = (std::max)(h_low, c_high);
+        } else if (c_low >= h_pool_high) {
+            h_high = (std::min)(h_high, c_low);
+        } else {
+            return std::nullopt;
+        }
+    }
+    low = align_up(pool_begin - static_cast<u64>(h_pool_low - h_low));
+    high = align_down(pool_begin + static_cast<u64>(h_high - h_pool_low));
+    if (low > pool_begin || high < pool_end || high <= low) {
+        return std::nullopt;
     }
     return ChunkWindow{base - static_cast<std::ptrdiff_t>(pool_begin - low), low, high - low};
 }
@@ -365,6 +444,9 @@ VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& erro
                                  .count()),
             std::memory_order_relaxed);
         chunk_import_bytes.fetch_add(size, std::memory_order_relaxed);
+        if (result == VK_SUCCESS) {
+            NoteImportedGuestRange(address, size);
+        }
         return result;
     };
     // Guest and host addresses must differ by a multiple of the import alignment.
@@ -414,6 +496,7 @@ VkResult Context::Impl::ImportPoolBuffer(Pool& pool, u8* host, std::string& erro
         import_chunks.push_back(chunk);
         import_chunks_live.fetch_add(1, std::memory_order_relaxed);
         import_chunks_live_bytes.fetch_add(high - low, std::memory_order_relaxed);
+        NoteImportedGuestRange(low, high - low);
     }
     const VkResult result = importer->CreateBufferInChunk(
         *chunk, static_cast<u64>(host - chunk->host), size, pool_usage,
@@ -515,7 +598,7 @@ void Context::Impl::BackingMain() {
                 pool->released.load(std::memory_order_relaxed)) {
                 return true; // used (and backed) already, or destroyed
             }
-            if (!(pool->flags & PoolFlag::CpuNoAccess) && !HostImportEnabled()) {
+            if (DeferDirectPoolBacking(pool->flags, pool->size, HostImportEnabled())) {
                 return true; // wait until a draw, copy, or raw miss uses it
             }
             // A pool inside a chunk imported since needs no buffer of its own.
@@ -532,8 +615,9 @@ void Context::Impl::BackingMain() {
             // backing_mutex (the replay thread may build the raw global table meanwhile): see
             // HostImporter::MakeResident. The import below then finds them resident.
             u8* const host = const_cast<u8*>(GuestPointer(pool->address, pool->size));
-            if (const auto window = host ? ImportWindow(pool->address, pool->size, host)
-                                         : std::nullopt) {
+            if (const auto window = (host && !InImportedChunk(host, pool->size))
+                                        ? ImportWindow(pool->address, pool->size, host)
+                                        : std::nullopt) {
                 lock.unlock();
                 HostImporter::MakeResident(window->host, window->size);
                 lock.lock();
@@ -717,6 +801,12 @@ void Context::Impl::UploadWholePools(std::span<Pool* const> targets) {
             pool->backing = Pool::Backing::None;
         }
         stats.pools_unsupported.fetch_add(targets.size(), std::memory_order_relaxed);
+    } else {
+        for (Pool* const pool : targets) {
+            if (pool->size >= (u64{64} << 10)) {
+                HintColdGuestSpan(*pool, 0, pool->size);
+            }
+        }
     }
 }
 
@@ -1400,7 +1490,16 @@ void Context::Impl::DestroyNow(u64 serial) {
                            }});
         return;
     }
-    if (samplers.erase(serial) != 0 || programs.erase(serial) != 0) {
+    if (samplers.erase(serial) != 0) {
+        if (draw_resources) {
+            draw_resources->ReleaseSampler(serial, after);
+        }
+        return;
+    }
+    if (programs.erase(serial) != 0) {
+        if (draw_resources) {
+            draw_resources->ReleaseProgram(serial);
+        }
         return;
     }
     if (syncs.contains(serial)) {
@@ -1420,10 +1519,10 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
     std::scoped_lock backing_lock{backing_mutex};
     const bool host_import_available = HostImportEnabled();
     // Without host import, backing a CPU-accessible pool creates a Mirror that the raw table
-    // skips anyway (unless demand-promoted via PromoteRawMirrorPool); never eagerly back all
-    // pending CPU pools during a raw table rebuild, even when try_storage_vram is enabled.
+    // skips anyway (unless demand-promoted via PromoteRawMirrorPool); never eagerly back CPU,
+    // compressible, shader-code, or GPU-no-access pools during a raw table rebuild.
     const auto defer = [host_import_available](const Pool& pool) {
-        return !host_import_available && !(pool.flags & PoolFlag::CpuNoAccess);
+        return DeferDirectPoolBacking(pool.flags, pool.size, host_import_available);
     };
     const auto has_own_buffer = [](const Pool& pool) {
         return (pool.backing == Pool::Backing::Imported && !pool.chunk) ||
@@ -1563,7 +1662,14 @@ const Context::Impl::RawGlobalTable& Context::Impl::RawGlobalMemoryTable() {
                 continue;
             }
             if (physical->pending) {
-                if (defer(*physical)) {
+                // Physical pools always carry PoolFlag::GpuNoAccess from StoredPoolFlags: when
+                // reached via a virtual mapping, only defer CPU pools (without host import) and
+                // compressible / shader-code pools, keeping plain CpuNoAccess physical pools backed.
+                const bool defer_physical =
+                    (!host_import_available && (!(physical->flags & PoolFlag::CpuNoAccess) ||
+                                                physical->size >= (u64{16} << 20))) ||
+                    (physical->flags & (PoolFlag::Compressible | PoolFlag::ShaderCode)) != 0;
+                if (defer_physical) {
                     ++skipped;
                     continue;
                 }
@@ -1716,7 +1822,8 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             sources.push_back({pool, {pool->address, target, pool->size}});
         }
     }
-    if (read_only_enabled && (pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
+    std::vector<std::pair<Pool*, bool>> prev_split_alias;
+    if ((pool_usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) != 0) {
         for (const auto& [serial, entry] : pools) {
             static_cast<void>(serial);
             Pool* const pool = entry.get();
@@ -1724,8 +1831,10 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
                 pool->backing != Pool::Backing::Mirror || pool->split_runs.empty()) {
                 continue;
             }
+            const bool was_written_through = pool->raw_written_through;
             pool->raw_written_through = false;
-            if (!pool->buffer || pool->size == 0) {
+            prev_split_alias.emplace_back(pool, was_written_through);
+            if (!read_only_enabled || !pool->buffer || pool->size == 0) {
                 continue;
             }
             if (pool->device_address == 0) {
@@ -1769,6 +1878,11 @@ const Context::Impl::RawWriteThroughTable& Context::Impl::RawStoreAliasTable() {
             }
             table.pool_serials.push_back(pool->serial);
             table.pools.push_back(pool);
+        }
+    }
+    for (const auto& [pool, was_written_through] : prev_split_alias) {
+        if (was_written_through && !pool->raw_written_through && !pool->split_runs.empty()) {
+            pool->ClearAllMirrorTrusted();
         }
     }
     stats.vram_raw_alias_rebuilds.fetch_add(1, std::memory_order_relaxed);
@@ -2030,9 +2144,38 @@ u32 Context::Impl::PromoteMissedRawPools(const VideoCommon::RawCoverageRing& win
         if (!visited.insert(target).second) {
             continue;
         }
-        if ((target->flags & (PoolFlag::CpuNoAccess | PoolFlag::GpuNoAccess)) != 0 ||
-            target->IsVirtual() || target->raw_mirror_enabled || target->raw_mirror_refused) {
+        if (target->IsVirtual()) {
             continue;
+        }
+        if ((target->flags & PoolFlag::CpuNoAccess) != 0) {
+            if (target->pending.load(std::memory_order_acquire)) {
+                EnsureBacking(*target);
+                if (target->backing == Pool::Backing::DeviceLocal) {
+                    LOG_INFO(Render_Vulkan,
+                             "[nvn] raw global memory: backed deferred GPU-only pool {:#x} "
+                             "({:.2f} MiB, flags {:#x}) on raw miss at {:#x}",
+                             target->address, target->size / 1048576.0, target->flags, miss.guest);
+                    ++promoted;
+                }
+            }
+            continue;
+        }
+        if ((target->flags & PoolFlag::GpuNoAccess) != 0 || target->raw_mirror_enabled ||
+            target->raw_mirror_refused) {
+            continue;
+        }
+        if (target->pending.load(std::memory_order_acquire) && HostImportEnabled()) {
+            EnsureBacking(*target);
+            if (target->backing == Pool::Backing::Imported ||
+                target->backing == Pool::Backing::DeviceLocal || !target->split_runs.empty()) {
+                LOG_INFO(Render_Vulkan,
+                         "[nvn] raw global memory: backed deferred pool {:#x} ({:.2f} MiB, "
+                         "flags {:#x}) on raw miss at {:#x}",
+                         target->address, static_cast<double>(target->size) / 1048576.0,
+                         target->flags, miss.guest);
+                ++promoted;
+                continue;
+            }
         }
         if (!target->pending.load(std::memory_order_acquire) &&
             (target->backing == Pool::Backing::Imported ||
@@ -2151,7 +2294,7 @@ u64 Context::Impl::RawCoverageRingFor(u64 seq) {
         return 0;
     }
     FlightCoverageQueue flights{completed_seq, seq};
-    const bool demand_backing = !HostImportEnabled();
+    const bool demand_backing = true;
     const auto now = std::chrono::steady_clock::now();
     const bool force_swap =
         demand_backing && raw_coverage->HasNonNullMisses() && now >= raw_miss_next_swap;

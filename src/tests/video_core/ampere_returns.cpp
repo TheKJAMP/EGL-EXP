@@ -1,16 +1,15 @@
 // SPDX-FileCopyrightText: Copyright 2026 Eglantine Emulator Project
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// SPDX-License-Identifier: GPL-3.0-or-later
-
 #include <array>
 #include <catch2/catch_test_macros.hpp>
 
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 
 namespace {
+using Shader::Ampere::AnalyzeProgram;
 using Shader::Ampere::Instruction;
-using Shader::Ampere::LowerToMaxwell;
 
 TEST_CASE("Ampere returns do not write the link register", "[video_core][ampere]") {
     for (const u32 link : {0U, 55U}) {
@@ -20,10 +19,10 @@ TEST_CASE("Ampere returns do not write the link register", "[video_core][ampere]
             {{0x0000794d, 0, 0x03800000, 0}},
             {{0x00007950U | (link << 24), 0xffffffc0, 0x03c3ffff, 0}},
         }};
-        const auto lowered = LowerToMaxwell(code);
-        REQUIRE(static_cast<bool>(lowered));
-        REQUIRE(lowered.source_size == sizeof(code));
-        REQUIRE(lowered.instructions.back() == 0xe32000000007000fULL);
+        const auto analysis = AnalyzeProgram(code);
+        REQUIRE(static_cast<bool>(analysis));
+        REQUIRE(analysis.source_size == sizeof(code));
+        REQUIRE(analysis.instruction_count == 4);
     }
 }
 
@@ -35,7 +34,7 @@ TEST_CASE("Ampere returns can read a copy of the R0 link", "[video_core][ampere]
         {{0x00017202, 0, 0x00000f00, 0}},
         {{0x01007950, 0xffffffb0, 0x03c3ffff, 0}},
     }};
-    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
+    REQUIRE(static_cast<bool>(AnalyzeProgram(code)));
 }
 
 TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere]") {
@@ -46,10 +45,10 @@ TEST_CASE("Ampere callees still reject writes to the link", "[video_core][ampere
         {{0x00007802, 0, 0x00000f00, 0}},
         {{0x00007950, 0xffffffb0, 0x03c3ffff, 0}},
     }};
-    const auto lowered = LowerToMaxwell(code);
-    REQUIRE(!static_cast<bool>(lowered));
-    REQUIRE(lowered.error == "native callee overwrites link register");
-    REQUIRE(lowered.error_offset == 0x30);
+    const auto analysis = AnalyzeProgram(code);
+    REQUIRE(!static_cast<bool>(analysis));
+    REQUIRE(analysis.error == "native callee overwrites link register");
+    REQUIRE(analysis.error_offset == 0x30);
 }
 
 TEST_CASE("Ampere callees can compare into predicates with an R0 link", "[video_core][ampere]") {
@@ -61,7 +60,7 @@ TEST_CASE("Ampere callees can compare into predicates with an R0 link", "[video_
         {{0x0100720c, 0x00000002, 0x03f06070, 0}},
         {{0x00007950, 0xffffffb0, 0x03c3ffff, 0}},
     }};
-    REQUIRE(static_cast<bool>(LowerToMaxwell(code)));
+    REQUIRE(static_cast<bool>(AnalyzeProgram(code)));
 }
 
 TEST_CASE("Ampere callees reject a wide multiply over the link", "[video_core][ampere]") {
@@ -73,9 +72,9 @@ TEST_CASE("Ampere callees reject a wide multiply over the link", "[video_core][a
         {{0x01367225, 0x00000002, 0x078e00ff, 0}},
         {{0x37007950, 0xffffffb0, 0x03c3ffff, 0}},
     }};
-    const auto lowered = LowerToMaxwell(code);
-    REQUIRE(!static_cast<bool>(lowered));
-    REQUIRE(lowered.error == "native callee overwrites link register");
-    REQUIRE(lowered.error_offset == 0x30);
+    const auto analysis = AnalyzeProgram(code);
+    REQUIRE(!static_cast<bool>(analysis));
+    REQUIRE(analysis.error == "native callee overwrites link register");
+    REQUIRE(analysis.error_offset == 0x30);
 }
 } // namespace

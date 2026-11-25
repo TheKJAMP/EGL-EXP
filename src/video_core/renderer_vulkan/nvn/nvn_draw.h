@@ -621,6 +621,7 @@ private:
 
     // ---- compute (nvn_compute.cpp) ----
     void Dispatch(const VC::DispatchPayload& p);
+    void PrefetchBoundCompute(u64 skip_hash);
 
     // ---- upscaling (nvn_upscale.cpp) ----
     /// One image of an upscale: the texture and the level and layer (and format, when the game's
@@ -785,7 +786,7 @@ private:
     std::shared_ptr<GraphicsPipeline> ResolvePipeline(u32 mode, u32 element_count,
                                                       bool& awaiting_async,
                                                       const PipelineLookahead* lookahead = nullptr);
-    void PrefetchUpcomingGraphics(u32 current_mode, u64 current_key);
+    void PrefetchUpcomingGraphics(u32 current_mode, u64 current_key, u64 skip_compute_hash = 0);
     void ApplyDynamicState(const GraphicsPipeline& pipeline);
 
     // ---- descriptors (nvn_draw_descriptors.cpp) ----
@@ -892,7 +893,9 @@ private:
         u32 prime_count{};
         std::vector<u32> unprimed_slots;
         std::vector<u8> unprimed_queued;
-        size_t unprimed_head{0};
+        u32 requested_types_mask{0};
+        bool types_mask_dirty{false};
+        u32 prime_paused_logs{0};
         u32 primed_total{};
     } bindless;
     /// Creates the table on first use; false when the device cannot hold it.
@@ -903,7 +906,7 @@ private:
     /// budget (creating one needs a pass break, and its memory counts).
     void BindlessPrime(DrawPlan& plan);
     /// Syncs the table and adds to `plan` the layout changes its images need.
-    bool BindlessPrepare(DrawPlan& plan);
+    bool BindlessPrepare(DrawPlan& plan, u32 types_mask = ~u32{0});
     /// Binds the table's set for the pipeline's layout.
     void BindlessBind(PipelineBase& pipeline, VkPipelineBindPoint bind_point);
     static void BindlessDetachEntry(BindlessState& state, u32 id);
@@ -1116,6 +1119,12 @@ private:
     /// known predecessor (the same rule as `vertex_input_set`).
     bool fixed_state_set{false};
     DynamicFixedState fixed_state;
+    bool patch_control_points_set{false};
+    u32 bound_patch_control_points{0};
+    bool blend_state_set{false};
+    DynamicBlendState blend_state;
+    bool alpha_to_coverage_set{false};
+    bool bound_alpha_to_coverage{false};
     /// What the open pass has recorded already (pipeline layout, push constants, descriptors,
     /// vertex and index buffers): a draw that would record the same again skips it. Reset at every
     /// pass begin/end and command buffer start (nvn_pass_state.h).

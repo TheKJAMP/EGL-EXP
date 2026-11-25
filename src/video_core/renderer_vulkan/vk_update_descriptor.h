@@ -72,6 +72,9 @@ public:
     void Acquire(Scheduler& scheduler, size_t required_entries = 0,
                  bool use_descriptor_buffer_ = false) {
         trace_buffers.clear();
+        if (!payload) [[unlikely]] {
+            EnsureAllocated();
+        }
         use_descriptor_buffer = supports_descriptor_buffer && use_descriptor_buffer_;
         static constexpr size_t DEFAULT_REQUIRED_ENTRIES = 0x400;
         const size_t reserve = required_entries > 0 ? required_entries : DEFAULT_REQUIRED_ENTRIES;
@@ -179,6 +182,7 @@ private:
     }
 
     void AcquireOverflow(Scheduler& scheduler, size_t reserve);
+    void EnsureAllocated();
 
     const Device& device;
     const size_t frame_payload_size;

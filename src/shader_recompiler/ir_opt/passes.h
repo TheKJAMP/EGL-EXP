@@ -42,6 +42,7 @@ void PositionPass(Environment& env, IR::Program& program);
 void BlitConstantsPass(Environment& env, IR::Program& program);
 void TexturePass(Environment& env, IR::Program& program, const HostTranslateInfo& host_info);
 void LayerPass(IR::Program& program, const HostTranslateInfo& host_info);
+void ValueNumberingPass(IR::Program& program);
 void VendorWorkaroundPass(IR::Program& program);
 void VerificationPass(const IR::Program& program);
 bool HasBrokenPattern(const IR::Program& program);

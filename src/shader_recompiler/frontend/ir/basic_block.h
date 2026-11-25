@@ -93,8 +93,8 @@ public:
     }
 
     /// Number of other fixed-count variables the SSA pass stores in blocks
-    /// (predicates, the four condition flags and the indirect branch variable).
-    static constexpr size_t NUM_SSA_VALUES = NUM_USER_PREDS + 5;
+    /// (predicates, uniform predicates, the four condition flags and the indirect branch variable).
+    static constexpr size_t NUM_SSA_VALUES = NUM_SSA_PREDS + 5;
 
     void SetSsaValue(size_t index, const Value& value) noexcept {
         ssa_values[index] = value;

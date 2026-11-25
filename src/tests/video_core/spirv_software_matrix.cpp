@@ -16,10 +16,16 @@
 #include <catch2/catch_test_macros.hpp>
 
 #include "shader_recompiler/backend/spirv/emit_spirv.h"
+#include "shader_recompiler/environment.h"
 #include "shader_recompiler/exception.h"
-#include "shader_recompiler/frontend/ampere/lower_to_maxwell.h"
+#include "shader_recompiler/frontend/ampere/control_flow.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
+#include "shader_recompiler/frontend/ampere/translate_program.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
+#include "shader_recompiler/frontend/maxwell/control_flow.h"
 #include "shader_recompiler/frontend/maxwell/decode.h"
+#include "shader_recompiler/host_translate_info.h"
+#include "shader_recompiler/program_header.h"
 
 namespace {
 using namespace Shader;
@@ -370,36 +376,93 @@ TEST_CASE("Cooperative HMMA self-test shader runs one lowering on one warp",
 
 TEST_CASE("Compact HMMA lowering emits one helper call per matrix multiply",
           "[video_core][tensor][ampere]") {
-    // HMMA.16816.F16 R44, R16, R48, RZ (Donkey Kong Bananza capture) and EXIT.
+    class MatrixEnv final : public Environment {
+    public:
+        MatrixEnv() {
+            stage = Stage::Compute;
+            is_proprietary_driver = true;
+            start_address = sizeof(ProgramHeader);
+        }
+        u64 ReadInstruction(u32) override { return 0; }
+        bool IsNativeProgram() const override { return true; }
+        u32 ReadCbufValue(u32 cbuf_index, u32 cbuf_offset) override {
+            return 0x101 + cbuf_index * 16 + cbuf_offset;
+        }
+        TextureType ReadTextureType(u32) override { return TextureType::Color2D; }
+        TexturePixelFormat ReadTexturePixelFormat(u32) override {
+            return TexturePixelFormat::A8B8G8R8_UNORM;
+        }
+        bool IsTexturePixelFormatInteger(u32) override { return false; }
+        u32 ReadViewportTransformState() override { return 1; }
+        u32 TextureBoundBuffer() const override { return 2; }
+        u32 LocalMemorySize() const override { return 0; }
+        u32 SharedMemorySize() const override { return 4096; }
+        std::array<u32, 3> WorkgroupSize() const override { return {32, 1, 1}; }
+        bool HasHLEMacroState() const override { return false; }
+        std::optional<ReplaceConstant> GetReplaceConstBuffer(u32, u32) override {
+            return std::nullopt;
+        }
+        void Dump(u64, u64) override {}
+    };
+
+    // Store R44 so DCE keeps the HMMA computation intact.
+    constexpr Ampere::Instruction LoadPtrLo{{0xff027624, 0x20U << 6, 0x078e00ff, 0x000fe200}};
+    constexpr Ampere::Instruction LoadPtrHi{{0xff037624, 0x24U << 6, 0x078e00ff, 0x000fe200}};
     constexpr Ampere::Instruction Hmma{{0x102c723c, 0x30, 0x8ff, 0x04aff000}};
+    constexpr Ampere::Instruction Store{{0x02007386, 44, 0x0010a900, 0x000fe200}};
     constexpr Ampere::Instruction Exit{{0x0000794d, 0, 0x03800000, 0}};
-    const std::array code{Hmma, Exit};
-    const auto is_tensor = [](u64 word) { return (word >> 51) == (0x5d30000000000000ULL >> 51); };
+    const std::array code{LoadPtrLo, LoadPtrHi, Hmma, Store, Exit};
 
-    const auto expanded = Ampere::LowerToMaxwell(code, {.tensor = true});
-    INFO(expanded.error);
-    REQUIRE(static_cast<bool>(expanded));
-    REQUIRE(std::ranges::none_of(expanded.instructions, is_tensor));
+    struct IrPools {
+        ObjectPool<IR::Inst> inst;
+        ObjectPool<IR::Block> block;
+    };
+    const auto translate = [&](IrPools& pools, const Ampere::LoweringOptions& opts,
+                               std::span<const Ampere::Instruction> src) {
+        const auto analysis = Ampere::AnalyzeProgram(src, opts);
+        INFO(analysis.error);
+        REQUIRE(static_cast<bool>(analysis));
+        MatrixEnv env;
+        ObjectPool<Maxwell::Flow::Block> flow_pool;
+        HostTranslateInfo host{};
+        host.support_float16 = true;
+        host.support_int64 = true;
+        host.support_float64 = true;
+        host.min_ssbo_alignment = 16;
+        return Ampere::TranslateProgram(pools.inst, pools.block, flow_pool, env, src, opts,
+                                        analysis.uses_async_copy, &analysis.branch_targets, host);
+    };
+    const auto count_opcode = [](const IR::Program& program, IR::Opcode op) {
+        size_t n = 0;
+        for (const IR::Block* b : program.blocks) {
+            for (const IR::Inst& i : b->Instructions()) {
+                n += i.GetOpcode() == op ? 1 : 0;
+            }
+        }
+        return n;
+    };
+    const auto total_insts = [](const IR::Program& program) {
+        size_t n = 0;
+        for (const IR::Block* b : program.blocks) {
+            n += b->Instructions().size();
+        }
+        return n;
+    };
 
-    const auto compact = Ampere::LowerToMaxwell(code, {.tensor = true, .compact_tensor = true});
-    INFO(compact.error);
-    REQUIRE(static_cast<bool>(compact));
-    REQUIRE(std::ranges::count_if(compact.instructions, is_tensor) == 1);
-    const u64 word = *std::ranges::find_if(compact.instructions, is_tensor);
-    CHECK((word & 0xff) == 0x2c);
-    CHECK(((word >> 8) & 0xff) == 0x10);
-    CHECK(((word >> 20) & 0xff) == 0x30);
-    CHECK(((word >> 39) & 0xff) == 0xff);
-    CHECK(((word >> 48) & 1) == 1);
-    CHECK(((word >> 49) & 1) == 0);
-    CHECK(compact.instructions.size() * 4 < expanded.instructions.size());
+    IrPools expanded_pools;
+    const auto expanded = translate(expanded_pools, {.tensor = true}, code);
+    CHECK(count_opcode(expanded, IR::Opcode::TensorMulAdd) == 0);
+    CHECK(count_opcode(expanded, IR::Opcode::FPFma32) > 0);
+
+    IrPools compact_pools;
+    const auto compact = translate(compact_pools, {.tensor = true, .compact_tensor = true}, code);
+    CHECK(count_opcode(compact, IR::Opcode::TensorMulAdd) == 1);
+    CHECK(total_insts(compact) < total_insts(expanded));
 
     // A guarded HMMA keeps the expansion: the helper shuffles across the whole warp.
     auto guarded = code;
-    guarded[0].words[0] = (guarded[0].words[0] & ~0xf000U) | (1U << 12);
-    const auto guarded_lowered =
-        Ampere::LowerToMaxwell(guarded, {.tensor = true, .compact_tensor = true});
-    INFO(guarded_lowered.error);
-    REQUIRE(static_cast<bool>(guarded_lowered));
-    CHECK(std::ranges::none_of(guarded_lowered.instructions, is_tensor));
+    guarded[2].words[0] = (guarded[2].words[0] & ~0xf000U) | (1U << 12);
+    IrPools guarded_pools;
+    const auto guarded_ir = translate(guarded_pools, {.tensor = true, .compact_tensor = true}, guarded);
+    CHECK(count_opcode(guarded_ir, IR::Opcode::TensorMulAdd) == 0);
 }

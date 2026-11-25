@@ -3,8 +3,8 @@
 // SPDX-License-Identifier: GPL-3.0-or-later AND MIT
 
 // Maps an NVN2 shader program (control section + code area, as the game hands them to
-// nvnProgramSetShaders) onto the shader recompiler: lowering to the Maxwell stream, a
-// Shader::Environment that serves the NVN constant-buffer ABI, and translation to IR.
+// nvnProgramSetShaders) onto the shader recompiler: direct native Ampere decoding/CFG/translation,
+// a Shader::Environment that serves the NVN constant-buffer ABI, and IR generation.
 //
 // The capture/pack logic mirrors GenericEnvironment::LowerNativeCode (video_core/
 // shader_environment.cpp) exactly, so a program lowers to the same bytes here and in the legacy
@@ -37,6 +37,7 @@
 
 #include "common/common_types.h"
 #include "shader_recompiler/environment.h"
+#include "shader_recompiler/frontend/ampere/instruction.h"
 #include "shader_recompiler/frontend/ir/basic_block.h"
 #include "shader_recompiler/frontend/ir/program.h"
 #include "shader_recompiler/frontend/maxwell/control_flow.h"
@@ -175,15 +176,18 @@ struct NvnProgramBinary {
 /// Graphics stage of a binary according to the SPH at the start of its code area.
 [[nodiscard]] std::optional<ShaderStage> StageFromSph(std::span<const u8> code);
 
-/// Result of lowering. Pure data: thread-safe to share and cache.
+/// Result of capturing and validating a native NVN program. Pure data: thread-safe to share and cache.
 struct LoweredNvnProgram {
     ShaderStage stage{};
     NvnControl control;
-    /// [0x50-byte SPH][instructions, a zero scheduling word whenever (size*8)%32==0][0]
-    /// [native address map], exactly as GenericEnvironment::LowerNativeCode packs it.
-    std::vector<u64> code;
+    /// Captured native Ampere instructions for direct translation.
+    std::vector<Shader::Ampere::Instruction> native;
+    NativeTensorLowering tensor_lowering{NativeTensorLowering::None};
+    u32 attributes_read_mask{};
+    bool uses_async_copy{};
+    std::vector<u8> branch_targets;
     u32 texture_bound{~0U};
-    /// Constant bank of the bound surface (SULD/SUST/SUATOM) descriptors when the lowering named
+    /// Constant bank of the bound surface (SULD/SUST/SUATOM) descriptors when the program named
     /// one (Ampere encodes it per instruction); ~0: the surfaces use the texture bank.
     u32 surface_bound{~0U};
     u32 source_size{};
@@ -197,7 +201,7 @@ struct LoweredNvnProgram {
     u32 error_offset{};
     std::array<u32, 4> error_words{};
     /// Instruction index (16-byte native instructions after the header) where the capture or the
-    /// lowering stopped; ~0 when the rejection is not about one instruction (control section...).
+    /// validation stopped; ~0 when the rejection is not about one instruction (control section...).
     u32 failed_instruction{~0U};
     /// Mesh programs whose control section names a per-primitive header (MeshControl): that
     /// header's SPH, read from the code area. Empty otherwise.
@@ -208,9 +212,9 @@ struct LoweredNvnProgram {
     }
 };
 
-/// Captures, lowers and packs a program. Compute programs lower their matrix multiplies (HMMA) as
-/// `tensor` says; EDEN_NX2_TENSOR overrides it.
-[[nodiscard]] std::shared_ptr<const LoweredNvnProgram> LowerNvnProgram(
+/// Captures and validates a native Ampere NVN program for direct translation. Compute programs
+/// configure HMMA lowering as `tensor` says; EDEN_NX2_TENSOR overrides it.
+[[nodiscard]] std::shared_ptr<const LoweredNvnProgram> PrepareNvnProgram(
     const NvnProgramBinary& binary, NativeTensorLowering tensor = NativeTensorLowering::None);
 
 /// A constant-buffer word whose value the environment hands out as a synthetic handle.
@@ -245,10 +249,11 @@ public:
     ~NvnEnvironment() override;
 
     [[nodiscard]] u64 ReadInstruction(u32 address) override;
-    [[nodiscard]] u32 TranslateProgramAddress(u32 address) const override;
-    /// Lowered Switch 2 code: the storage buffer pass looks at every pointer an address can
-    /// come from (a predicated assignment merges two in a phi) instead of the first one found.
+    /// Switch 2 native Ampere program: storage buffer pointers are raw 8-byte arguments in
+    /// constant buffers, or entries in the NVN driver-bank buffer tables.
     [[nodiscard]] bool IsNativeProgram() const override;
+    [[nodiscard]] std::optional<Shader::Ampere::NativeAmpereView> NativeAmpereProgram()
+        const override;
     [[nodiscard]] bool IsNvnHleProgram() const override {
         return true;
     }

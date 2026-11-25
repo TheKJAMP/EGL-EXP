@@ -4,9 +4,6 @@
 // SPDX-FileCopyrightText: Copyright 2021 yuzu Emulator Project
 // SPDX-License-Identifier: GPL-2.0-or-later
 
-#include <algorithm>
-#include <iterator>
-
 #include "common/bit_field.h"
 #include "shader_recompiler/frontend/ir/ir_emitter.h"
 #include "shader_recompiler/frontend/maxwell/translate/impl/impl.h"
@@ -22,39 +19,8 @@ namespace {
 }
 } // Anonymous namespace
 
-void TranslatorVisitor::SetAddress(u32 address) {
-    if (remaps.empty()) {
-        return;
-    }
-    // The remaps of one instruction share its range, and ranges don't overlap.
-    const auto after = std::ranges::upper_bound(remaps, address, {},
-                                                &Ampere::NativeRegisterRemap::begin);
-    if (after == remaps.begin() || address >= std::prev(after)->end) {
-        active = {};
-        return;
-    }
-    auto first = std::prev(after);
-    while (first != remaps.begin() && std::prev(first)->begin == first->begin) {
-        --first;
-    }
-    active = remaps.subspan(static_cast<size_t>(first - remaps.begin()),
-                            static_cast<size_t>(after - first));
-}
-
-IR::Reg TranslatorVisitor::Remapped(IR::Reg reg) const {
-    const u32 index = static_cast<u32>(reg);
-    for (const Ampere::NativeRegisterRemap& remap : active) {
-        if (index / 4 == remap.low_group) {
-            const u32 component = index % 4;
-            const u32 bank = (remap.bank_mask >> component) & 1;
-            return static_cast<IR::Reg>(bank * 256 + remap.high_group * 4 + component);
-        }
-    }
-    return reg;
-}
-
 IR::U32 TranslatorVisitor::X(IR::Reg reg) {
-    return ir.GetReg(Remapped(reg));
+    return ir.GetReg(reg);
 }
 
 IR::U64 TranslatorVisitor::L(IR::Reg reg) {
@@ -76,7 +42,7 @@ IR::F64 TranslatorVisitor::D(IR::Reg reg) {
 }
 
 void TranslatorVisitor::X(IR::Reg dest_reg, const IR::U32& value) {
-    ir.SetReg(Remapped(dest_reg), value);
+    ir.SetReg(dest_reg, value);
 }
 
 void TranslatorVisitor::L(IR::Reg dest_reg, const IR::U64& value) {

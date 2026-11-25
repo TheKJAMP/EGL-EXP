@@ -158,6 +158,23 @@ static_assert(std::is_trivially_copyable_v<TranslationState>);
 /// these values for the static pipeline state and for the dynamic state the replay sets.
 [[nodiscard]] DynamicFixedState MakeDynamicFixedState(const GraphicsFixedState& state);
 
+/// Device capabilities for deduplicating dynamic state from GraphicsKey.
+struct DynamicStateCaps {
+    bool fixed{};
+    bool polygon_mode{};
+    bool depth_clamp{};
+    bool provoking_vertex{};
+    bool patch_control_points{};
+    bool blend{};
+    bool alpha_to_coverage{};
+    [[nodiscard]] bool operator==(const DynamicStateCaps&) const = default;
+};
+
+[[nodiscard]] DynamicBlendState MakeDynamicBlendState(const GraphicsFixedState& state,
+                                                      const RenderPassKey& targets);
+void StripDynamicKeyState(GraphicsFixedState& state, const DynamicStateCaps& caps,
+                          bool has_tessellation);
+
 /// Depth/stencil aspect helpers on VkFormat (render pass construction).
 [[nodiscard]] bool FormatHasDepth(VkFormat format);
 [[nodiscard]] bool FormatHasStencil(VkFormat format);
@@ -179,6 +196,8 @@ struct GraphicsPipelineParams {
     /// differing only in them get equal pre-rasterization and fragment shader library keys. Needs
     /// VK_EXT_extended_dynamic_state and VK_EXT_extended_dynamic_state2.
     bool dynamic_fixed{};
+    bool dynamic_blend{};
+    bool dynamic_alpha_to_coverage{};
 };
 
 /// A VkGraphicsPipelineCreateInfo and the state structures it points to (not copyable: `ci`
@@ -209,7 +228,7 @@ struct GraphicsPipelineDescription {
     boost::container::static_vector<VkPipelineColorBlendAttachmentState, MAX_COLOR_TARGETS>
         blend_attachments;
     VkPipelineColorBlendStateCreateInfo color_blend{};
-    boost::container::static_vector<VkDynamicState, 20> dynamic_states;
+    boost::container::static_vector<VkDynamicState, 32> dynamic_states;
     VkPipelineDynamicStateCreateInfo dynamic_state{};
     VkGraphicsPipelineCreateInfo ci{};
 };

@@ -79,17 +79,12 @@ u64 StageCache::Recorder::ReadInstruction(u32 address) {
     return inner.ReadInstruction(address);
 }
 
-u32 StageCache::Recorder::TranslateProgramAddress(u32 address) const {
-    return inner.TranslateProgramAddress(address);
-}
-
 bool StageCache::Recorder::IsNativeProgram() const {
     return inner.IsNativeProgram();
 }
 
-std::span<const Shader::Ampere::NativeRegisterRemap> StageCache::Recorder::NativeRegisterRemaps()
-    const {
-    return inner.NativeRegisterRemaps();
+std::optional<Shader::Ampere::NativeAmpereView> StageCache::Recorder::NativeAmpereProgram() const {
+    return inner.NativeAmpereProgram();
 }
 
 bool StageCache::Recorder::IsCbufStorageBufferPointer(u32 index, u32 offset) {
