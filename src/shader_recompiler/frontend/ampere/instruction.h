@@ -17,7 +17,7 @@ namespace Shader::Ampere {
 struct Instruction {
     std::array<u32, 4> words{};
 
-    [[nodiscard]] u32 Bits(u32 offset, u32 count) const {
+    [[nodiscard]] constexpr u32 Bits(u32 offset, u32 count) const noexcept {
         u64 bits = words[offset / 32];
         if (offset / 32 + 1 < words.size()) {
             bits |= u64{words[offset / 32 + 1]} << 32;
