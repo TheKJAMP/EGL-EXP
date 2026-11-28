@@ -265,19 +265,14 @@ void Context::Impl::ImmediateSubmit(const std::function<void(vk::CommandBuffer)>
 
 bool Context::Impl::ResolveBuffer(u64 address, u64 size, Pool*& pool, u64& offset) const {
     const u64 generation = pool_generation.load(std::memory_order_acquire);
-    ExactResolveSlot* exact = nullptr;
-    if (mario_kart_world) {
-        const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) *
-                        0x9e3779b97f4a7c15ULL;
-        exact = &mkw_resolve_cache[key >> 52];
-        if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
-            exact->address == address && exact->size == size) {
-            pool = exact->pool;
-            offset = exact->offset;
-            ++mkw_resolve_hits;
-            return true;
-        }
-        ++mkw_resolve_misses;
+    const u64 key = ((address >> 4) ^ (size * 0xd6e8feb86659fd93ULL)) * 0x9e3779b97f4a7c15ULL;
+    ExactResolveSlot* const exact = &mkw_resolve_cache[key >> 52];
+    if (exact->generation == generation && exact->mappings == mkw_mapping_generation &&
+        exact->address == address && exact->size == size) {
+        pool = exact->pool;
+        offset = exact->offset;
+        ++mkw_resolve_hits;
+        return true;
     }
     ++mkw_resolve_misses;
     const auto remember = [&] {

@@ -127,7 +127,7 @@ private:
     VideoCommon::ComputeUniformBufferSizes uniform_buffer_sizes{};
 
     vk::ShaderModule spv_module;
-    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by ComputePipelineLayoutCache
+    VkDescriptorSetLayout descriptor_set_layout{}; ///< Owned by PipelineLayoutCache
     bool uses_push_descriptor{false};
     bool uses_descriptor_buffer{false};
     DescriptorBufferLayout descriptor_buffer_layout;
@@ -137,7 +137,7 @@ private:
     u32 last_descriptor_buffer_chunk{};
     u64 last_descriptor_buffer_generation{};
     DescriptorAllocator descriptor_allocator;
-    VkPipelineLayout pipeline_layout{}; ///< Owned by ComputePipelineLayoutCache
+    VkPipelineLayout pipeline_layout{}; ///< Owned by PipelineLayoutCache
     vk::DescriptorUpdateTemplate descriptor_update_template;
     vk::Pipeline pipeline;
 

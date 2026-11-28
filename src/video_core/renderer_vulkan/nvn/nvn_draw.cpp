@@ -2907,7 +2907,16 @@ std::optional<u32> DrawContext::ReadUniformWord(u32 stage, u32 slot, u32 byte_of
     }
     if (!read_ok) {
         VC::GuestMemory* memory = impl.guest.load(std::memory_order_acquire);
-        if (!memory || !memory->Read(address, &value, sizeof(value))) {
+        if (!memory) {
+            return std::nullopt;
+        }
+        if ((address & 0xFFFu) <= 0xFFCu) {
+            if (const u8* ptr = memory->Pointer(address)) {
+                std::memcpy(&value, ptr, sizeof(value));
+            } else if (!memory->Read(address, &value, sizeof(value))) {
+                return std::nullopt;
+            }
+        } else if (!memory->Read(address, &value, sizeof(value))) {
             return std::nullopt;
         }
     }

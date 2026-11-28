@@ -400,17 +400,10 @@ void Context::Impl::MirrorMarkPrefetch(Pool& pool, u64 offset, u64 size) {
     if (mirror == nullptr) {
         return;
     }
-    if (!mirror->wanted) {
-        mirror->wanted = std::make_unique<MirrorPages>(pool.size);
-    }
     if (!mirror->prefetch) {
-        mirror->prefetch = true;
         vram_prefetch_mirrors.push_back({&pool, mirror, mirror->write_epoch.get()});
     }
-    if (!mirror->wanted->AllValid(offset, size)) {
-        mirror->wanted->Set(offset, size);
-        mirror->wanted_dirty = true;
-    }
+    mirror->MarkWanted(pool.size, offset, size);
 }
 
 void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64, u64>>& runs) {
@@ -418,9 +411,8 @@ void Context::Impl::MirrorTakeStaleWanted(Pool& pool, std::vector<std::pair<u64,
     if (mirror == nullptr || !mirror->wanted) {
         return;
     }
-    if (mirror->write_epoch &&
-        mirror->write_epoch->load(std::memory_order_acquire) == mirror->epoch_clean &&
-        !mirror->wanted_dirty) {
+    if (!mirror->wanted_dirty && mirror->write_epoch &&
+        mirror->write_epoch->load(std::memory_order_acquire) == mirror->epoch_clean) {
         return;
     }
     VC::GuestMemory* const memory = guest.load(std::memory_order_acquire);

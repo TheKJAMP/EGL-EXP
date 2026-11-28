@@ -15,7 +15,8 @@
 namespace Shader::Ampere {
 
 struct Instruction {
-    std::array<u32, 4> words{};
+    // Trivial so UnpackNativeAmpereCode can memcpy packed words into it.
+    std::array<u32, 4> words;
 
     [[nodiscard]] constexpr u32 Bits(u32 offset, u32 count) const noexcept {
         u64 bits = words[offset / 32];

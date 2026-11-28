@@ -1174,15 +1174,14 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
             }
         }
         const bool misaligned = resolved && uniform && (ref.offset % 256) != 0;
-        const bool may_need_gpu_source =
-            resolved && !write && snapshot_range == UniformSnapshotView::npos &&
-            (misaligned || (overlaps && pass_open));
-        const bool needs_gpu_source =
-            may_need_gpu_source &&
-            (ref.pool->backing == Pool::Backing::DeviceLocal ||
-             HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
-             impl.NeedsGpuFlushForUniform(binding.address, binding.address + size, current_seq));
-        if (misaligned && needs_gpu_source) {
+        const auto check_needs_gpu_source = [&] {
+            return resolved && !write && snapshot_range == UniformSnapshotView::npos &&
+                   (ref.pool->backing == Pool::Backing::DeviceLocal ||
+                    HasOverlappingShadow(*ref.pool, ref.pool_offset, ref.pool_offset + size) ||
+                    impl.NeedsGpuFlushForUniform(binding.address, binding.address + size,
+                                                 current_seq));
+        };
+        if (misaligned && check_needs_gpu_source()) {
             const BufferRef copy = AllocArena(size, 256, nullptr);
             if (copy.buffer) {
                 if (overlaps) {
@@ -1201,7 +1200,7 @@ bool DrawContext::BuildDescriptors(PipelineBase& pipe, DrawPlan& plan, bool grap
         bool flush_inline_to_pool = false;
         if (overlaps && !misaligned && resolved && !write &&
             snapshot_range == UniformSnapshotView::npos) {
-            if (!pass_open || needs_gpu_source) {
+            if (!pass_open || check_needs_gpu_source()) {
                 flush_inline_to_pool = true;
                 plan.flush_inline = true;
             }
@@ -2612,11 +2611,16 @@ bool DrawContext::PushPlan(PipelineBase& pipe, DrawPlan& plan, VkPipelineBindPoi
         host->HostFailed("Draw", "descriptor set allocation failed");
         return false;
     }
-    for (VkWriteDescriptorSet& write : scratch_writes) {
-        write.dstSet = set;
+    if (template_ready) {
+        impl.device.GetLogical().UpdateDescriptorSet(set, pipe.update_template,
+                                                     scratch_template_entries.data());
+    } else {
+        for (VkWriteDescriptorSet& write : scratch_writes) {
+            write.dstSet = set;
+        }
+        impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(scratch_writes.size()),
+                                        scratch_writes.data(), 0, nullptr);
     }
-    impl.dld.vkUpdateDescriptorSets(impl.logical, static_cast<u32>(scratch_writes.size()),
-                                    scratch_writes.data(), 0, nullptr);
     if (cache_slot != nullptr) {
         cache_slot->seq = flight_seq;
         cache_slot->hash = cache_hash;

@@ -332,15 +332,15 @@ public:
 
     /// The set and pipeline layouts from the cache, made on the first pipeline with these
     /// bindings, set flags and push constant range.
-    const PipelineLayoutCache::Entry& GetLayouts(PipelineLayoutCache& cache,
-                                                 bool use_push_descriptor,
-                                                 bool use_descriptor_buffer = false) const {
+    const ComputePipelineLayoutCache::Entry& GetLayouts(ComputePipelineLayoutCache& cache,
+                                                        bool use_push_descriptor,
+                                                        bool use_descriptor_buffer = false) const {
         return cache.Get(
-            PipelineLayoutCache::MakeKey(use_push_descriptor, use_descriptor_buffer, is_compute,
-                                         uses_mesh, mesh_emulation,
-                                         std::span(bindings.data(), bindings.size())),
+            ComputePipelineLayoutCache::MakeKey(use_push_descriptor, use_descriptor_buffer,
+                                                is_compute, uses_mesh, mesh_emulation,
+                                                std::span(bindings.data(), bindings.size())),
             [&] {
-                PipelineLayoutCache::Entry entry;
+                ComputePipelineLayoutCache::Entry entry;
                 entry.set = CreateDescriptorSetLayout(use_push_descriptor, use_descriptor_buffer);
                 entry.pipeline = CreatePipelineLayout(*entry.set);
                 return entry;

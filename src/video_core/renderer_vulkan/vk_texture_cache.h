@@ -11,7 +11,6 @@
 
 #include <cstdlib>
 #include <chrono>
-#include <deque>
 #include <memory>
 #include <optional>
 #include <span>

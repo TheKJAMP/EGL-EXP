@@ -778,8 +778,8 @@ bool DrawContext::UpscaleMovieNetwork(Texture& input, Texture& output) {
         return false;
     }
     const u64 seq = host->HostFlight().seq;
-    impl.NoteUse(input.serial, seq);
-    impl.NoteUse(output.serial, seq);
+    impl.NoteUse(input, seq);
+    impl.NoteUse(output, seq);
 
     UpscaleJob job;
     job.input.texture = &input;

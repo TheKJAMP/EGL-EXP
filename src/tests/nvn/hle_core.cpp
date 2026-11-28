@@ -201,21 +201,35 @@ TEST_CASE("nvn hle device: ray tracing sizing, uniform handles and fast-clear in
     const u64 out_as = Rig::SCRATCH;
     const u64 out_build = Rig::SCRATCH + 8;
     const u64 out_update = Rig::SCRATCH + 16;
+    const u64 info = Rig::SCRATCH + 64;
+    const u64 geom = Rig::SCRATCH + 128;
+    rig.memory.Put<std::array<u64, 4>>(info, {});
     rig.memory.Put<u64>(out_as, 0x100000001ull);
     rig.memory.Put<u64>(out_build, 0x100000001ull);
     rig.memory.Put<u64>(out_update, 0x100000001ull);
     rig.Call("nvnDeviceCalculateAccelerationStructureMemoryRequirements",
-             {Rig::I(DEVICE), Rig::I(Rig::SCRATCH + 64), Rig::I(out_as), Rig::I(out_build),
-              Rig::I(out_update)});
-    CHECK(rig.memory.Get<u64>(out_as) == 256);
-    CHECK(rig.memory.Get<u64>(out_build) == 256);
-    CHECK(rig.memory.Get<u64>(out_update) == 256);
+             {Rig::I(DEVICE), Rig::I(info), Rig::I(out_as), Rig::I(out_build), Rig::I(out_update)});
+    CHECK(rig.memory.Get<u64>(out_as) == 0x100000);
+    CHECK(rig.memory.Get<u64>(out_build) == 0x100000);
+    CHECK(rig.memory.Get<u64>(out_update) == 0);
 
     // Null optional output pointers are skipped without disturbing mapped outputs.
     rig.memory.Put<u64>(out_as, 0xDEAD);
     rig.Call("nvnDeviceCalculateAccelerationStructureMemoryRequirements",
-             {Rig::I(DEVICE), Rig::I(Rig::SCRATCH + 64), Rig::I(out_as), Rig::I(0), Rig::I(0)});
-    CHECK(rig.memory.Get<u64>(out_as) == 256);
+             {Rig::I(DEVICE), Rig::I(info), Rig::I(out_as), Rig::I(0), Rig::I(0)});
+    CHECK(rig.memory.Get<u64>(out_as) == 0x100000);
+
+    // Instance-geometry build info scales output sizes from instance count.
+    rig.memory.Put<std::array<u64, 4>>(geom, {});
+    rig.memory.Put<u32>(geom, 3);
+    rig.memory.Put<u64>(geom + 0x10, 4096);
+    rig.memory.Put<u64>(info + 0x08, geom);
+    rig.memory.Put<u64>(info + 0x10, 1);
+    rig.Call("nvnDeviceCalculateAccelerationStructureMemoryRequirements",
+             {Rig::I(DEVICE), Rig::I(info), Rig::I(out_as), Rig::I(out_build), Rig::I(out_update)});
+    CHECK(rig.memory.Get<u64>(out_as) == 0x1000 + u64{4096} * 0x130);
+    CHECK(rig.memory.Get<u64>(out_build) == u64{4096} * 0x70);
+    CHECK(rig.memory.Get<u64>(out_update) == 0);
 
     CHECK(rig.Call("nvnDeviceRegisterFastClearStencil", {Rig::I(DEVICE), Rig::I(0)}) == 1);
     CHECK(rig.Call("nvnDeviceRegisterFastClearColorIndex", {Rig::I(DEVICE), Rig::I(0)}) == 0);

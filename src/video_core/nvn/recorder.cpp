@@ -1835,28 +1835,8 @@ u32 Recorder::Impl::BufferBytesFrom(u64 address) {
         if (span.begin <= address && address < span.end) {
             end = (std::max)(end, span.end);
         }
-        std::sort(buffer_spans_index.begin(), buffer_spans_index.end(),
-                  [](const IndexedBufferSpan& a, const IndexedBufferSpan& b) {
-                      return a.begin < b.begin || (a.begin == b.begin && a.max_end > b.max_end);
-                  });
-        u64 running_max = 0;
-        for (IndexedBufferSpan& entry : buffer_spans_index) {
-            running_max = (std::max)(running_max, entry.max_end);
-            entry.max_end = running_max;
-        }
-        buffer_spans_dirty = false;
     }
-    const auto it = std::upper_bound(
-        buffer_spans_index.begin(), buffer_spans_index.end(), address,
-        [](u64 addr, const IndexedBufferSpan& entry) { return addr < entry.begin; });
-    if (it == buffer_spans_index.begin()) {
-        return 0;
-    }
-    const u64 max_end = std::prev(it)->max_end;
-    if (max_end <= address) {
-        return 0;
-    }
-    return static_cast<u32>((std::min<u64>)(max_end - address, 0xFFFF'FFFFu));
+    return static_cast<u32>((std::min<u64>)(end != 0 ? end - address : 0, 0xFFFF'FFFFu));
 }
 
 std::optional<BufferInfo> Recorder::GetBuffer(u64 buffer_va) {

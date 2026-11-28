@@ -313,10 +313,10 @@ TEST_CASE("nvn uniform snapshot: PeekWritten avoids intra-frame re-arm and rearm
     REQUIRE(snap2 != nullptr);
     CHECK(snap2->bytes[0] == 0x43);
     CHECK(memory.take_calls == 0);
-    // B+0x1000 is already stamped for this frame, so peek runs for B+0x5000 only (+1 = 3).
-    CHECK(memory.peek_calls == 3);
+    // B+0x1000 is stamped and B+0x5000 checked in cur_epoch, so unchanged epoch skips PeekWritten.
+    CHECK(memory.peek_calls == 2);
 
-    // Write B+0x5000 too: after both pages are stamped for this frame, further captures skip Peek.
+    // Write B+0x5000 too: epoch advances, B+0x5000 peeks (+1 = 3), then further captures skip Peek.
     memory.Fill(B + 0x5000, 0x100, 0x77);
     REQUIRE(capture() != nullptr);
     const size_t peeks_both_stamped = memory.peek_calls;

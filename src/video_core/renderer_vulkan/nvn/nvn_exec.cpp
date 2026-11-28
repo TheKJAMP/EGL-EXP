@@ -740,7 +740,8 @@ public:
         return elapsed >= (std::max<u64>)(config.early_interval_us, 4000);
     }
     void HostSubmitUploadPiece() override {
-        SubmitPiece();
+        SubmitPiece(false);
+        impl.FlushSubmitBatch();
         ++early_pieces;
         impl.stats.early_submits.fetch_add(1, std::memory_order_relaxed);
         if (Debug::Timeline()) {
@@ -1136,7 +1137,6 @@ private:
     u32 early_pieces{0};
     size_t flushed_arena{0};   ///< flight.arena chunks before this index were flushed already
     size_t flushed_staging{0}; ///< the same for flight.staging
-    std::shared_ptr<ShadowChunk> alias_scratch;
     std::vector<std::pair<u64, u64>> mirror_pending_writes;
     std::vector<std::pair<VkBuffer, u64>> deferred_zero; ///< (buffer, offset) of 8-byte zero-fills
     const VC::Submission* lookahead_submission{};
@@ -1748,7 +1748,7 @@ bool Recorder::CollectMirrorUploadParts(Pool& pool, u64 offset, u64 size,
     if (!pool.buffer || pool.mirror_pages.empty()) {
         impl.EnsureBacking(pool);
         if (!pool.buffer || pool.mirror_pages.empty()) {
-            return;
+            return false;
         }
     }
     // The guest pages of the range that differ from what the mirror holds (all of them the first
@@ -2854,6 +2854,16 @@ void Recorder::UploadStorage(Storage& s) {
     if (s.samples != VK_SAMPLE_COUNT_1_BIT) {
         return;
     }
+    if (!s.sparse && s.image && s.image.IsUnbacked()) {
+        if (!std::exchange(s.contents_valid, true)) {
+            impl.NoteBindlessStorageChanged(s);
+        }
+        s.origin = StorageOrigin::Gpu;
+        s.linear_writeback_seq = 0;
+        s.watch_valid = false;
+        s.unchanged_checks = 0;
+        return;
+    }
     const auto pool_it = impl.pools.find(s.pool_serial);
     if (pool_it == impl.pools.end()) {
         return;
@@ -2916,6 +2926,16 @@ void Recorder::UploadStorage(Storage& s) {
     if (s.host.bc_standin && !RefitStandin(s, data, size)) {
         return; // no image to upload into (EnsureImage logged it)
     }
+    if (!s.sparse && s.image && s.image.IsUnbacked()) {
+        if (!std::exchange(s.contents_valid, true)) {
+            impl.NoteBindlessStorageChanged(s);
+        }
+        s.origin = StorageOrigin::Gpu;
+        s.linear_writeback_seq = 0;
+        s.watch_valid = false;
+        s.unchanged_checks = 0;
+        return;
+    }
     // Hash before the fill: bytes a decoder rewrites meanwhile must look changed at the next check
     // (the image holds what the fill read, the hash must not describe newer bytes).
     const auto log_planned = std::chrono::steady_clock::now();
@@ -2967,7 +2987,20 @@ void Recorder::UploadStorage(Storage& s) {
     } else if (untiled_on_gpu) {
         log_staged = log_filled = std::chrono::steady_clock::now();
     } else {
-        staging = AllocStaging(plan.staging_size, 64);
+        try {
+            staging = AllocStaging(plan.staging_size, 64);
+        } catch (const vk::Exception& exception) {
+            if (exception.GetResult() != VK_ERROR_OUT_OF_DEVICE_MEMORY) {
+                throw;
+            }
+            if (std::exchange(s.contents_valid, false)) {
+                impl.NoteBindlessStorageChanged(s);
+            }
+            LogOnce(fmt::format("storage staging ({}x{}x{}, format {:#x}, {} bytes) failed: {}",
+                                s.extent.width, s.extent.height, s.layers, s.desc.format,
+                                plan.staging_size, exception.what()));
+            return;
+        }
         log_staged = std::chrono::steady_clock::now();
         FillStorageUpload(s, plan, data, size, staging.pointer, &upload_stats);
         log_filled = std::chrono::steady_clock::now();
@@ -3362,6 +3395,9 @@ bool Recorder::UploadAstcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool, c
             input = staging.buffer;
             input_offset = staging.offset;
         } catch (const vk::Exception& exception) {
+            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                throw;
+            }
             LogOnce(fmt::format("ASTC staging allocation failed: {}", exception.what()));
             return false;
         }
@@ -3388,6 +3424,8 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
     u64 input_offset{};
     u64 input_size = size;
     bool from_pool = false;
+    constexpr u64 MinStagedAstcBytes = u64{4} << 10;
+    constexpr u64 MaxStagedAstcBytes = u64{128} << 20;
     if (!pool.pending.load(std::memory_order_acquire) && pool.backing == Pool::Backing::Imported &&
         AstcGpuLevels(s, plan, s.pool_offset, *decoder, levels)) {
         input = pool.Handle();
@@ -3396,19 +3434,20 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
         from_pool = true;
     } else {
         // Stage compressed GOBs from mirrored/non-imported pools before falling back to CPU decode.
-        constexpr u64 MinStagedAstcBytes = u64{4} << 10;
-        constexpr u64 MaxStagedAstcBytes = u64{128} << 20;
-        if (s.sparse || size < MinStagedAstcBytes || size > MaxStagedAstcBytes ||
-            size > impl.device.GetMaxStorageBufferRange() ||
-            !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
+        if (s.sparse || size < MinStagedAstcBytes || !AstcGpuLevels(s, plan, 0, *decoder, levels)) {
             return false;
         }
     }
+    const u64 max_range = impl.device.GetMaxStorageBufferRange();
+    const u64 max_chunk_staged = (std::min<u64>)(MaxStagedAstcBytes, max_range);
+    const u64 align = decoder->OffsetAlignment();
+    bool stage_whole = !from_pool && size <= max_chunk_staged;
+    bool stage_per_chunk = !from_pool && !stage_whole;
     // The decoder writes level 0 of the scratch: one dispatch per chunk of layers, each bound from
     // its first layer's bytes. Validate alignment before allocating staging memory.
-    const u64 base_align_offset = from_pool ? input_offset : 0;
     std::vector<BcChunk> chunks;
     std::vector<AstcGpuDecoder::Level> chunk_levels;
+    std::vector<u64> chunk_bytes;
     for (const AstcGpuDecoder::Level& level : levels) {
         const u32 width = (std::max)(s.extent.width >> level.level, 1u);
         const u32 height = (std::max)(s.extent.height >> level.level, 1u);
@@ -3417,34 +3456,96 @@ bool Recorder::UploadAstcBcOnGpu(Storage& s, const UploadPlan& plan, Pool& pool,
             part.level = 0;
             part.layers = chunk.layers;
             part.offset += u64{chunk.first_layer} * level.layer_stride;
-            if ((base_align_offset + part.offset) % decoder->OffsetAlignment() != 0) {
+            if (part.offset >= size) {
                 return false;
+            }
+            const u32 stride = part.columns * 16u;
+            const u32 gobs_in_x =
+                (stride + Tegra::Texture::GOB_SIZE_X - 1u) >> Tegra::Texture::GOB_SIZE_X_SHIFT;
+            const u32 tile_y_shift = Tegra::Texture::GOB_SIZE_Y_SHIFT + part.tile_height;
+            const u32 tile_rows = (part.rows + ((1u << tile_y_shift) - 1u)) >> tile_y_shift;
+            const u64 x_shift = Tegra::Texture::GOB_SIZE_SHIFT + part.tile_height + part.tile_depth;
+            const u64 single_layer_bytes = (u64{gobs_in_x} << x_shift) * tile_rows;
+            const u64 bytes_needed = u64{part.layers - 1} * part.layer_stride + single_layer_bytes;
+            const u64 part_bytes = (std::min)(size - part.offset, bytes_needed);
+            if (part_bytes == 0) {
+                return false;
+            }
+            if (from_pool) {
+                if ((input_offset + part.offset) % align != 0) {
+                    return false;
+                }
+            } else {
+                if (stage_whole && (part.offset % align) != 0) {
+                    stage_whole = false;
+                    stage_per_chunk = true;
+                }
+                if (stage_per_chunk && part_bytes > max_chunk_staged) {
+                    return false;
+                }
             }
             chunks.push_back(chunk);
             chunk_levels.push_back(part);
+            chunk_bytes.push_back(part_bytes);
         }
     }
-    if (!from_pool) {
+    if (stage_whole) {
         try {
-            const StagingRange staging = AllocStaging(size, decoder->OffsetAlignment());
+            const StagingRange staging = AllocStaging(size, align);
             std::memcpy(staging.pointer, data, static_cast<size_t>(size));
             input = staging.buffer;
             input_offset = staging.offset;
         } catch (const vk::Exception& exception) {
-            LogOnce(fmt::format("ASTC BC staging allocation failed: {}", exception.what()));
-            return false;
+            if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                throw;
+            }
+            const bool chunks_fit = std::ranges::all_of(chunk_bytes, [max_chunk_staged](u64 bytes) {
+                return bytes != 0 && bytes <= max_chunk_staged;
+            });
+            if (chunks_fit) {
+                stage_whole = false;
+                stage_per_chunk = true;
+            } else {
+                LogOnce(fmt::format("ASTC BC staging allocation failed: {}", exception.what()));
+                return false;
+            }
         }
-    } else {
+    } else if (from_pool) {
         if (draw.HasShadows()) {
             draw.FlushShadowsOverlapping(pool, s.pool_offset, s.layout.size);
         }
         FlushPending(); // earlier writes of the pool's bytes before the decoder reads them
     }
     size_t next = 0;
-    return RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
-        decoder->RecordWithView(Cmd(), input, input_offset, input_size, *scratch.view,
-                                chunk_levels[next++]);
+    bool chunk_oom = false;
+    const bool recorded = RecordBcUpload(s, chunks, true, [&](const BcChunk&, BcScratch& scratch) {
+        const size_t idx = next++;
+        if (stage_per_chunk) {
+            if (chunk_oom) {
+                return;
+            }
+            try {
+                const StagingRange staging = AllocStaging(chunk_bytes[idx], align);
+                std::memcpy(staging.pointer, data + chunk_levels[idx].offset,
+                            static_cast<size_t>(chunk_bytes[idx]));
+                AstcGpuDecoder::Level local_part = chunk_levels[idx];
+                local_part.offset = 0;
+                decoder->RecordWithView(Cmd(), staging.buffer, staging.offset, chunk_bytes[idx],
+                                        *scratch.view, local_part);
+            } catch (const vk::Exception& exception) {
+                if (exception.GetResult() == VK_ERROR_DEVICE_LOST) {
+                    throw;
+                }
+                LogOnce(fmt::format("ASTC BC chunk staging failed ({} bytes): {}",
+                                    chunk_bytes[idx], exception.what()));
+                chunk_oom = true;
+            }
+        } else {
+            decoder->RecordWithView(Cmd(), input, input_offset, input_size, *scratch.view,
+                                    chunk_levels[idx]);
+        }
     });
+    return recorded && !chunk_oom;
 }
 
 void Recorder::UploadBcFromStaging(Storage& s, const UploadPlan& plan,
@@ -5144,7 +5245,6 @@ bool Recorder::TransferOverlapBytesBatch(std::span<Storage* const> sources, Stor
         why = "no scratch memory for the transfer";
         return false;
     }
-
     const auto regions = [](const std::vector<AliasPiece>& pieces) {
         std::vector<VkBufferImageCopy> out;
         out.reserve(pieces.size());
@@ -5153,7 +5253,6 @@ bool Recorder::TransferOverlapBytesBatch(std::span<Storage* const> sources, Stor
         }
         return out;
     };
-
     for (size_t chunk_idx = 0; chunk_idx < chunks.size(); ++chunk_idx) {
         const BuiltChunk& chunk = chunks[chunk_idx];
         std::vector<std::pair<u64, u64>> dense_spans;
@@ -8178,6 +8277,7 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
             entry.flight = &flight;
             entry.queue_timeline = *queue.timeline;
             entry.queue_signal_value = segment.signal_value;
+            entry.has_gpu_work = segment.has_gpu_work;
             impl.submit_batch.entries.push_back(std::move(entry));
         }
         submitted_segments = segments.size();
@@ -8286,6 +8386,7 @@ void Recorder::SubmitSegments(std::span<const VkSemaphore> binary_signals) {
                                        cur, flight.seq, std::memory_order_release,
                                        std::memory_order_relaxed)) {
         }
+    }
     if (count != 0) {
         flight.gpu_submitted_value =
             (std::max)(flight.gpu_submitted_value, segments.back().signal_value);
@@ -8335,9 +8436,6 @@ void Recorder::FlushAndWait() {
 }
 
 void Recorder::MaybeSubmitEarly() {
-    if (impl.submit_batch.batching && !Debug::Get().upload_log) {
-        return;
-    }
     const Debug::Config& config = Debug::Get();
     if (config.early_interval_us == 0 || !impl.options.early_submit || finished || condition_open ||
         (!draw.PassOpen() && (draw.HasInlineUpdates() || draw.HasPendingClears()))) {
@@ -8380,6 +8478,7 @@ void Recorder::MaybeSubmitEarly() {
         }
     }
     SubmitPiece(false);
+    impl.FlushSubmitBatch();
     ++early_pieces;
     impl.stats.early_submits.fetch_add(1, std::memory_order_relaxed);
     if (Debug::Timeline()) {
@@ -8638,10 +8737,21 @@ void Context::Impl::FlushSubmitBatch() {
                 }
                 vk::Check(result);
             }
+            u64 max_gpu_seq = 0;
             for (const SubmitBatch::Entry& entry : entries) {
                 if (entry.flight) {
                     entry.flight->gpu_submitted_value =
                         (std::max)(entry.flight->gpu_submitted_value, entry.queue_signal_value);
+                }
+                if (entry.has_gpu_work) {
+                    max_gpu_seq = (std::max)(max_gpu_seq, entry.flight_seq);
+                }
+            }
+            if (max_gpu_seq != 0) {
+                u64 cur = gpu_submitted_seq.load(std::memory_order_relaxed);
+                while (cur < max_gpu_seq && !gpu_submitted_seq.compare_exchange_weak(
+                                                cur, max_gpu_seq, std::memory_order_release,
+                                                std::memory_order_relaxed)) {
                 }
             }
             if (mario_kart_world) {

@@ -55,9 +55,9 @@ TEST_CASE("Pipeline layout cache: the key covers every input of layout creation"
         size_t num_bindings{2};
     };
     const auto key = [](const Inputs& in) {
-        return ComputePipelineLayoutCache::MakeKey(in.push, in.descriptor_buffer, in.compute, in.mesh,
-                                            in.mesh_emulation,
-                                            std::span(in.bindings.data(), in.num_bindings));
+        return ComputePipelineLayoutCache::MakeKey(
+            in.push, in.descriptor_buffer, in.compute, in.mesh, in.mesh_emulation,
+            std::span(in.bindings.data(), in.num_bindings));
     };
     const Inputs base;
     CHECK(key(base) == key(Inputs{}));

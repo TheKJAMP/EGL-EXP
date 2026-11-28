@@ -421,6 +421,42 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<B
                                                                u64 budget, u32 width, u32 height,
                                                                u32 layers) {
     const bool bc7 = astc_standin == AstcStandin::Bc7;
+    if (slot && slot->Fits(width, height, layers, bc7)) {
+        return slot;
+    }
+    const auto texel_bytes = [](u32 w, u32 h, u32 l) { return u64{w} * h * l * 4; };
+    u32 w = width;
+    u32 h = height;
+    u32 l = layers;
+    if (slot) {
+        // Grow to cover both shapes while that stays in the budget, else take the new shape.
+        const u32 grown_w = (std::max)(slot->width, width);
+        const u32 grown_h = (std::max)(slot->height, height);
+        const u32 grown_l = (std::max)(slot->layers, layers);
+        if (texel_bytes(grown_w, grown_h, grown_l) <= budget) {
+            w = grown_w;
+            h = grown_h;
+            l = grown_l;
+        }
+    }
+    try {
+        auto scratch = MakeBcScratch(device, *allocator, w, h, l, bc7);
+        if (texel_bytes(w, h, l) <= budget) {
+            slot = scratch;
+        }
+        return scratch;
+    } catch (const vk::Exception& exception) {
+        if (!bc_scratch_failed_logged) {
+            bc_scratch_failed_logged = true;
+            LOG_ERROR(Render_Vulkan, "[nvn] BC stand-in scratch {}x{}x{} failed: {}", w, h, l,
+                      exception.what());
+        }
+        return nullptr;
+    }
+}
+
+std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
+    const bool bc7 = astc_standin == AstcStandin::Bc7;
     for (size_t i = 0; i < bc_scratches.size(); ++i) {
         if (bc_scratches[i] && bc_scratches[i]->Fits(width, height, layers, bc7)) {
             if (i != 0) {
@@ -468,10 +504,6 @@ std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchFrom(std::shared_ptr<B
         }
         return nullptr;
     }
-}
-
-std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratch(u32 width, u32 height, u32 layers) {
-    return AcquireBcScratchFrom(bc_scratch, BC_SCRATCH_BUDGET, width, height, layers);
 }
 
 std::shared_ptr<BcScratch> Context::Impl::AcquireBcScratchSlot(size_t slot, u32 width, u32 height,
@@ -705,7 +737,6 @@ Context::Impl::~Impl() {
     final_fsr.reset();
     upscaler_fsr.reset();
     mirror_merge_stats = {}; // allocator-owned, like the pool buffers above
-    bc_scratch.reset();
     bc_scratch_ring = {};
     bc_scratches.clear();
     staging_cache = {};

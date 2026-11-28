@@ -1375,6 +1375,8 @@ struct Context::Impl {
         u32 layers{};
         VkSampleCountFlagBits samples{};
         VkImageUsageFlags usage{};
+        u32 view_format_count{};
+        std::array<VkFormat, 2> view_formats{};
         bool operator==(const ImageRecycleKey&) const = default;
         auto operator<=>(const ImageRecycleKey&) const = default;
     };
@@ -1663,14 +1665,11 @@ struct Context::Impl {
     std::future<std::unique_ptr<BcGpuEncoder>> bc_encoder_future;
     bool bc_encoder_failed{false};
     [[nodiscard]] BcGpuEncoder* BcEncoder();
-    /// Replay thread: the scratch BC stand-in uploads reuse (grown up to BC_SCRATCH_BUDGET).
-    /// AcquireBcScratch returns it, a bigger one, or a one-off for a single layer above the
-    /// budget; null when no image could be created (logged once).
+    /// Replay thread: LRU pool of scratch BC stand-in images (up to 4 shapes within
+    /// BC_SCRATCH_BUDGET), plus a 4-slot ring of small scratches for barrier-batched chunks.
     static constexpr size_t BC_SMALL_SCRATCH_COUNT = 4;
     static constexpr u64 BC_SMALL_SCRATCH_MAX_BYTES = u64{4} << 20;
-    std::shared_ptr<BcScratch> bc_scratch;
     std::array<std::shared_ptr<BcScratch>, BC_SMALL_SCRATCH_COUNT> bc_scratch_ring;
-    /// Replay thread: LRU pool of scratch BC stand-in images (up to 4 shapes within BC_SCRATCH_BUDGET).
     std::vector<std::shared_ptr<BcScratch>> bc_scratches;
     bool bc_scratch_failed_logged{false};
     [[nodiscard]] std::shared_ptr<BcScratch> AcquireBcScratchFrom(std::shared_ptr<BcScratch>& slot,
@@ -1787,6 +1786,7 @@ struct Context::Impl {
             InFlight* flight{nullptr};
             VkSemaphore queue_timeline{VK_NULL_HANDLE};
             u64 queue_signal_value{0};
+            bool has_gpu_work{false};
         };
         struct Mark {
             InFlight* flight{};

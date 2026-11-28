@@ -183,7 +183,6 @@ bool Context::Impl::TakePoolCpuWrites(Pool& pool) {
             }
             if (index < pool.mirror_pages.size()) {
                 pool.SetMirrorPageTrusted(index, false);
-                pool.mirror_pages[index].trusted = false;
                 if (pool.raw_written_through &&
                     pool.mirror_pages[index].raw_epoch != pool.split_raw_epoch_seen) {
                     pool.mirror_pages[index].valid = false;
@@ -416,8 +415,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     // contents are stale, and equal pages mean the bytes are the trusted ones again.
     if (written && s.page_hashes.size() == last_page - first_page + 1 &&
         last_page < check_pool->page_write_gen.size()) {
-        last_page < pool.page_write_gen.size()) {
-        ArmPoolMirrorPages(pool, first_page, last_page);
+        ArmPoolMirrorPages(*check_pool, first_page, last_page);
         std::vector<u8> page_scratch;
         const auto page_begin = std::chrono::steady_clock::now();
         if (const u8* bytes = GuestBytes(pool, s.pool_offset, size, page_scratch)) {
@@ -486,7 +484,7 @@ void Context::Impl::DetectGuestChange(Storage& s, u64 seq) {
     const bool signature_only = watching || !full;
     const bool gathered_lines = pool.IsVirtual() && signature_only;
     if (tracked && full && !watching) {
-        ArmPoolMirrorPages(pool, first_page, last_page);
+        ArmPoolMirrorPages(*check_pool, first_page, last_page);
     }
     std::vector<u8> scratch;
     const auto guest_begin = std::chrono::steady_clock::now();
@@ -716,6 +714,22 @@ vk::Image Context::Impl::TakeRecycledImage(const VkImageCreateInfo& info) {
     if (image_recycle_count == 0) {
         return {};
     }
+    u32 view_format_count = 0;
+    std::array<VkFormat, 2> view_formats{};
+    for (const auto* next = static_cast<const VkBaseInStructure*>(info.pNext); next != nullptr;
+         next = next->pNext) {
+        if (next->sType == VK_STRUCTURE_TYPE_IMAGE_FORMAT_LIST_CREATE_INFO) {
+            const auto* list = reinterpret_cast<const VkImageFormatListCreateInfo*>(next);
+            if (list->viewFormatCount > view_formats.size()) {
+                return {};
+            }
+            view_format_count = list->viewFormatCount;
+            for (u32 i = 0; i < view_format_count; ++i) {
+                view_formats[i] = list->pViewFormats[i];
+            }
+            break;
+        }
+    }
     const ImageRecycleKey key{
         .flags = info.flags,
         .type = info.imageType,
@@ -727,6 +741,8 @@ vk::Image Context::Impl::TakeRecycledImage(const VkImageCreateInfo& info) {
         .layers = info.arrayLayers,
         .samples = info.samples,
         .usage = info.usage,
+        .view_format_count = view_format_count,
+        .view_formats = view_formats,
     };
     const auto it = image_recycle_pool.find(key);
     if (it == image_recycle_pool.end() || it->second.empty()) {
@@ -747,6 +763,11 @@ void Context::Impl::RecycleImage(Storage& s) {
     if (!s.image || s.sparse || s.vram_bytes == 0 || s.vram_bytes > IMAGE_RECYCLE_MAX_BYTES / 2) {
         return;
     }
+    const u32 view_format_count =
+        (s.view_format_count != 0 && device.IsKhrImageFormatListSupported()) ? s.view_format_count
+                                                                             : 0;
+    const std::array<VkFormat, 2> view_formats =
+        view_format_count != 0 ? s.view_formats : std::array<VkFormat, 2>{};
     const ImageRecycleKey key{
         .flags = s.create_flags,
         .type = s.type,
@@ -758,6 +779,8 @@ void Context::Impl::RecycleImage(Storage& s) {
         .layers = s.layers,
         .samples = s.samples,
         .usage = s.usage,
+        .view_format_count = view_format_count,
+        .view_formats = view_formats,
     };
     const u64 bytes = s.vram_bytes;
     image_recycle_pool[key].push_back(RecycledImage{
